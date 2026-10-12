@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Defigent — Monad's standard A2A inbox + x402 rail</title>
+<style>
+  :root {
+    --bg: #0a0e14; --panel: #111722; --panel2: #161e2c; --line: #232d40;
+    --text: #e6edf3; --dim: #8b98a9; --accent: #4ade80; --accent2: #60a5fa;
+    --warn: #fbbf24; --err: #f87171; --purple: #a78bfa;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; line-height: 1.5; }
+  a { color: var(--accent2); text-decoration: none; } a:hover { text-decoration: underline; }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 24px 20px 64px; }
+
+  header { padding: 28px 0 8px; }
+  .brand { display: flex; align-items: center; gap: 12px; }
+  .logo { width: 42px; height: 42px; border-radius: 10px; background: linear-gradient(135deg, var(--accent), var(--accent2)); display: flex; align-items: center; justify-content: center; font-weight: 700; color: #04101c; font-size: 20px; }
+  h1 { font-size: 22px; letter-spacing: -0.5px; }
+  .sub { color: var(--dim); font-size: 13px; margin-top: 2px; }
+  .badges { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+  .badge { font-size: 11px; padding: 4px 10px; border: 1px solid var(--line); border-radius: 999px; color: var(--dim); background: var(--panel); }
+  .badge.on { color: var(--accent); border-color: rgba(74,222,128,.35); }
+  .badge.p { color: var(--purple); border-color: rgba(167,139,250,.35); }
+
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin: 22px 0; }
+  .tile { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; }
+  .tile .v { font-size: 22px; font-weight: 700; color: var(--accent); }
+  .tile .l { font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: .8px; margin-top: 3px; }
+
+  h2 { font-size: 15px; margin: 30px 0 12px; color: var(--text); display: flex; align-items: center; gap: 8px; }
+  h2 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 8px var(--accent); }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; padding: 10px 14px; color: var(--dim); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: .6px; border-bottom: 1px solid var(--line); }
+  td { padding: 9px 14px; border-bottom: 1px solid rgba(35,45,64,.5); }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: var(--panel2); }
+  .pill { font-size: 10px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line); color: var(--dim); }
+  .pill.y { color: var(--accent); border-color: rgba(74,222,128,.4); }
+  .pill.n { opacity: .45; }
+  .aid { color: var(--accent2); }
+  .name { color: var(--text); }
+  .tools { display: flex; gap: 6px; margin: 10px 0 0; flex-wrap: wrap; }
+  .tools input { background: var(--panel); border: 1px solid var(--line); color: var(--text); border-radius: 8px; padding: 7px 12px; font-size: 12px; min-width: 220px; font-family: inherit; }
+  .tools button { background: var(--panel2); border: 1px solid var(--line); color: var(--dim); border-radius: 8px; padding: 7px 12px; font-size: 11px; cursor: pointer; font-family: inherit; }
+  .tools button.on, .tools button:hover { color: var(--accent); border-color: rgba(74,222,128,.4); }
+
+  .state { font-size: 10px; padding: 3px 9px; border-radius: 999px; font-weight: 600; }
+  .s-working { background: rgba(96,165,250,.15); color: var(--accent2); }
+  .s-completed { background: rgba(74,222,128,.15); color: var(--accent); }
+  .s-input-required { background: rgba(251,191,36,.15); color: var(--warn); }
+  .s-canceled { background: rgba(248,113,113,.15); color: var(--err); }
+  .verif { font-size: 10px; color: var(--accent); } .unverif { font-size: 10px; color: var(--dim); }
+
+  .task { border-bottom: 1px solid rgba(35,45,64,.5); }
+  .task:last-child { border-bottom: none; }
+  .task-head { display: flex; align-items: center; gap: 10px; padding: 10px 14px; cursor: pointer; }
+  .task-head:hover { background: var(--panel2); }
+  .task-id { color: var(--accent2); font-size: 12px; }
+  .task-ts { color: var(--dim); font-size: 11px; margin-left: auto; }
+  .task-body { display: none; padding: 12px 16px; background: var(--panel2); border-top: 1px solid var(--line); }
+  .task.open .task-body { display: block; }
+  .msg { margin: 8px 0; padding: 8px 12px; border-radius: 8px; font-size: 12px; }
+  .msg.user { background: rgba(96,165,250,.08); border-left: 2px solid var(--accent2); }
+  .msg.agent { background: rgba(74,222,128,.06); border-left: 2px solid var(--accent); }
+  .msg .who { font-size: 10px; color: var(--dim); margin-bottom: 2px; }
+  .raw { display: none; margin-top: 10px; background: #0a0f18; border: 1px solid var(--line); border-radius: 8px; padding: 10px; font-size: 11px; color: #9fb0c3; overflow-x: auto; white-space: pre; }
+  .task.open .raw { display: block; }
+  .mono-dim { color: var(--dim); }
+
+  .steps { display: grid; gap: 10px; }
+  .step { display: flex; gap: 12px; align-items: flex-start; padding: 12px 14px; background: var(--panel2); border-radius: 10px; border: 1px solid var(--line); }
+  .step .n { width: 24px; height: 24px; border-radius: 50%; background: var(--panel); border: 1px solid var(--line); color: var(--accent); display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; }
+  .step .t { font-size: 13px; }
+  .step .c { font-size: 11px; color: var(--dim); margin-top: 2px; }
+  code { background: #0a0f18; padding: 1px 6px; border-radius: 5px; font-size: 11px; color: var(--accent); }
+
+  footer { margin-top: 40px; padding-top: 16px; border-top: 1px solid var(--line); color: var(--dim); font-size: 11px; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
+  .live { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--accent); animation: pulse 2s infinite; margin-right: 6px; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .3; } }
+  .err-tile .v { color: var(--err); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <div class="brand">
+      <div class="logo">D</div>
+      <div>
+        <h1>Defigent <span class="mono-dim">//</span> agentId 10331</h1>
+        <div class="sub">Monad's standard A2A inbox · EIP-712 signed senders · native x402 rail</div>
+      </div>
+    </div>
+    <div class="badges">
+      <span class="badge on">A2A v1.0.1</span>
+      <span class="badge on">x402 v1+v2</span>
+      <span class="badge on">ERC-8004</span>
+      <span class="badge p">MCP 2026-07-28</span>
+      <span class="badge on">SSE streaming</span>
+      <span class="badge" id="hd-status">connecting…</span>
+    </div>
+  </header>
+
+  <div class="tiles" id="tiles"></div>
+
+  <h2><span class="dot"></span> Network directory <span class="mono-dim" style="font-size:11px;font-weight:400">ERC-8004 agents on Monad</span></h2>
+  <div class="tools">
+    <input id="q" placeholder="filter by name / agentId…" autocomplete="off">
+    <button id="f-all" class="on">all</button>
+    <button id="f-inbox">inbox ✓</button>
+    <button id="f-x402">x402 ✓</button>
+  </div>
+  <div class="panel" style="margin-top:8px">
+    <table>
+      <thead><tr><th>agentId</th><th>name</th><th>inbox</th><th>x402</th><th>status</th></tr></thead>
+      <tbody id="net-body"><tr><td colspan="5" class="mono-dim">loading…</td></tr></tbody>
+    </table>
+  </div>
+
+  <h2><span class="dot" style="background:var(--warn);box-shadow:0 0 8px var(--warn)"></span> Live inbox tasks <span class="mono-dim" style="font-size:11px;font-weight:400">signed threads · click to expand</span></h2>
+  <div class="panel" id="tasks-panel">
+    <div id="tasks-list"><div style="padding:14px" class="mono-dim">loading…</div></div>
+  </div>
+
+  <h2><span class="dot" style="background:var(--accent2);box-shadow:0 0 8px var(--accent2)"></span> Integrate in minutes</h2>
+  <div class="steps" id="steps"></div>
+
+  <footer>
+    <span><span class="live"></span>live from 3.238.185.185:8080 · data refreshes every 15s</span>
+    <span><a href="/.well-known/agent-card.json">agent card</a> · <a href="/integration">integration API</a> · <a href="/network">network JSON</a> · <a href="/mcp">MCP server</a> · <a href="https://github.com/Firrton/defigent-a2a-protocol">source</a></span>
+  </footer>
+
+</div>
+<script>
+const $ = (s) => document.querySelector(s);
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const ago = (ts) => { const d = Math.max(0, Date.now() - ts); const m = Math.floor(d/60000); if (m < 1) return "just now"; if (m < 60) return m + "m ago"; const h = Math.floor(m/60); if (h < 24) return h + "h ago"; return Math.floor(h/24) + "d ago"; };
+
+let FILTER = "all", QUERY = "";
+
+// ---------- status tiles ----------
+async function loadStatus() {
+  try {
+    const s = await (await fetch("/status")).json();
+    $("#hd-status").textContent = "operational · rpc " + s.rpc_latency_ms + "ms";
+    $("#hd-status").classList.add("on");
+    let inboxCount = "—", agents = "—";
+    try { const n = await (await fetch("/network")).json(); agents = (n.agents || []).length; } catch {}
+    try { const t = await (await fetch("/tasks?pageSize=1")).json(); inboxCount = t.totalSize; } catch {}
+    $("#tiles").innerHTML = [
+      [Math.floor(s.uptime_s/3600) + "h", "uptime"],
+      [s.rpc_latency_ms + "ms", "rpc latency"],
+      [s.head_block, "head block"],
+      [agents, "agents mapped"],
+      [inboxCount, "tasks processed"],
+    ].map(([v, l]) => `<div class="tile"><div class="v">${esc(v)}</div><div class="l">${esc(l)}</div></div>`).join("");
+  } catch {
+    $("#tiles").innerHTML = `<div class="tile err-tile"><div class="v">offline</div><div class="l">status unreachable</div></div>`;
+  }
+}
+
+// ---------- network directory ----------
+let NET = [];
+async function loadNetwork() {
+  try {
+    const n = await (await fetch("/network")).json();
+    NET = (n.agents || []).sort((a, b) => (b.agentId || 0) - (a.agentId || 0));
+    renderNet();
+  } catch { $("#net-body").innerHTML = `<tr><td colspan="5" class="mono-dim">unreachable</td></tr>`; }
+}
+function renderNet() {
+  const rows = NET.filter(a => {
+    if (FILTER === "inbox" && !a.hasInbox) return false;
+    if (FILTER === "x402" && !a.x402Support) return false;
+    if (QUERY) { const q = QUERY.toLowerCase(); return String(a.agentId).includes(q) || (a.name || "").toLowerCase().includes(q); }
+    return true;
+  }).slice(0, 100).map(a => `<tr>
+    <td class="aid">${esc(a.agentId)}</td>
+    <td class="name">${esc(a.name || "—")}</td>
+    <td><span class="pill ${a.hasInbox ? "y" : "n"}">${a.hasInbox ? "inbox ✓" : "—"}</span></td>
+    <td><span class="pill ${a.x402Support ? "y" : "n"}">${a.x402Support ? "x402 ✓" : "—"}</span></td>
+    <td class="mono-dim" style="font-size:11px">${esc(a.status || "known")}</td>
+  </tr>`).join("");
+  $("#net-body").innerHTML = rows || `<tr><td colspan="5" class="mono-dim">no matches</td></tr>`;
+}
+
+// ---------- tasks explorer ----------
+async function loadTasks() {
+  try {
+    const r = await (await fetch("/tasks?pageSize=12")).json();
+    if (!r.tasks.length) { $("#tasks-list").innerHTML = `<div style="padding:14px" class="mono-dim">no tasks yet — send the first message to POST /inbox</div>`; return; }
+    $("#tasks-list").innerHTML = r.tasks.map(t => {
+      const hist = (t.history || []);
+      return `<div class="task" data-id="${esc(t.id)}">
+        <div class="task-head" onclick="this.parentElement.classList.toggle('open');this.parentElement.querySelector('.raw').textContent=JSON.stringify(window.__raw&&window.__raw['${esc(t.id)}']||{raw:'open deep-link: /tasks/${esc(t.id)}'},null,2)">
+          <span class="state s-${esc(t.status.state)}">${esc(t.status.state)}</span>
+          <span class="task-id">${esc(t.id)}</span>
+          <span class="task-ts">${esc(ago(Date.parse(t.status.timestamp)))}</span>
+        </div>
+        <div class="task-body" id="b-${esc(t.id)}"><span class="mono-dim">loading thread…</span></div>
+      </div>`;
+    }).join("");
+    window.__raw = {};
+    for (const t of r.tasks) {
+      fetch("/tasks/" + encodeURIComponent(t.id)).then(x => x.json()).then(d => {
+        window.__raw[t.id] = d;
+        const el = $("#b-" + CSS.escape(t.id));
+        if (!el) return;
+        el.innerHTML = (d.history || []).map(m => `<div class="msg ${esc(m.role)}">
+          <div class="who">${esc(m.role)} ${m.verified ? '<span class="verif">✓ verified' + (m.sender ? ' · ' + esc(m.sender) : '') + '</span>' : '<span class="unverif">unsigned</span>'}</div>
+          ${esc((m.text || "").slice(0, 300))}
+        </div>`).join("") + `<div class="raw"></div>`;
+      }).catch(() => {});
+    }
+  } catch { $("#tasks-list").innerHTML = `<div style="padding:14px" class="mono-dim">tasks unreachable</div>`; }
+}
+
+// ---------- integration steps ----------
+fetch("/integration").then(r => r.json()).then(d => {
+  const icons = { "1": "📄", "2": "📨", "2b": "🔐", "2c": "🧵", "3": "💸", "4": "🌐" };
+  $("#steps").innerHTML = (d.steps || []).map(s => `<div class="step">
+    <div class="n">${esc(s.step)}</div>
+    <div><div class="t"><b>${esc(s.title)}</b></div><div class="c">${esc((s.how || "").slice(0, 220))}</div></div>
+  </div>`).join("");
+}).catch(() => { $("#steps").innerHTML = `<div class="step"><div class="t mono-dim">/integration unreachable</div></div>`; });
+
+// ---------- wiring ----------
+$("#q").addEventListener("input", (e) => { QUERY = e.target.value.trim(); renderNet(); });
+$("#f-all").onclick = () => setFilter("all");
+$("#f-inbox").onclick = () => setFilter("inbox");
+$("#f-x402").onclick = () => setFilter("x402");
+function setFilter(f) {
+  FILTER = f;
+  ["f-all", "f-inbox", "f-x402"].forEach(id => $("#" + id).classList.toggle("on", id === "f-" + f));
+  renderNet();
+}
+
+loadStatus(); loadNetwork(); loadTasks();
+setInterval(loadStatus, 15000);
+setInterval(loadTasks, 15000);
+</script>
+</body>
+</html>

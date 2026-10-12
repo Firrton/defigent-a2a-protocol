@@ -24,6 +24,8 @@ async function rpc(method, params) {
 
 const app = express();
 app.use(express.json({ verify: (req, _res, buf) => { req.rawBody = buf; } }));
+app.use(express.static("public", { index: false })); // dashboard assets (public/index.html served at / below)
+app.get("/", (_req, res) => res.sendFile("index.html", { root: "public" }));
 
 const facilitatorClient = new HTTPFacilitatorClient({ url: FACILITATOR });
 const resourceServer = new x402ResourceServer(facilitatorClient).register(NETWORK, new ExactEvmScheme());
