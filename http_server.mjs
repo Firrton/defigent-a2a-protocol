@@ -56,15 +56,14 @@ app.get("/digest", async (req, res) => {
   if (!/^0x[0-9a-fA-F]{40}$/.test(address)) {
     return res.status(400).json({ error: "address query param required (0x…40)" });
   }
-  const mon = await rpc("eth_getBalance", [address, "latest"]);
-  let usdc = 0;
-  try {
-    const r = await rpc("eth_call", [{
+  const [mon, usdcR] = await Promise.all([
+    rpc("eth_getBalance", [address, "latest"]),
+    rpc("eth_call", [{
       to: "0x754704Bc059F8C67012fEd69BC8A327a5aafb603",
       data: "0x70a08231" + address.toLowerCase().slice(2).padStart(64, "0"),
-    }, "latest"]);
-    usdc = parseInt(r, 16) / 1e6;
-  } catch {}
+    }, "latest"]).catch(() => null),
+  ]);
+  const usdc = usdcR ? parseInt(usdcR, 16) / 1e6 : 0;
   res.json({
     address,
     mon: Number(BigInt(mon)) / 1e18,
@@ -92,9 +91,16 @@ app.get("/.well-known/agent-card.json", (_req, res) => {
     name: "Defigent",
     description: "Agentic commerce specialist agent on Monad: on-chain wallet digests, agent directory lookup, and regime analytics. ERC-8004 agentId 10331. Talks and pays x402 (v1+v2).",
     url: `${BASE}/inbox`,
-    version: "1.3.0",
-    protocolVersion: "0.3.0",
-    capabilities: { streaming: false, pushNotifications: false, stateTransitionHistory: true },
+    version: "1.4.0",
+    protocolVersion: "1.0.1",
+    supportedInterfaces: [
+      { url: `${BASE}/inbox`, protocolBinding: "JSONRPC", protocolVersion: "1.0" },
+      { url: `${BASE}/inbox`, protocolBinding: "JSONRPC", protocolVersion: "0.3.0" },
+    ],
+    capabilities: { streaming: true, pushNotifications: false, stateTransitionHistory: true, extendedAgentCard: false },
+    securitySchemes: {},
+    extensions: [{ uri: "defigent:identity-eip712@v1", description: "Messages may carry params.auth {address,signature,timestamp,nonce} — EIP-712 signed identity (chainId 143). Verified replies set verified:true." }],
+    documentationUrl: `${BASE}/integration`,
     defaultInputModes: ["text/plain", "application/json"],
     defaultOutputModes: ["text/plain", "application/json"],
     skills: [
@@ -109,10 +115,13 @@ app.get("/.well-known/agent-card.json", (_req, res) => {
 
 // ---------- A2A v2: SQLite tasks + signed sender identity ----------
 import Database from "better-sqlite3";
+import crypto from "crypto";
 import { verifyTypedData } from "viem";
 
 const A2A_DB = "/home/ubuntu/.hermes/cache/scratch/defigent_a2a.db";
 const a2a = new Database(A2A_DB);
+a2a.pragma("journal_mode = WAL");       // low-latency writes (research P0)
+a2a.pragma("synchronous = NORMAL");
 a2a.exec(`CREATE TABLE IF NOT EXISTS tasks (
   context_id TEXT PRIMARY KEY,
   state TEXT NOT NULL DEFAULT 'working',
@@ -128,7 +137,17 @@ CREATE TABLE IF NOT EXISTS messages (
   sender TEXT,
   ts INTEGER NOT NULL,
   FOREIGN KEY (context_id) REFERENCES tasks(context_id)
+);
+CREATE TABLE IF NOT EXISTS artifacts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id TEXT NOT NULL,
+  artifact_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  parts_json TEXT NOT NULL,
+  ts INTEGER NOT NULL,
+  FOREIGN KEY (task_id) REFERENCES tasks(context_id)
 );`);
+try { a2a.exec(`ALTER TABLE messages ADD COLUMN meta TEXT`); } catch {}
 
 function upsertTask(contextId, state) {
   const now = Date.now();
@@ -137,9 +156,9 @@ function upsertTask(contextId, state) {
     .run(contextId, state, now, now);
 }
 
-function addMessage(contextId, role, text, verified, sender) {
-  a2a.prepare(`INSERT INTO messages (context_id, role, text, verified, sender, ts) VALUES (?,?,?,?,?,?)`)
-    .run(contextId, role, text, verified ? 1 : 0, sender || null, Date.now());
+function addMessage(contextId, role, text, verified, sender, meta = null) {
+  a2a.prepare(`INSERT INTO messages (context_id, role, text, verified, sender, ts, meta) VALUES (?,?,?,?,?,?,?)`)
+    .run(contextId, role, text, verified ? 1 : 0, sender || null, Date.now(), meta);
 }
 
 function getHistory(contextId) {
@@ -192,7 +211,7 @@ app.post("/inbox", async (req, res) => {
     return res.json({ jsonrpc: "2.0", id: body?.id ?? null, error: { code: -32009, message: "VersionNotSupported", data: { requested: verHeader, supported: A2A_SUPPORTED } } });
   }
   const rpcMethod = body?.method || "message/send";
-  if (!["message/send", "SendMessage", "tasks/cancel", "CancelTask"].includes(rpcMethod)) {
+  if (!["message/send", "SendMessage", "message/stream", "SendStreamingMessage", "tasks/cancel", "CancelTask"].includes(rpcMethod)) {
     return res.json({ jsonrpc: "2.0", id: body?.id ?? null, error: { code: -32601, message: "MethodNotFound", data: { method: rpcMethod } } });
   }
   if (rpcMethod === "tasks/cancel" || rpcMethod === "CancelTask") {
@@ -205,8 +224,13 @@ app.post("/inbox", async (req, res) => {
   }
 
   const msg = body?.params?.message || body?.message || body;
-  const text = (msg?.parts || []).map(p => p.text || "").join(" ").slice(0, 4000);
+  // A2A v1.0 full parts: TextPart {text} | DataPart {data:object} | FilePart {raw|url + mediaType}
+  const partsIn = msg?.parts || [];
+  const text = partsIn.map(p => p.text || "").join(" ").slice(0, 4000);
+  const dataParts = partsIn.filter(p => p.data && typeof p.data === "object").map(p => p.data);
+  const fileParts = partsIn.filter(p => (p.raw || p.url) && p.mediaType).map(p => ({ name: p.name || "file", url: p.url || null, mediaType: p.mediaType }));
   const id = body?.id ?? null;
+  const isStream = rpcMethod === "message/stream" || rpcMethod === "SendStreamingMessage";
   const messageId = msg?.messageId || `anon-${now}`;
   // dedupe
   if (global.__seenMsg && global.__seenMsg.has(messageId)) {
@@ -230,17 +254,25 @@ app.post("/inbox", async (req, res) => {
   else if (/hello|hi\b|hola|welcome|greeting|present|soy |i am |i'm /.test(lower)) cls = "greeting";
   else if (/offer|propuesta|partnership|alianza|collab|colaboración|service proposal/.test(lower)) cls = "offer";
   else if (/\?/.test(text)) cls = "question";
+  // structured offer (Defigent offer schema v1): DataPart {intent:"offer", service, price, asset, expiry?, terms?}
+  let structuredOffer = null;
+  for (const d of dataParts) {
+    if (d?.intent === "offer" && d?.service && d?.price) { structuredOffer = d; break; }
+  }
+  if (structuredOffer) cls = "offer_structured";
 
-  logInbox({ ts: now, ip, messageId, cls, from: msg?.role || "unknown", declaredAgent: /agentId[ ]?\d+/i.exec(text)?.[0] || null, verified: ident.verified, sender: ident.address || null, contextId, text: (text || "").slice(0, 2000) });
-  addMessage(contextId, "user", text, ident.verified, ident.address || declaredSender);
+  logInbox({ ts: now, ip, messageId, cls, from: msg?.role || "unknown", declaredAgent: /agentId[ ]?\d+/i.exec(text)?.[0] || null, verified: ident.verified, sender: ident.address || null, contextId, hasData: dataParts.length > 0, hasFiles: fileParts.length > 0, text: (text || "").slice(0, 2000) });
+  addMessage(contextId, "user", text || "(no text; structured parts only)", ident.verified, ident.address || declaredSender, dataParts.length || fileParts.length ? JSON.stringify({ data: dataParts, files: fileParts }) : null);
 
   let reply;
   if (cls === "handshake") {
     reply = "READY";
   } else if (cls === "greeting") {
     reply = `Hello! Defigent here (ERC-8004 agentId 10331, Monad). We run the standard A2A inbox you are using right now — any agent on Monad can write to us here. Our paid services run on x402: wallet digest $0.001, agent lookup free. Let's interop.`;
+  } else if (cls === "offer_structured") {
+    reply = `Structured offer received (schema v1, machine-readable — thanks!). Service: ${structuredOffer.service}, price: ${structuredOffer.price} ${structuredOffer.asset || "USDC"}. Logged for operator review; response via this inbox or Telegram @FirrtonH. Card: ${BASE}/.well-known/agent-card.json`;
   } else if (cls === "offer") {
-    reply = `Offer received and logged for operator review (response via this inbox or Telegram @FirrtonH). Card: ${BASE}/.well-known/agent-card.json`;
+    reply = `Offer received and logged for operator review (response via this inbox or Telegram @FirrtonH). Tip: send structured offers as DataPart {intent:"offer", service, price, asset, expiry, terms} — see ${BASE}/integration (offer schema v1). Card: ${BASE}/.well-known/agent-card.json`;
   } else if (cls === "question") {
     reply = `Answering from Defigent KB: services — GET /info (free), GET /digest?address=0x... ($0.001 x402), GET /status (free), GET /.well-known/agent-card.json (A2A). Operator: Telegram @FirrtonH.`;
   } else {
@@ -248,22 +280,50 @@ app.post("/inbox", async (req, res) => {
   }
 
   addMessage(contextId, "agent", reply, true, null);
-  // task stays 'working' awaiting operator; auto-close simple classes after response
-  if (["handshake", "greeting", "question"].includes(cls)) {
-    upsertTask(contextId, "completed");
-  } else {
-    upsertTask(contextId, "input-required");
+  // artifact: structured outputs travel as artifacts (A2A v1.0 §4.1.7)
+  if (cls === "question" || cls === "offer_structured") {
+    const art = cls === "question"
+      ? { artifactId: `art-services-${now}`, name: "defigent-services-catalog", parts: [{ data: { services: [
+          { endpoint: "GET /info", price: "free" },
+          { endpoint: "GET /digest?address=0x...", price: "$0.001 USDC x402" },
+          { endpoint: "GET /status", price: "free" },
+          { endpoint: "POST /inbox (A2A message/send + SendMessage)", price: "free" },
+        ] } }] }
+      : { artifactId: `art-offer-${now}`, name: "received-offer", parts: [{ data: structuredOffer }] };
+    a2a.prepare(`INSERT INTO artifacts (task_id, artifact_id, name, parts_json, ts) VALUES (?,?,?,?,?)`)
+      .run(contextId, art.artifactId, art.name, JSON.stringify(art.parts), Date.now());
   }
+  // wake-up queue: operator/agent attention needed (research P0 — kills the 2h blind window)
+  if (["offer", "offer_structured", "other"].includes(cls)) {
+    try {
+      fs.appendFileSync("/home/ubuntu/.hermes/cache/scratch/defigent_wake_queue.jsonl",
+        JSON.stringify({ ts: now, contextId, cls, verified: ident.verified, sender: ident.address || declaredSender, preview: (structuredOffer ? JSON.stringify(structuredOffer) : text).slice(0, 140) }) + "\n");
+    } catch {}
+  }
+  // task states (0.3.0 wire values; 1.0 maps at transport layer)
+  const finalState = ["handshake", "greeting", "question"].includes(cls) ? "completed" : "input-required";
+  upsertTask(contextId, finalState);
 
-  res.json({ jsonrpc: "2.0", id, result: {
+  const replyMsg = {
     kind: "message", role: "agent",
     parts: [{ type: "text", text: reply }],
     messageId: `defigent-re-${now}`,
     contextId,
     verified: ident.verified,
     sender: ident.address || null,
-    task: { id: contextId, state: ["handshake","greeting","question"].includes(cls) ? "completed" : "input-required" },
-  }});
+    task: { id: contextId, state: finalState },
+  };
+
+  // SSE streaming (A2A message/stream — spec §9.4): statusUpdate events + final message
+  if (isStream) {
+    res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
+    res.write(`event: statusUpdate\ndata: ${JSON.stringify({ taskId: contextId, status: { state: "working" }, contextId })}\n\n`);
+    res.write(`event: statusUpdate\ndata: ${JSON.stringify({ taskId: contextId, status: { state: finalState }, contextId })}\n\n`);
+    res.write(`event: message\ndata: ${JSON.stringify(replyMsg)}\n\n`);
+    return res.end();
+  }
+
+  res.json({ jsonrpc: "2.0", id, result: replyMsg });
 });
 
 // ---------- A2A tasks: read state + history ----------
@@ -273,8 +333,31 @@ app.get("/tasks/:contextId", (req, res) => {
   if (!task) return res.status(404).json({ jsonrpc: "2.0", id: null, error: { code: -32001, message: "TaskNotFound", data: { contextId: ctx } } });
   res.json({
     task: { id: task.context_id, state: task.state, createdAt: task.created_at, updatedAt: task.updated_at },
-    history: getHistory(ctx).map(m => ({ role: m.role, text: m.text, verified: !!m.verified, sender: m.sender, ts: m.ts })),
+    history: getHistory(ctx).map(m => ({ role: m.role, text: m.text, verified: !!m.verified, sender: m.sender, ts: m.ts, ...(m.meta ? { data: JSON.parse(m.meta) } : {}) })),
+    artifacts: a2a.prepare(`SELECT artifact_id, name, parts_json, ts FROM artifacts WHERE task_id=? ORDER BY ts ASC`).all(ctx)
+      .map(a => ({ artifactId: a.artifact_id, name: a.name, parts: JSON.parse(a.parts_json), ts: a.ts })),
   });
+});
+
+// ---------- On-chain webhook (QuickNode Streams → detección <2s) ----------
+// Payload esperado: {event: {blockNumber, ...}} con Transfer del IdentityRegistry.
+// Auth: HMAC-SHA256 del body con WEBHOOK_SECRET (env) O IP allowlist QuickNode (141.148.40.227).
+app.post("/webhooks/onchain", (req, res) => {
+  const secret = process.env.WEBHOOK_SECRET;
+  const ip = req.ip || "";
+  if (!secret && ip !== "141.148.40.227" && ip !== "::ffff:141.148.40.227") {
+    return res.status(403).json({ error: "forbidden (configure WEBHOOK_SECRET or allowlist)" });
+  }
+  if (secret) {
+    const sig = String(req.headers["x-webhook-signature"] || "");
+    const hmac = crypto.createHmac("sha256", secret).update(JSON.stringify(req.body || {})).digest("hex");
+    if (sig !== hmac) return res.status(403).json({ error: "bad signature" });
+  }
+  res.status(204).end();
+  try {
+    fs.appendFileSync("/home/ubuntu/.hermes/cache/scratch/defigent_wake_queue.jsonl",
+      JSON.stringify({ ts: Date.now(), cls: "onchain_event", source: "quicknode-webhook", preview: JSON.stringify(req.body || {}).slice(0, 300) }) + "\n");
+  } catch {}
 });
 
 app.post("/tasks/cancel", (req, res) => {
