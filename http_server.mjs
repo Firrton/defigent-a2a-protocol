@@ -396,14 +396,30 @@ app.post("/webhooks/onchain", (req, res) => {
   const secret = process.env.WEBHOOK_SECRET;
   const ip = (req.ip || "").replace("::ffff:", "");
   const ipAllowed = ip === "141.148.40.227";
+  // QuickNode puede firmar con distintos headers — probamos todos los comunes
   let hmacOk = false;
   if (secret) {
-    const sig = String(req.headers["x-webhook-signature"] || "");
-    const hmac = crypto.createHmac("sha256", secret).update(JSON.stringify(req.body || {})).digest("hex");
-    hmacOk = sig === hmac;
+    const raw = JSON.stringify(req.body || {});
+    const candidates = [
+      req.headers["x-webhook-signature"],
+      req.headers["x-qn-signature"],
+      req.headers["x-signature"],
+      req.headers["x-quicknode-signature"],
+      req.headers["x-hook-signature"],
+    ].filter(Boolean).map(String);
+    hmacOk = candidates.some(sig => {
+      const h = crypto.createHmac("sha256", secret).update(raw).digest("hex");
+      const h256t = crypto.createHmac("sha256", secret).update(raw).digest("base64");
+      return sig === h || sig === h256t || sig === "sha256=" + h || sig === "sha256=" + h256t;
+    });
   }
   if (!hmacOk && !ipAllowed) {
-    return res.status(403).json({ error: "forbidden (valid X-Webhook-Signature or QuickNode IP required)" });
+    // logueamos el intento para adaptar la auth a lo que QuickNode envíe de verdad
+    try {
+      fs.appendFileSync("/home/ubuntu/.hermes/cache/scratch/defigent_webhook_rejects.jsonl",
+        JSON.stringify({ ts: Date.now(), ip, headers: req.headers, bodyKeys: Object.keys(req.body || {}) }) + "\n");
+    } catch {}
+    return res.status(403).json({ error: "forbidden (valid signature or QuickNode IP required)" });
   }
   res.status(204).end();
   try {
