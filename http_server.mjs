@@ -339,6 +339,56 @@ app.get("/tasks/:contextId", (req, res) => {
   });
 });
 
+// ---------- MCP 2026-07-28 stateless surface (headers Mcp-Method/Mcp-Name; cada request self-contained) ----------
+const MCP_TOOLS = [
+  { name: "defigent_inbox_send", description: "Send an A2A message to the Defigent inbox (the standard agent messaging channel on Monad). Returns the inbox reply + task state. Optional: contextId to continue a thread.", inputSchema: { type: "object", properties: { text: { type: "string", description: "Message text" }, contextId: { type: "string", description: "Optional task contextId to continue a thread" }, sender: { type: "string", description: "Optional sender identifier (e.g. ERC-8004 agentId or address)" } }, required: ["text"] } },
+  { name: "defigent_network_list", description: "List ERC-8004 agents registered on Monad from the Defigent network directory (49+ mapped, the discovery hub).", inputSchema: { type: "object", properties: { limit: { type: "number", description: "Max agents to return (default 20)" } } } },
+  { name: "defigent_status", description: "Live Defigent storefront status: uptime, RPC latency, head block, inbox count. Free.", inputSchema: { type: "object", properties: {} } },
+];
+app.get("/mcp", (_req, res) => {
+  res.json({ server: { name: "defigent", version: "1.4.0", description: "Defigent A2A inbox + network directory as stateless MCP server (spec 2026-07-28: Mcp-Method/Mcp-Name headers, no session state)" }, protocolVersion: "2026-07-28", transport: "stateless-http", tools: MCP_TOOLS, x402_note: "Paid x402 services (GET /digest) remain on the HTTP storefront; MCP surface exposes the free messaging/discovery tools." });
+});
+app.post("/mcp", async (req, res) => {
+  const method = String(req.headers["mcp-method"] || "");
+  const body = req.body || {};
+  if (!method) return res.status(400).json({ error: "Mcp-Method header required (server/discover, tools/list, tools/call)" });
+  if (method === "server/discover") {
+    return res.json({ protocolVersion: "2026-07-28", server: { name: "defigent", version: "1.4.0" }, capabilities: { tools: {} }, tools: MCP_TOOLS });
+  }
+  if (method === "tools/list") return res.json({ tools: MCP_TOOLS });
+  if (method === "tools/call") {
+    const name = body?.name || body?.params?.name;
+    const args = body?.arguments || body?.params?.arguments || {};
+    try {
+      if (name === "defigent_inbox_send") {
+        if (!args.text) return res.json({ isError: true, content: [{ type: "text", text: "Missing required arg: text" }] });
+        const msgId = `mcp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const payload = { jsonrpc: "2.0", id: 1, method: "message/send", params: { message: { role: "agent", sender: args.sender || "mcp-client", parts: [{ type: "text", text: String(args.text).slice(0, 4000) }], messageId: msgId, kind: "message", ...(args.contextId ? { contextId: String(args.contextId) } : {}) } } };
+        const r = await fetch(`http://127.0.0.1:${PORT}/inbox`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+        const j = await r.json();
+        const result = j.result || j;
+        return res.json({ content: [{ type: "text", text: result?.parts?.[0]?.text || JSON.stringify(result).slice(0, 800) }], meta: { contextId: result?.contextId, task: result?.task, verified: result?.verified } });
+      }
+      if (name === "defigent_network_list") {
+        const db = loadNetwork();
+        const lim = Math.min(Number(args.limit) || 20, 100);
+        const agents = [...db.agents].sort((a, b) => (b.agentId || 0) - (a.agentId || 0)).slice(0, lim)
+          .map(a => ({ agentId: a.agentId, name: a.name || null, hasInbox: !!a.inbox, x402: !!a.x402 }));
+        return res.json({ content: [{ type: "text", text: JSON.stringify({ total: db.agents.length, agents }, null, 1) }] });
+      }
+      if (name === "defigent_status") {
+        const t0 = Date.now();
+        const b = await rpc("eth_blockNumber", []);
+        return res.json({ content: [{ type: "text", text: JSON.stringify({ uptime_s: Math.floor((Date.now() - START_TS) / 1000), rpc_latency_ms: Date.now() - t0, head_block: BigInt(b).toString(), inbox_messages: (function(){ try { return fs.readFileSync(INBOX_FILE, "utf8").split("\n").filter(Boolean).length; } catch { return 0; } })() }) }] });
+      }
+      return res.json({ isError: true, content: [{ type: "text", text: `Unknown tool: ${name}. Available: ${MCP_TOOLS.map(t => t.name).join(", ")}` }] });
+    } catch (err) {
+      return res.json({ isError: true, content: [{ type: "text", text: "Tool error: " + String(err).slice(0, 200) }] });
+    }
+  }
+  return res.status(400).json({ error: `Unsupported Mcp-Method: ${method}` });
+});
+
 // ---------- On-chain webhook (QuickNode Streams → detección <2s) ----------
 // Payload esperado: {event: {blockNumber, ...}} con Transfer del IdentityRegistry.
 // Auth: HMAC-SHA256 del body con WEBHOOK_SECRET (env) O IP allowlist QuickNode (141.148.40.227).
@@ -384,7 +434,7 @@ app.get("/status", async (_req, res) => {
     rpc_latency_ms: rpcMs,
     head_block: block,
     inbox_messages: (function(){ try { return fs.readFileSync(INBOX_FILE, "utf8").split("\n").filter(Boolean).length; } catch { return 0; } })(),
-    endpoints: ["/info", "/digest (x402 $0.001)", "/status", "/inbox (A2A v2: signed+tasks)", "/tasks/:contextId", "/tasks/cancel", "/network", "/integration", "/.well-known/agent-card.json"],
+    endpoints: ["/info", "/digest (x402 $0.001)", "/status", "/inbox (A2A 0.3.0+1.0.1, signed+tasks+SSE)", "/tasks/:contextId", "/tasks/cancel", "/mcp (MCP 2026-07-28 stateless)", "/network", "/integration", "/webhooks/onchain", "/.well-known/agent-card.json"],
     registration: { agentId: 10331, registry: "eip155:143:0x8004A169FB4a3325136EB29fA0ceB6D2e539a432" },
   });
 });
