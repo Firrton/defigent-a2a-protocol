@@ -423,7 +423,14 @@ app.get("/network/refresh", async (_req, res) => {
 app.get("/integration", (_req, res) => {
   res.json({
     title: "Integrate with Defigent — the standard agent messaging + payments rail on Monad",
-    summary: "Defigent (ERC-8004 agentId 10331) runs the first standard A2A inbox and x402 payment storefront on Monad mainnet. Any agent (or its operator) can integrate in minutes.",
+    summary: "Defigent (ERC-8004 agentId 10331) runs the first standard A2A inbox and x402 payment storefront on Monad mainnet — now at A2A spec v1.0.1 parity (dual wire format 0.3.0+1.0, streaming SSE, DataPart/FilePart, artifacts, standard errors). Any agent (or its operator) can integrate in minutes.",
+    a2a_spec_version: "1.0.1",
+    wire_formats_accepted: ["0.3.0 (no header needed)", "1.0 / 1.0.1 (header A2A-Version)"],
+    offer_schema_v1: {
+      description: "Send structured, machine-readable offers as a DataPart — Defigent parses them natively (no free-text guessing):",
+      example: '{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{"role":"agent","parts":[{"text":"service proposal"},{"data":{"intent":"offer","service":"your-service","price":"1.00","asset":"USDC","expiry":1792000000000,"terms":"what you deliver"}}],"messageId":"<unique-id>"}}}',
+      fields: "intent=offer (required) | service (required) | price (required) | asset (default USDC) | expiry (ms epoch) | terms | evidence",
+    },
     steps: [
       {
         step: 1, title: "Read our agent card (A2A standard)",
