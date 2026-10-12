@@ -184,6 +184,26 @@ app.post("/inbox", async (req, res) => {
   arr.push(now); RATE.set(ip, arr);
 
   const body = req.body || {};
+
+  // ---- A2A v1.0 compat: version negotiation + dual method names + standard errors ----
+  const A2A_SUPPORTED = ["0.3", "0.3.0", "1.0", "1.0.1"];
+  const verHeader = String(req.headers["a2a-version"] || "").trim();
+  if (verHeader && !A2A_SUPPORTED.includes(verHeader)) {
+    return res.json({ jsonrpc: "2.0", id: body?.id ?? null, error: { code: -32009, message: "VersionNotSupported", data: { requested: verHeader, supported: A2A_SUPPORTED } } });
+  }
+  const rpcMethod = body?.method || "message/send";
+  if (!["message/send", "SendMessage", "tasks/cancel", "CancelTask"].includes(rpcMethod)) {
+    return res.json({ jsonrpc: "2.0", id: body?.id ?? null, error: { code: -32601, message: "MethodNotFound", data: { method: rpcMethod } } });
+  }
+  if (rpcMethod === "tasks/cancel" || rpcMethod === "CancelTask") {
+    const ctx = body?.params?.contextId || body?.params?.taskId || body?.params?.id;
+    if (!ctx) return res.json({ jsonrpc: "2.0", id: body?.id ?? null, error: { code: -32602, message: "InvalidParams", data: { reason: "contextId required" } } });
+    const t = a2a.prepare(`SELECT context_id FROM tasks WHERE context_id=?`).get(ctx);
+    if (!t) return res.json({ jsonrpc: "2.0", id: body?.id ?? null, error: { code: -32001, message: "TaskNotFound", data: { contextId: ctx } } });
+    upsertTask(ctx, "canceled");
+    return res.json({ jsonrpc: "2.0", id: body?.id ?? null, result: { taskId: ctx, state: "canceled" } });
+  }
+
   const msg = body?.params?.message || body?.message || body;
   const text = (msg?.parts || []).map(p => p.text || "").join(" ").slice(0, 4000);
   const id = body?.id ?? null;
@@ -250,7 +270,7 @@ app.post("/inbox", async (req, res) => {
 app.get("/tasks/:contextId", (req, res) => {
   const ctx = req.params.contextId;
   const task = a2a.prepare(`SELECT * FROM tasks WHERE context_id=?`).get(ctx);
-  if (!task) return res.status(404).json({ error: "task not found" });
+  if (!task) return res.status(404).json({ jsonrpc: "2.0", id: null, error: { code: -32001, message: "TaskNotFound", data: { contextId: ctx } } });
   res.json({
     task: { id: task.context_id, state: task.state, createdAt: task.created_at, updatedAt: task.updated_at },
     history: getHistory(ctx).map(m => ({ role: m.role, text: m.text, verified: !!m.verified, sender: m.sender, ts: m.ts })),
@@ -360,6 +380,14 @@ app.get("/integration", (_req, res) => {
     },
     contact_operator: "Telegram @FirrtonH",
   });
+});
+
+// JSON-RPC standard error middleware (spec A2A 1.0 §9.5)
+app.use((err, _req, res, _next) => {
+  if (err?.type === "entity.parse.failed") {
+    return res.status(400).json({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "ParseError" } });
+  }
+  return res.status(500).json({ jsonrpc: "2.0", id: null, error: { code: -32603, message: "InternalError" } });
 });
 
 app.listen(PORT, "0.0.0.0", () => {
