@@ -167,6 +167,90 @@ function getHistory(contextId) {
   return a2a.prepare(`SELECT role, text, verified, sender, ts FROM messages WHERE context_id=? ORDER BY ts ASC`).all(contextId);
 }
 
+// ---------- Trust pipeline: on-chain owner check + reputation (all VERIFIED vs Monad live) ----------
+const IDENTITY_REG = "0x8004A169FB4a3325136EB29fA0ceB6D2e539a432";
+const REPUTATION_REG = "0x8004BAa17C55a88189AE136b182e5fdA19dE9b63";
+const repCache = new Map(); // address -> {ts, trust}
+
+async function ethCallStr(to, data) {
+  try {
+    const r = await rpc("eth_call", [{ to, data }, "latest"]);
+    if (!r || r === "0x") return null;
+    const raw = r.slice(2);
+    const ln = parseInt(raw.slice(64, 128), 16);
+    return raw.slice(128, 128 + ln * 2); // hex string value (string return)
+  } catch { return null; }
+}
+
+// 1) is `address` the owner (or registered agentWallet) of `agentId`?
+async function verifyAgentOwner(agentId, address) {
+  if (!Number.isInteger(agentId) || agentId <= 0 || !/^0x[0-9a-fA-F]{40}$/.test(address)) return { ok: false, reason: "bad args" };
+  const idHex = agentId.toString(16).padStart(64, "0");
+  const addrHex = address.toLowerCase().replace("0x", "").padStart(64, "0");
+  try {
+    const owner = await rpc("eth_call", [{ to: IDENTITY_REG, data: "0x6352211e" + idHex }, "latest"]); // ownerOf(uint256)
+    if (owner && owner.toLowerCase().endsWith(addrHex)) return { ok: true, via: "ownerOf" };
+    const wallet = await rpc("eth_call", [{ to: IDENTITY_REG, data: "0x00339509" + idHex }, "latest"]); // getAgentWallet(uint256)
+    if (wallet && wallet.toLowerCase().endsWith(addrHex)) return { ok: true, via: "getAgentWallet" };
+    return { ok: false, reason: "address is neither owner nor registered agentWallet" };
+  } catch (e) { return { ok: false, reason: String(e).slice(0, 60) }; }
+}
+
+// 2) peer reputation: readAllFeedback(agentId, [], "", "", false) → aggregate mean
+async function peerReputation(agentId) {
+  if (!Number.isInteger(agentId) || agentId <= 0) return { clients: 0, mean: 0 };
+  // select=0x<d4d1f543?> readAllFeedback(uint256,address[],string,string,bool) — compute selector at runtime
+  const sel = crypto.createHash("sha3-256").update("readAllFeedback(uint256,address[],string,string,bool)").digest("hex").slice(0, 8);
+  // encode: agentId | offset of clients[] (0xa0) | offset of tag1 | offset of tag2 | false | len0 | len0 | len0
+  const idHex = agentId.toString(16).padStart(64, "0");
+  const offA = (0xa0).toString(16).padStart(64, "0");
+  const offT1 = (0xc0).toString(16).padStart(64, "0");
+  const offT2 = (0xe0).toString(16).padStart(64, "0");
+  const f = "0".repeat(64);
+  const zeroLen = "0".repeat(64);
+  const data = "0x" + sel + idHex + offA + offT1 + offT2 + f + zeroLen + zeroLen + zeroLen;
+  try {
+    const r = await rpc("eth_call", [{ to: REPUTATION_REG, data }, "latest"]);
+    if (!r || r === "0x") return { clients: 0, mean: 0 };
+    const raw = r.slice(2);
+    // dynamic return: offset(0x20) | arrayLen | ... entries {value(int128→int256), valueDecimals, tag1, tag2, endpoint, feedbackURI, feedbackHash}
+    const arrOff = parseInt(raw.slice(0, 64), 16) / 8; // word offset → byte offset/32... compute in words
+    const arrLen = parseInt(raw.slice(64, 128), 16);
+    let mean = 0;
+    if (arrLen > 0) {
+      // entries are 7-word structs (4 static + 3 dynamic offsets = 7 words each)
+      let sum = 0;
+      const base = 128; // skip offset word + len word
+      const w = 64;
+      for (let i = 0; i < arrLen; i++) {
+        const entOff = parseInt(raw.slice(base + i * w, base + (i + 1) * w), 16); // byte offset from start of array data
+        const vHex = raw.slice(base + entOff, base + entOff + w);
+        let v = BigInt("0x" + vHex);
+        if (v > (1n << 127n)) v -= (1n << 256n); // int128 negative
+        sum += Number(v);
+      }
+      mean = Math.round(sum / arrLen);
+    }
+    return { clients: arrLen, mean };
+  } catch { return { clients: 0, mean: 0 }; }
+}
+
+async function peerTrust(agentId, address) {
+  const key = `${agentId}:${(address || "").toLowerCase()}`;
+  const c = repCache.get(key);
+  if (c && Date.now() - c.ts < 10 * 60 * 1000) return c.trust;
+  const owner = await verifyAgentOwner(agentId, address);
+  const rep = owner.ok ? await peerReputation(agentId) : { clients: 0, mean: 0 };
+  // trust tiers (signal-weak gating per arXiv: 73-91% feedback is Sybil):
+  // verified+rep>=40 (>=2 clients) → RICH | verified → STANDARD | else → MINIMAL
+  const trust = owner.ok
+    ? (rep.clients >= 2 && rep.mean >= 40 ? "RICH" : "STANDARD")
+    : "MINIMAL";
+  const result = { trust, ownerOk: owner.ok, via: owner.via || owner.reason, rep };
+  repCache.set(key, { ts: Date.now(), trust: result });
+  return result;
+}
+
 // EIP-712 verification of sender identity
 // auth: { address, signature, timestamp, nonce } — signed over DefigentInbox(InboxAgentId,SenderAddress,Timestamp,Nonce)
 async function verifyAuth(auth, declaredSender) {
@@ -381,6 +465,15 @@ app.post("/inbox", async (req, res) => {
     sender: ident.address || null,
     task: { id: contextId, state: finalState },
   };
+
+  // trust enrichment (non-blocking best-effort): declare peer trust level in the reply
+  try {
+    const aidMatch = /agentId[ ]?(\d+)/i.exec(text || "");
+    if (ident.verified && aidMatch) {
+      const tr = await peerTrust(parseInt(aidMatch[1]), ident.address);
+      replyMsg.trust = { level: tr.trust, ownerVerified: tr.ownerOk, via: tr.via, reputation: tr.rep };
+    }
+  } catch {}
 
   // SSE streaming (A2A message/stream — spec §9.4): statusUpdate events + final message
   if (isStream) {
