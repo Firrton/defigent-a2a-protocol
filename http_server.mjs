@@ -394,14 +394,16 @@ app.post("/mcp", async (req, res) => {
 // Auth: HMAC-SHA256 del body con WEBHOOK_SECRET (env) O IP allowlist QuickNode (141.148.40.227).
 app.post("/webhooks/onchain", (req, res) => {
   const secret = process.env.WEBHOOK_SECRET;
-  const ip = req.ip || "";
-  if (!secret && ip !== "141.148.40.227" && ip !== "::ffff:141.148.40.227") {
-    return res.status(403).json({ error: "forbidden (configure WEBHOOK_SECRET or allowlist)" });
-  }
+  const ip = (req.ip || "").replace("::ffff:", "");
+  const ipAllowed = ip === "141.148.40.227";
+  let hmacOk = false;
   if (secret) {
     const sig = String(req.headers["x-webhook-signature"] || "");
     const hmac = crypto.createHmac("sha256", secret).update(JSON.stringify(req.body || {})).digest("hex");
-    if (sig !== hmac) return res.status(403).json({ error: "bad signature" });
+    hmacOk = sig === hmac;
+  }
+  if (!hmacOk && !ipAllowed) {
+    return res.status(403).json({ error: "forbidden (valid X-Webhook-Signature or QuickNode IP required)" });
   }
   res.status(204).end();
   try {
