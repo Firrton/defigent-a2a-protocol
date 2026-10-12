@@ -23,7 +23,7 @@ async function rpc(method, params) {
 }
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ verify: (req, _res, buf) => { req.rawBody = buf; } }));
 
 const facilitatorClient = new HTTPFacilitatorClient({ url: FACILITATOR });
 const resourceServer = new x402ResourceServer(facilitatorClient).register(NETWORK, new ExactEvmScheme());
@@ -399,7 +399,9 @@ app.post("/webhooks/onchain", (req, res) => {
   // QuickNode puede firmar con distintos headers — probamos todos los comunes
   let hmacOk = false;
   if (secret) {
-    const raw = JSON.stringify(req.body || {});
+    // HMAC sobre los bytes EXACTOS del body (raw) — es lo que firma QuickNode
+    const raw = req.rawBody || Buffer.from(JSON.stringify(req.body || {}));
+    const digests = ["hex", "base64"].map(enc => crypto.createHmac("sha256", secret).update(raw).digest(enc));
     const candidates = [
       req.headers["x-webhook-signature"],
       req.headers["x-qn-signature"],
@@ -407,11 +409,7 @@ app.post("/webhooks/onchain", (req, res) => {
       req.headers["x-quicknode-signature"],
       req.headers["x-hook-signature"],
     ].filter(Boolean).map(String);
-    hmacOk = candidates.some(sig => {
-      const h = crypto.createHmac("sha256", secret).update(raw).digest("hex");
-      const h256t = crypto.createHmac("sha256", secret).update(raw).digest("base64");
-      return sig === h || sig === h256t || sig === "sha256=" + h || sig === "sha256=" + h256t;
-    });
+    hmacOk = candidates.some(sig => digests.some(d => sig === d || sig === "sha256=" + d));
   }
   if (!hmacOk && !ipAllowed) {
     // logueamos el intento para adaptar la auth a lo que QuickNode envíe de verdad
