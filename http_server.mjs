@@ -99,7 +99,7 @@ app.get("/.well-known/agent-card.json", (_req, res) => {
       { url: `${BASE}/inbox`, protocolBinding: "JSONRPC", protocolVersion: "1.0" },
       { url: `${BASE}/inbox`, protocolBinding: "JSONRPC", protocolVersion: "0.3.0" },
     ],
-    capabilities: { streaming: true, pushNotifications: false, stateTransitionHistory: true, extendedAgentCard: false },
+    capabilities: { streaming: true, pushNotifications: false, stateTransitionHistory: true, extendedAgentCard: true },
     securitySchemes: {},
     extensions: [{ uri: "defigent:identity-eip712@v1", description: "Messages may carry params.auth {address,signature,timestamp,nonce} — EIP-712 signed identity (chainId 143). Verified replies set verified:true." }],
     documentationUrl: `${BASE}/integration`,
@@ -297,6 +297,17 @@ app.post("/inbox", async (req, res) => {
     return res.json({ jsonrpc: "2.0", id: body?.id ?? null, error: { code: -32009, message: "VersionNotSupported", data: { requested: verHeader, supported: A2A_SUPPORTED } } });
   }
   const rpcMethod = body?.method || "message/send";
+  if (rpcMethod === "GetExtendedAgentCard") {
+    // spec §3.1.11: extended card requires authentication per securitySchemes
+    const auth = body?.params?.auth || null;
+    const declared = body?.params?.sender || null;
+    const ident = await verifyAuth(auth, declared);
+    if (!ident.verified) {
+      return res.json({ jsonrpc: "2.0", id: body?.id ?? null, error: { code: -32002, message: "ExtendedAgentCardAuthRequired", data: { hint: "Sign DefigentInboxAuth EIP-712 and send params.auth {address,signature,timestamp,nonce}", securitySchemes: Object.keys(EXTENDED_CARD.securitySchemes) } } });
+    }
+    const card = { ...EXTENDED_CARD, servedTo: ident.address, servedAt: new Date().toISOString() };
+    return res.json({ jsonrpc: "2.0", id: body?.id ?? null, result: card });
+  }
   if (!["message/send", "SendMessage", "message/stream", "SendStreamingMessage", "tasks/cancel", "CancelTask", "tasks/list", "ListTasks", "tasks/get", "GetTask"].includes(rpcMethod)) {
     return res.json({ jsonrpc: "2.0", id: body?.id ?? null, error: { code: -32601, message: "MethodNotFound", data: { method: rpcMethod } } });
   }
@@ -743,7 +754,39 @@ app.get("/integration", (_req, res) => {
   });
 });
 
-// JSON-RPC standard error middleware (spec A2A 1.0 §9.5)
+// ---------- Extended Agent Card (spec §3.1.11/§13.3 — requiere auth EIP-712) ----------
+const EXTENDED_CARD = {
+  name: "Defigent (extended)",
+  description: "Authenticated extended card: operator data, trust policy, rate limits and full service catalog for verified partners.",
+  url: `${BASE}/inbox`,
+  version: "1.4.0",
+  protocolVersion: "1.0.1",
+  capabilities: { streaming: true, pushNotifications: false, stateTransitionHistory: true, extendedAgentCard: true },
+  securitySchemes: { eip712: { type: "http", scheme: "DefigentInboxAuth", description: "EIP-712 signature over DefigentInboxAuth(inboxAgentId, senderAddress, timestamp, nonce), chainId 143" } },
+  security: [{ eip712: [] }],
+  skills: [
+    { id: "digest", name: "Wallet digest", description: "On-chain MON+USDC balance digest for any address on Monad mainnet. Paid $0.001 USDC via x402.", tags: ["analytics", "monad", "x402"], examples: ["GET /digest?address=0x..."] },
+    { id: "agent-lookup", name: "Agent lookup", description: "Read any ERC-8004 agent registration from the Monad identity registry. Free.", tags: ["directory", "erc8004"] },
+    { id: "network-directory", name: "Network directory", description: "Full ERC-8004 agent directory of Monad with inbox/x402 capability flags. Free.", tags: ["discovery"] },
+    { id: "a2a-inbox", name: "A2A inbox", description: "Standard JSON-RPC message/send + SendMessage with EIP-712 sender verification, stateful tasks, SSE streaming, structured offers (schema v1).", tags: ["a2a", "messaging"] },
+    { id: "trust-check", name: "Peer trust check", description: "On-chain ownerOf/getAgentWallet verification + Reputation Registry read for any agentId. Used internally; exposed as data in replies (trust field).", tags: ["trust", "erc8004"] },
+  ],
+  provider: { organization: "Defigent (operator: FirrtonH)", url: `${BASE}/` },
+  documentationUrl: `${BASE}/integration`,
+  operatorContact: { telegram: "@FirrtonH", responseTimeHours: 24 },
+  trustPolicy: {
+    tiers: { RICH: "verified owner + reputation >=40 with >=2 clients (rich replies)", STANDARD: "verified owner (standard replies)", MINIMAL: "unverified (courtesy replies)" },
+    onChain: { identityRegistry: IDENTITY_REG, reputationRegistry: REPUTATION_REG },
+    notes: "Feedback treated as weak signal (73-91% Sybil per arXiv 2606.26028) — used for gating, not scoring.",
+  },
+  limits: { inboxRatePerMinPerIp: 10, replyLatencyMs: 100, maxTextLen: 4000 },
+};
+
+app.get("/extendedAgentCard", (_req, res) => {
+  res.json({ jsonrpc: "2.0", id: null, error: { code: -32001, message: "ExtendedAgentCardNotConfiguredWithoutAuth", data: { hint: "This endpoint requires EIP-712 auth. Use JSON-RPC GetExtendedAgentCard with a signed request." } } });
+});
+
+// ---------- JSON-RPC standard error middleware (spec A2A 1.0 §9.5)
 app.use((err, _req, res, _next) => {
   if (err?.type === "entity.parse.failed") {
     return res.status(400).json({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "ParseError" } });
