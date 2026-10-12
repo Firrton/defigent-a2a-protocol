@@ -211,7 +211,7 @@ app.post("/inbox", async (req, res) => {
     return res.json({ jsonrpc: "2.0", id: body?.id ?? null, error: { code: -32009, message: "VersionNotSupported", data: { requested: verHeader, supported: A2A_SUPPORTED } } });
   }
   const rpcMethod = body?.method || "message/send";
-  if (!["message/send", "SendMessage", "message/stream", "SendStreamingMessage", "tasks/cancel", "CancelTask"].includes(rpcMethod)) {
+  if (!["message/send", "SendMessage", "message/stream", "SendStreamingMessage", "tasks/cancel", "CancelTask", "tasks/list", "ListTasks", "tasks/get", "GetTask"].includes(rpcMethod)) {
     return res.json({ jsonrpc: "2.0", id: body?.id ?? null, error: { code: -32601, message: "MethodNotFound", data: { method: rpcMethod } } });
   }
   if (rpcMethod === "tasks/cancel" || rpcMethod === "CancelTask") {
@@ -221,6 +221,72 @@ app.post("/inbox", async (req, res) => {
     if (!t) return res.json({ jsonrpc: "2.0", id: body?.id ?? null, error: { code: -32001, message: "TaskNotFound", data: { contextId: ctx } } });
     upsertTask(ctx, "canceled");
     return res.json({ jsonrpc: "2.0", id: body?.id ?? null, result: { taskId: ctx, state: "canceled" } });
+  }
+
+  // ---- tasks/list | ListTasks (spec §3.1.4/§9.4.4): filtros + paginación cursor-based ----
+  if (rpcMethod === "tasks/list" || rpcMethod === "ListTasks") {
+    const p = body?.params || {};
+    const pageSize = Math.min(Math.max(parseInt(p.pageSize) || 50, 1), 100);
+    const statusFilter = typeof p.status === "string" ? p.status.replace("TASK_STATE_", "").toLowerCase().replace(/_/g, "-") : null;
+    const VALID_STATES = ["working", "completed", "input-required", "canceled"];
+    if (statusFilter && !VALID_STATES.includes(statusFilter)) {
+      return res.json({ jsonrpc: "2.0", id: body?.id ?? null, error: { code: -32602, message: "InvalidParams", data: { reason: `status must be one of ${VALID_STATES.map(s => "TASK_STATE_" + s.toUpperCase()).join(", ")}` } } });
+    }
+    // opaque cursor: base64("last_update_ts:id")
+    let cursorTs = 0, cursorId = "";
+    if (p.pageToken) {
+      try {
+        const [ts, id] = Buffer.from(String(p.pageToken), "base64").toString("utf8").split(":");
+        cursorTs = parseInt(ts) || 0; cursorId = id || "";
+      } catch {
+        return res.json({ jsonrpc: "2.0", id: body?.id ?? null, error: { code: -32602, message: "InvalidParams", data: { reason: "invalid pageToken" } } });
+      }
+    }
+    const where = [];
+    const args = [];
+    if (statusFilter) { where.push("state = ?"); args.push(statusFilter); }
+    if (typeof p.statusTimestampAfter === "string" && p.statusTimestampAfter) {
+      const t = Date.parse(p.statusTimestampAfter);
+      if (Number.isNaN(t)) return res.json({ jsonrpc: "2.0", id: body?.id ?? null, error: { code: -32602, message: "InvalidParams", data: { reason: "statusTimestampAfter must be ISO 8601" } } });
+      where.push("updated_at > ?"); args.push(t);
+    }
+    if (cursorTs || cursorId) { where.push("(updated_at < ? OR (updated_at = ? AND context_id > ?))"); args.push(cursorTs, cursorTs, cursorId); }
+    const whereSql = where.length ? "WHERE " + where.join(" AND ") : "";
+    const totalSize = a2a.prepare(`SELECT COUNT(*) AS n FROM tasks ${statusFilter || cursorTs ? (statusFilter && !cursorTs ? `WHERE state='${statusFilter}'` : "") : ""}`).get()?.n ?? 0;
+    const rows = a2a.prepare(`SELECT context_id, state, created_at, updated_at FROM tasks ${whereSql} ORDER BY updated_at DESC, context_id ASC LIMIT ?`).all(...args, pageSize + 1);
+    const hasMore = rows.length > pageSize;
+    const page = rows.slice(0, pageSize);
+    const historyLen = Math.max(parseInt(p.historyLength) || 0, 0);
+    const includeArtifacts = p.includeArtifacts !== false && p.includeArtifacts !== "false";
+    const tasks = page.map(r => {
+      const t = { id: r.context_id, contextId: r.context_id, status: { state: r.state, timestamp: new Date(r.updated_at).toISOString() } };
+      if (historyLen > 0) t.history = getHistory(r.context_id).slice(-historyLen).map(m => ({ role: m.role, text: m.text, verified: !!m.verified, sender: m.sender, ts: m.ts }));
+      if (includeArtifacts) {
+        const arts = a2a.prepare(`SELECT artifact_id, name, parts_json, ts FROM artifacts WHERE task_id=? ORDER BY ts ASC`).all(r.context_id);
+        if (arts.length) t.artifacts = arts.map(a => ({ artifactId: a.artifact_id, name: a.name, parts: JSON.parse(a.parts_json) }));
+      }
+      return t;
+    });
+    let nextPageToken = "";
+    if (hasMore) {
+      const last = page[page.length - 1];
+      nextPageToken = Buffer.from(`${last.updated_at}:${last.context_id}`).toString("base64");
+    }
+    return res.json({ jsonrpc: "2.0", id: body?.id ?? null, result: { tasks, nextPageToken, pageSize, totalSize } });
+  }
+
+  // ---- tasks/get | GetTask ----
+  if (rpcMethod === "tasks/get" || rpcMethod === "GetTask") {
+    const ctx = body?.params?.id || body?.params?.taskId || body?.params?.contextId;
+    if (!ctx) return res.json({ jsonrpc: "2.0", id: body?.id ?? null, error: { code: -32602, message: "InvalidParams", data: { reason: "task id required" } } });
+    const t = a2a.prepare(`SELECT * FROM tasks WHERE context_id=?`).get(ctx);
+    if (!t) return res.json({ jsonrpc: "2.0", id: body?.id ?? null, error: { code: -32001, message: "TaskNotFound", data: { contextId: ctx } } });
+    const result = { id: t.context_id, contextId: t.context_id, status: { state: t.state, timestamp: new Date(t.updated_at).toISOString() } };
+    const hl = Math.max(parseInt(body?.params?.historyLength) || 0, 0);
+    if (hl > 0) result.history = getHistory(ctx).slice(-hl).map(m => ({ role: m.role, text: m.text, verified: !!m.verified, sender: m.sender, ts: m.ts }));
+    const arts = a2a.prepare(`SELECT artifact_id, name, parts_json, ts FROM artifacts WHERE task_id=? ORDER BY ts ASC`).all(ctx);
+    if (arts.length) result.artifacts = arts.map(a => ({ artifactId: a.artifact_id, name: a.name, parts: JSON.parse(a.parts_json) }));
+    return res.json({ jsonrpc: "2.0", id: body?.id ?? null, result });
   }
 
   const msg = body?.params?.message || body?.message || body;
@@ -324,6 +390,50 @@ app.post("/inbox", async (req, res) => {
   }
 
   res.json({ jsonrpc: "2.0", id, result: replyMsg });
+});
+
+// ---------- A2A tasks: list (REST binding, spec §9.4.4 — camelCase query params) ----------
+app.get("/tasks", (req, res) => {
+  const q = req.query || {};
+  const fakeBody = { jsonrpc: "2.0", id: null, method: "tasks/list", params: {
+    ...(q.contextId ? { contextId: String(q.contextId) } : {}),
+    ...(q.status ? { status: String(q.status) } : {}),
+    ...(q.pageSize ? { pageSize: String(q.pageSize) } : {}),
+    ...(q.pageToken ? { pageToken: String(q.pageToken) } : {}),
+    ...(q.historyLength ? { historyLength: String(q.historyLength) } : {}),
+    ...(q.includeArtifacts ? { includeArtifacts: String(q.includeArtifacts) } : {}),
+  }};
+  req.body = fakeBody;
+  // reuse the JSON-RPC handler by internal dispatch
+  return (async () => {
+    const p = fakeBody.params;
+    const pageSize = Math.min(Math.max(parseInt(p.pageSize) || 50, 1), 100);
+    const statusFilter = typeof p.status === "string" ? p.status.replace("TASK_STATE_", "").toLowerCase().replace(/_/g, "-") : null;
+    const VALID_STATES = ["working", "completed", "input-required", "canceled"];
+    if (statusFilter && !VALID_STATES.includes(statusFilter)) {
+      return res.status(400).json({ jsonrpc: "2.0", id: null, error: { code: -32602, message: "InvalidParams", data: { reason: "invalid status filter" } } });
+    }
+    let cursorTs = 0, cursorId = "";
+    if (p.pageToken) {
+      try {
+        const [ts, id] = Buffer.from(String(p.pageToken), "base64").toString("utf8").split(":");
+        cursorTs = parseInt(ts) || 0; cursorId = id || "";
+      } catch {
+        return res.status(400).json({ jsonrpc: "2.0", id: null, error: { code: -32602, message: "InvalidParams", data: { reason: "invalid pageToken" } } });
+      }
+    }
+    const where = []; const args = [];
+    if (statusFilter) { where.push("state = ?"); args.push(statusFilter); }
+    if (cursorTs || cursorId) { where.push("(updated_at < ? OR (updated_at = ? AND context_id > ?))"); args.push(cursorTs, cursorTs, cursorId); }
+    const whereSql = where.length ? "WHERE " + where.join(" AND ") : "";
+    const totalSize = a2a.prepare(`SELECT COUNT(*) AS n FROM tasks`).get()?.n ?? 0;
+    const rows = a2a.prepare(`SELECT context_id, state, created_at, updated_at FROM tasks ${whereSql} ORDER BY updated_at DESC, context_id ASC LIMIT ?`).all(...args, pageSize + 1);
+    const hasMore = rows.length > pageSize;
+    const page = rows.slice(0, pageSize);
+    const tasks = page.map(r => ({ id: r.context_id, contextId: r.context_id, status: { state: r.state, timestamp: new Date(r.updated_at).toISOString() } }));
+    const nextPageToken = hasMore ? Buffer.from(`${page[page.length - 1].updated_at}:${page[page.length - 1].context_id}`).toString("base64") : "";
+    res.json({ tasks, nextPageToken, pageSize, totalSize });
+  })();
 });
 
 // ---------- A2A tasks: read state + history ----------
