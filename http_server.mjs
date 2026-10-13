@@ -437,6 +437,7 @@ app.post("/inbox", async (req, res) => {
   // Taifoon mcp.digest class probe: deterministic, safe — hash a quoted string (content is DATA, computed, never executed)
   const digestMatch = /(?:keccak256|sha256)\s+hash\s+of\s+"([^"]{1,4096})"/i.exec(text || "");
   let digestValue = null;
+  let wcTarget = null;
   if (digestMatch) {
     try {
       digestValue = /sha256/i.test(digestMatch[0])
@@ -448,6 +449,11 @@ app.post("/inbox", async (req, res) => {
   if (digestMatch && digestValue) cls = "digest";
   else if (/onboarding probe.*ready/i.test(text) && text.length < 200) cls = "handshake";
   else if (/Taifoon work notice\./.test(text) && /dm_[0-9a-f]{24}/.test(text)) cls = "taifoon_notice";
+  else if (/chat\.word_count:\s*Count the words in:\s*"([^"]+)"/i.test(text)) {
+    cls = "word_count";
+    wcTarget = /chat\.word_count:\s*Count the words in:\s*"([^"]+)"/i.exec(text)[1];
+  }
+  else if (/chat\.(\w+):/i.test(text)) cls = "taifoon_probe"; // practice probe desconocido → operador
   else if (/hello|hi\b|hola|welcome|greeting|present|soy |i am |i'm /.test(lower)) cls = "greeting";
   else if (/offer|propuesta|partnership|alianza|collab|colaboración|service proposal/.test(lower)) cls = "offer";
   else if (/\?/.test(text)) cls = "question";
@@ -467,6 +473,11 @@ app.post("/inbox", async (req, res) => {
   } else if (cls === "taifoon_notice") {
     // respuesta MÁQUINA: {"interested": true} — el demand se liquida en segundos; el HTTP response de este POST es lo que Taifoon lee
     reply = '{"interested": true}';
+  } else if (cls === "word_count") {
+    // Taifoon practice probe: conteo de palabras del texto citado (respuestas deterministas)
+    reply = String((wcTarget || "").trim().split(/\s+/).filter(Boolean).length);
+  } else if (cls === "taifoon_probe") {
+    reply = `Practice probe received and logged for operator review. Defigent supports deterministic classes: mcp.digest (sha256/keccak256), chat.word_count, web.search. Operator: Telegram @FirrtonH.`;
   } else if (cls === "digest") {
     reply = String(digestValue);
   } else if (cls === "greeting") {
@@ -507,7 +518,7 @@ app.post("/inbox", async (req, res) => {
     } catch {}
   }
   // task states (0.3.0 wire values; 1.0 maps at transport layer)
-  const finalState = ["handshake", "greeting", "question", "digest", "taifoon_notice"].includes(cls) ? "completed" : "input-required";
+  const finalState = ["handshake", "greeting", "question", "digest", "taifoon_notice", "word_count"].includes(cls) ? "completed" : "input-required";
   upsertTask(contextId, finalState);
 
   const replyMsg = {
