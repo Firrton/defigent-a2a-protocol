@@ -81,7 +81,10 @@ import os from "os";
 const BASE = `http://3.238.185.185:8080`;
 const HTTPS_BASE = `https://opacus-liana-lanceted.ngrok-free.dev`;
 const START_TS = Date.now();
-const INBOX_FILE = "/home/ubuntu/.hermes/cache/scratch/defigent_inbox.jsonl";
+const DATA_DIR = process.env.DEFIGENT_DATA_DIR || "/home/ubuntu/.hermes/cache/scratch"; // override for local/test runs; default = production path
+const INBOX_FILE = `${DATA_DIR}/defigent_inbox.jsonl`;
+const WAKE_QUEUE_FILE = `${DATA_DIR}/defigent_wake_queue.jsonl`;
+const WEBHOOK_REJECTS_FILE = `${DATA_DIR}/defigent_webhook_rejects.jsonl`;
 const RATE = new Map(); // ip -> [timestamps]
 
 function logInbox(entry) {
@@ -124,7 +127,7 @@ import Database from "better-sqlite3";
 import crypto from "crypto";
 import { verifyTypedData, keccak256, toHex } from "viem";
 
-const A2A_DB = "/home/ubuntu/.hermes/cache/scratch/defigent_a2a.db";
+const A2A_DB = `${DATA_DIR}/defigent_a2a.db`;
 const a2a = new Database(A2A_DB);
 a2a.pragma("journal_mode = WAL");       // low-latency writes (research P0)
 a2a.pragma("synchronous = NORMAL");
@@ -481,7 +484,7 @@ app.post("/inbox", async (req, res) => {
   // wake-up queue: operator/agent attention needed (research P0 — kills the 2h blind window)
   if (["offer", "offer_structured", "other"].includes(cls)) {
     try {
-      fs.appendFileSync("/home/ubuntu/.hermes/cache/scratch/defigent_wake_queue.jsonl",
+      fs.appendFileSync(WAKE_QUEUE_FILE,
         JSON.stringify({ ts: now, contextId, cls, verified: ident.verified, sender: ident.address || declaredSender, preview: (structuredOffer ? JSON.stringify(structuredOffer) : text).slice(0, 140) }) + "\n");
     } catch {}
   }
@@ -692,14 +695,14 @@ app.post("/webhooks/onchain", (req, res) => {
   if (!hmacOk && !ipAllowed) {
     // logueamos el intento para adaptar la auth a lo que QuickNode envíe de verdad
     try {
-      fs.appendFileSync("/home/ubuntu/.hermes/cache/scratch/defigent_webhook_rejects.jsonl",
+      fs.appendFileSync(WEBHOOK_REJECTS_FILE,
         JSON.stringify({ ts: Date.now(), ip, headers: req.headers, bodyKeys: Object.keys(req.body || {}) }) + "\n");
     } catch {}
     return res.status(403).json({ error: "forbidden (valid signature or QuickNode IP required)" });
   }
   res.status(204).end();
   try {
-    fs.appendFileSync("/home/ubuntu/.hermes/cache/scratch/defigent_wake_queue.jsonl",
+    fs.appendFileSync(WAKE_QUEUE_FILE,
       JSON.stringify({ ts: Date.now(), cls: "onchain_event", source: "quicknode-webhook", preview: JSON.stringify(req.body || {}).slice(0, 300) }) + "\n");
   } catch {}
 });
