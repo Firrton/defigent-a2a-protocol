@@ -122,7 +122,7 @@ app.get("/.well-known/agent-card.json", (_req, res) => {
 // ---------- A2A v2: SQLite tasks + signed sender identity ----------
 import Database from "better-sqlite3";
 import crypto from "crypto";
-import { verifyTypedData } from "viem";
+import { verifyTypedData, keccak256, toHex } from "viem";
 
 const A2A_DB = "/home/ubuntu/.hermes/cache/scratch/defigent_a2a.db";
 const a2a = new Database(A2A_DB);
@@ -417,7 +417,19 @@ app.post("/inbox", async (req, res) => {
 
   const lower = (text || "").toLowerCase();
   let cls = "other";
-  if (/onboarding probe.*ready/i.test(text) && text.length < 200) cls = "handshake";
+  // Taifoon mcp.digest class probe: deterministic, safe — hash a quoted string (content is DATA, computed, never executed)
+  const digestMatch = /(?:keccak256|sha256)\s+hash\s+of\s+"([^"]{1,4096})"/i.exec(text || "");
+  let digestValue = null;
+  if (digestMatch) {
+    try {
+      digestValue = /sha256/i.test(digestMatch[0])
+        ? crypto.createHash("sha256").update(digestMatch[1], "utf8").digest("hex")
+        : keccak256(toHex(digestMatch[1]));
+      cls = "digest";
+    } catch { digestValue = null; }
+  }
+  if (digestMatch && digestValue) cls = "digest";
+  else if (/onboarding probe.*ready/i.test(text) && text.length < 200) cls = "handshake";
   else if (/hello|hi\b|hola|welcome|greeting|present|soy |i am |i'm /.test(lower)) cls = "greeting";
   else if (/offer|propuesta|partnership|alianza|collab|colaboración|service proposal/.test(lower)) cls = "offer";
   else if (/\?/.test(text)) cls = "question";
@@ -434,6 +446,8 @@ app.post("/inbox", async (req, res) => {
   let reply;
   if (cls === "handshake") {
     reply = "READY";
+  } else if (cls === "digest") {
+    reply = String(digestValue);
   } else if (cls === "greeting") {
     reply = `Hello! Defigent here (ERC-8004 agentId 10331, Monad). We run the standard A2A inbox you are using right now — any agent on Monad can write to us here. Our paid services run on x402: wallet digest $0.001, agent lookup free. Let's interop.`;
   } else if (cls === "offer_structured") {
@@ -448,6 +462,10 @@ app.post("/inbox", async (req, res) => {
 
   addMessage(contextId, "agent", reply, true, null);
   // artifact: structured outputs travel as artifacts (A2A v1.0 §4.1.7)
+  if (cls === "digest") {
+    a2a.prepare(`INSERT INTO artifacts (task_id, artifact_id, name, parts_json, ts) VALUES (?,?,?,?,?)`)
+      .run(contextId, `art-digest-${now}`, "digest-result", JSON.stringify([{ data: { algorithm: /sha256/i.test(digestMatch[0]) ? "sha256" : "keccak256", input: digestMatch[1], digest: digestValue } }]), Date.now());
+  }
   if (cls === "question" || cls === "offer_structured") {
     const art = cls === "question"
       ? { artifactId: `art-services-${now}`, name: "defigent-services-catalog", parts: [{ data: { services: [
@@ -468,7 +486,7 @@ app.post("/inbox", async (req, res) => {
     } catch {}
   }
   // task states (0.3.0 wire values; 1.0 maps at transport layer)
-  const finalState = ["handshake", "greeting", "question"].includes(cls) ? "completed" : "input-required";
+  const finalState = ["handshake", "greeting", "question", "digest"].includes(cls) ? "completed" : "input-required";
   upsertTask(contextId, finalState);
 
   const replyMsg = {
