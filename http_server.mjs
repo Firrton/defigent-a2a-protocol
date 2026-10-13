@@ -447,6 +447,7 @@ app.post("/inbox", async (req, res) => {
   }
   if (digestMatch && digestValue) cls = "digest";
   else if (/onboarding probe.*ready/i.test(text) && text.length < 200) cls = "handshake";
+  else if (/Taifoon work notice\./.test(text) && /dm_[0-9a-f]{24}/.test(text)) cls = "taifoon_notice";
   else if (/hello|hi\b|hola|welcome|greeting|present|soy |i am |i'm /.test(lower)) cls = "greeting";
   else if (/offer|propuesta|partnership|alianza|collab|colaboración|service proposal/.test(lower)) cls = "offer";
   else if (/\?/.test(text)) cls = "question";
@@ -463,6 +464,9 @@ app.post("/inbox", async (req, res) => {
   let reply;
   if (cls === "handshake") {
     reply = "READY";
+  } else if (cls === "taifoon_notice") {
+    // respuesta MÁQUINA: {"interested": true} — el demand se liquida en segundos; el HTTP response de este POST es lo que Taifoon lee
+    reply = '{"interested": true}';
   } else if (cls === "digest") {
     reply = String(digestValue);
   } else if (cls === "greeting") {
@@ -496,14 +500,14 @@ app.post("/inbox", async (req, res) => {
       .run(contextId, art.artifactId, art.name, JSON.stringify(art.parts), Date.now());
   }
   // wake-up queue: operator/agent attention needed (research P0 — kills the 2h blind window)
-  if (["offer", "offer_structured", "other"].includes(cls)) {
+  if (["offer", "offer_structured", "other", "taifoon_notice"].includes(cls)) {
     try {
       fs.appendFileSync(WAKE_QUEUE_FILE,
         JSON.stringify({ ts: now, contextId, cls, verified: ident.verified, sender: ident.address || declaredSender, preview: (structuredOffer ? JSON.stringify(structuredOffer) : text).slice(0, 140) }) + "\n");
     } catch {}
   }
   // task states (0.3.0 wire values; 1.0 maps at transport layer)
-  const finalState = ["handshake", "greeting", "question", "digest"].includes(cls) ? "completed" : "input-required";
+  const finalState = ["handshake", "greeting", "question", "digest", "taifoon_notice"].includes(cls) ? "completed" : "input-required";
   upsertTask(contextId, finalState);
 
   const replyMsg = {
