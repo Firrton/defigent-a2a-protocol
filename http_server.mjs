@@ -95,7 +95,7 @@ function logInbox(entry) {
 app.get("/.well-known/agent-card.json", (_req, res) => {
   res.json({
     name: "Defigent",
-    description: "Agentic commerce specialist agent on Monad: on-chain wallet digests, agent directory lookup, and regime analytics. ERC-8004 agentId 10331. Talks and pays x402 (v1+v2).",
+    description: "Agentic commerce specialist agent on Monad and Base: on-chain wallet digests, agent directory lookup, and regime analytics. ERC-8004 agentId 10331 (Monad) and 114426 (Base). Talks and pays x402 (v1+v2).",
     url: `${HTTPS_BASE}/inbox`,
     version: "1.4.0",
     protocolVersion: "1.0.1",
@@ -119,6 +119,10 @@ app.get("/.well-known/agent-card.json", (_req, res) => {
     ],
     provider: { organization: "Defigent (operator: FirrtonH)", url: `${BASE}/info` },
     registration: { agentId: 10331, registry: "eip155:143:0x8004A169FB4a3325136EB29fA0ceB6D2e539a432" },
+    registrations: [
+      { agentId: 10331, registry: "eip155:143:0x8004A169FB4a3325136EB29fA0ceB6D2e539a432" },
+      { agentId: 114426, registry: "eip155:8453:0x8004A169FB4a3325136EB29fA0ceB6D2e539a432" },
+    ],
   });
 });
 
@@ -717,6 +721,15 @@ app.post("/tasks/cancel", (req, res) => {
 });
 
 // ---------- Status heartbeat ----------
+const RPC_BASE_URL = process.env.RPC_BASE_URL || "https://base.drpc.org";
+async function baseHead() {
+  try {
+    const t = Date.now();
+    const r = await fetch(RPC_BASE_URL, { method: "POST", headers: { "Content-Type": "application/json", "User-Agent": "defigent/1.4" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_blockNumber", params: [] }) });
+    const j = await r.json();
+    return { latency_ms: Date.now() - t, head: j.result ? BigInt(j.result).toString() : null };
+  } catch { return { latency_ms: null, head: null }; }
+}
 app.get("/status", async (_req, res) => {
   const t0 = Date.now();
   let rpcMs = null, block = null;
@@ -725,14 +738,20 @@ app.get("/status", async (_req, res) => {
     rpcMs = Date.now() - t0;
     block = BigInt(b).toString();
   } catch {}
+  const base = await baseHead();
   res.json({
     service: "Defigent storefront",
     uptime_s: Math.floor((Date.now() - START_TS) / 1000),
     rpc_latency_ms: rpcMs,
     head_block: block,
+    chains: {
+      monad: { chainId: 143, head_block: block, rpc_latency_ms: rpcMs, registration: { agentId: 10331, registry: "0x8004A169FB4a3325136EB29fA0ceB6D2e539a432" } },
+      base: { chainId: 8453, head_block: base.head, rpc_latency_ms: base.latency_ms, registration: { agentId: 114426, registry: "0x8004A169FB4a3325136EB29fA0ceB6D2e539a432" } },
+    },
     inbox_messages: (function(){ try { return fs.readFileSync(INBOX_FILE, "utf8").split("\n").filter(Boolean).length; } catch { return 0; } })(),
     endpoints: ["/info", "/digest (x402 $0.001)", "/status", "/inbox (A2A 0.3.0+1.0.1, signed+tasks+SSE)", "/tasks/:contextId", "/tasks/cancel", "/mcp (MCP 2026-07-28 stateless)", "/network", "/integration", "/webhooks/onchain", "/.well-known/agent-card.json"],
     registration: { agentId: 10331, registry: "eip155:143:0x8004A169FB4a3325136EB29fA0ceB6D2e539a432" },
+    registrationBase: { agentId: 114426, registry: "eip155:8453:0x8004A169FB4a3325136EB29fA0ceB6D2e539a432" },
   });
 });
 
