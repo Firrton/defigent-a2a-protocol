@@ -1081,12 +1081,16 @@ describe("trust enrichment for signed senders that name an agentId (stub RPC)", 
     rpcServer = http.createServer((req, res) => {
       let body = ""; req.on("data", (d) => { body += d; });
       req.on("end", () => {
-        const j = JSON.parse(body); calls.push(j);
+        const j = JSON.parse(body);
+        // The server's own network-directory scan (tokenURI, at start-up) is not part of the trust flow:
+        // it always gets "no such agent" and is not counted, so these tests only see trust-related calls.
+        const scan = j.method === "eth_call" && String(j.params?.[0]?.data || "").startsWith("0xc87b56dd");
+        if (!scan) calls.push(j);
         let out;
         if (j.method === "eth_blockNumber") out = { result: "0x10" };
         else if (j.method === "eth_call") {
           const { to, data } = j.params[0]; const sel = data.slice(2, 10);
-          if (mode === "revert") out = { error: { code: 3, message: "execution reverted" } };
+          if (mode === "revert" || scan) out = { error: { code: 3, message: "execution reverted" } };
           else if (to.toLowerCase() === IDENTITY_REG.toLowerCase() && sel === "6352211e") out = { result: mode === "owner" ? pad(acct.address) : pad("0x" + "0".repeat(40)) };
           else if (to.toLowerCase() === IDENTITY_REG.toLowerCase() && sel === "00339509") out = { result: pad(acct.address) };
           else out = { result: "0x" }; // reputation registry: no feedback
