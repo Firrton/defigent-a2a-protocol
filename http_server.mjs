@@ -28,6 +28,7 @@ const app = express();
 app.use(express.json({ verify: (req, _res, buf) => { req.rawBody = buf; } }));
 app.use(express.static("public", { index: false })); // dashboard assets (public/index.html served at / below)
 app.get("/", (_req, res) => res.sendFile("index.html", { root: "public" }));
+app.get("/jobs", (_req, res) => res.sendFile("jobs.html", { root: "public" }));
 
 const facilitatorMonad = new HTTPFacilitatorClient({ url: FACILITATOR });
 const facilitatorBase = new HTTPFacilitatorClient({ url: FACILITATOR_BASE });
