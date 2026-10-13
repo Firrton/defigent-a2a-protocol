@@ -33,9 +33,11 @@ registration = {
         {'name': 'status', 'endpoint': HTTPS + '/status', 'version': '1'},
         {'name': 'network', 'endpoint': HTTPS + '/network', 'version': '1'},
         {'name': 'integration', 'endpoint': HTTPS + '/integration', 'version': '1'},
+        {'name': 'jobs', 'endpoint': 'eip155:143:0x61625eA32DaD03403db27cd94D6D3FE23b4A4a65', 'version': 'erc-8183'},
+        {'name': 'x402-base', 'endpoint': 'eip155:8453', 'version': 'x402'},
     ],
     'x402Support': True,
-    'x402': {'rail': 'x402', 'facilitator': 'https://x402-facilitator.molandak.org', 'network': 'eip155:143'},
+    'x402': {'rail': 'x402', 'facilitator': 'https://x402-facilitator.molandak.org', 'network': 'eip155:143', 'facilitatorBase': 'https://facilitator.payai.network', 'networkBase': 'eip155:8453'},
     'supportedTrust': ['eip-8004#trustless-agents-v1'],
     'agentWallet': WALLET,
 }
