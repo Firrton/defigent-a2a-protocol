@@ -734,8 +734,27 @@ app.get("/status", async (_req, res) => {
 });
 
 // ---------- Network directory ----------
+// Source of truth is the on-chain ERC-8004 registry: this server rebuilds the directory itself (startup, every 2h,
+// /network/refresh) into data/network.json, with a committed snapshot as last resort. The lead-monitor cache only
+// enriches it (welcomeTx, status), so a missing or corrupt cache file can no longer empty /network.
+import { fileURLToPath } from "url";
+import { readDirectory, resolveDirectory, rebuildDirectory } from "./network_directory.mjs";
 const NETWORK_FILE = "/home/ubuntu/.hermes/cache/scratch/defigent_network.json";
-function loadNetwork() { try { return JSON.parse(fs.readFileSync(NETWORK_FILE, "utf8")); } catch { return { updated: 0, agents: [] }; } }
+const NETWORK_LOCAL = fileURLToPath(new URL("./data/network.json", import.meta.url));     // runtime rebuild (gitignored)
+const NETWORK_SEED = fileURLToPath(new URL("./data/network.seed.json", import.meta.url)); // committed snapshot
+const NETWORK_REBUILD_MS = 2 * 60 * 60 * 1000;
+function loadNetwork() { return resolveDirectory({ monitor: readDirectory(NETWORK_FILE), local: readDirectory(NETWORK_LOCAL), seed: readDirectory(NETWORK_SEED) }); }
+
+let networkRebuild = null, networkRebuildAt = 0, networkRefreshTimer = null;
+function rebuildNetwork() {
+  if (networkRebuild) return networkRebuild;
+  networkRebuildAt = Date.now();
+  networkRebuild = rebuildDirectory({ ethCall: (to, data) => rpc("eth_call", [{ to, data }, "latest"]), file: NETWORK_LOCAL, seedFile: NETWORK_SEED, selfId: 10331 })
+    .then(r => console.error(`[defigent-http] network directory rebuilt from the registry: ${r.agents} agents, ${r.fetched} registration files read${r.truncated ? " — scan cap reached, newest agents may be missing" : ""}`))
+    .catch(e => console.error(`[defigent-http] network rebuild failed, serving the last good directory: ${String(e?.message || e).slice(0, 200)}`))
+    .finally(() => { networkRebuild = null; });
+  return networkRebuild;
+}
 
 app.get("/network", async (_req, res) => {
   const db = loadNetwork();
@@ -759,8 +778,11 @@ app.get("/network", async (_req, res) => {
 });
 
 app.get("/network/refresh", async (_req, res) => {
-  // Rebuilds the directory from the ERC-8004 registry (open — anyone can trigger; cheap RPC reads)
-  res.json({ queued: true, hint: "directory rebuild runs async via lead-monitor pipeline" });
+  // Rebuilds the directory from the ERC-8004 registry (open — anyone can trigger; at most one scan per 10 min:
+  // a request inside that window is queued for when it closes, so `queued` stays true as before)
+  const wait = Math.max(0, networkRebuildAt + 10 * 60 * 1000 - Date.now());
+  if (!networkRefreshTimer) networkRefreshTimer = setTimeout(() => { networkRefreshTimer = null; rebuildNetwork(); }, wait);
+  res.json({ queued: true, hint: wait ? `directory rebuild from the ERC-8004 registry queued, runs in ~${Math.ceil(wait / 60000)} min (one scan per 10 min)` : "directory rebuild from the ERC-8004 registry started" });
 });
 
 // ---------- Integration guide (adoption) ----------
@@ -858,4 +880,6 @@ app.use((err, _req, res, _next) => {
 
 app.listen(PORT, "0.0.0.0", () => {
   console.error(`[defigent-http] listening :${PORT} — /info free, /digest $0.001 x402 (${NETWORK})`);
+  rebuildNetwork();
+  setInterval(rebuildNetwork, NETWORK_REBUILD_MS);
 });
