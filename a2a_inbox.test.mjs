@@ -46,6 +46,7 @@ if (NODE_MAJOR < 22) {
 // Constants copied from the server's observable output (strings are compared, never fetched)
 // ---------------------------------------------------------------------------------------------------------------------
 const BASE = "http://3.238.185.185:8080"; // GAP(G10): hard-coded production IP over plain HTTP, even when the server runs locally
+const HTTPS_BASE = "https://opacus-liana-lanceted.ngrok-free.dev"; // the card's primary endpoint: a tunnel hostname hard-coded in the server (http_server.mjs:82)
 const CARD_URL = `${BASE}/.well-known/agent-card.json`;
 const TXT = {
   handshake: "READY",
@@ -250,17 +251,21 @@ describe("probes: the nine production probes replayed locally", { timeout: 12000
     assert.match(r.headers["etag"], /^W\/"/);
     // GAP(G12): ETag only; no Cache-Control on the card
     assert.equal(r.headers["cache-control"], undefined);
-    assert.deepEqual(Object.keys(r.json), ["name", "description", "url", "version", "protocolVersion", "supportedInterfaces", "capabilities", "securitySchemes", "extensions", "documentationUrl", "defaultInputModes", "defaultOutputModes", "skills", "provider", "registration"]);
+    assert.deepEqual(Object.keys(r.json), ["name", "description", "url", "version", "protocolVersion", "supportedInterfaces", "address", "agentWallet", "capabilities", "securitySchemes", "extensions", "documentationUrl", "defaultInputModes", "defaultOutputModes", "skills", "provider", "registration"]);
     assert.equal(r.json.name, "Defigent");
     assert.equal(r.json.version, "1.4.0");
-    // GAP(G10): the card advertises the hard-coded production IP over HTTP, also for a local instance
-    assert.equal(r.json.url, `${BASE}/inbox`);
-    // GAP(G12): protocolVersion carries a patch ("1.0.1") and the second interface says "0.3.0" instead of "0.3"; both interfaces share one URL and one hybrid wire format (G3)
+    // GAP(G10): the card advertises a hard-coded tunnel hostname (HTTPS) plus the production IP over plain HTTP, also for a local instance
+    assert.equal(r.json.url, `${HTTPS_BASE}/inbox`);
+    // GAP(G12): protocolVersion carries a patch ("1.0.1") and the second interface says "0.3.0" instead of "0.3"; all interfaces share one hybrid wire format (G3)
     assert.equal(r.json.protocolVersion, "1.0.1");
     assert.deepEqual(r.json.supportedInterfaces, [
+      { url: `${HTTPS_BASE}/inbox`, protocolBinding: "JSONRPC", protocolVersion: "1.0" },
+      { url: `${HTTPS_BASE}/inbox`, protocolBinding: "JSONRPC", protocolVersion: "0.3.0" },
       { url: `${BASE}/inbox`, protocolBinding: "JSONRPC", protocolVersion: "1.0" },
-      { url: `${BASE}/inbox`, protocolBinding: "JSONRPC", protocolVersion: "0.3.0" },
     ]);
+    // the card binds the agent to its payment wallet (added for marketplace registration)
+    assert.equal(r.json.address, "0x940ecB27d8f4F7009c8BC12969496E9639717638");
+    assert.equal(r.json.agentWallet, r.json.address);
     // GAP(G12): stateTransitionHistory:true has no backing (tasks store only the current state); streaming:true is a one-shot replay (G5)
     assert.deepEqual(r.json.capabilities, { streaming: true, pushNotifications: false, stateTransitionHistory: true, extendedAgentCard: true });
     // GAP(G8): securitySchemes is empty although the inbox has an identity mechanism; the extension sits at top level, not in capabilities.extensions (G12)
