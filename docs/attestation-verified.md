@@ -15,3 +15,4 @@ no se puede escribir sin un settle on-chain real. El gating por reputación
 
 Self-test antecedente: jobId 4 (ciclo completo con provider sin agentId → el hook
 correctamente NO escribió nada — guard de providerAgentId==0 verificado).
+docs: broadcast 60/60 verificado (landing /jobs live, dedupe+retry)
