@@ -9,7 +9,8 @@ env = dict(l.strip().split('=', 1) for l in open(os.path.expanduser('~/.hermes/.
 RPC = env['QUICKNODE_URL']
 W = env.get('DEFIGENT_ADDRESS') or '0x940ecB27d8f4F7009c8BC12969496E9639717638'
 USDC = '0x754704Bc059F8C67012fEd69BC8A327a5aafb603'
-AMT = 5_000_000  # 5 USDC
+import sys
+AMT = int(sys.argv[1]) if len(sys.argv) > 1 else 5_000_000  # micro-USDC (default 5 USDC)
 CHAIN_MONAD, CHAIN_BASE = 143, 8453
 
 def rpc(m, p):

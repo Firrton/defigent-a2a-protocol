@@ -8,7 +8,9 @@ import { HTTPFacilitatorClient } from "@x402/core/server";
 const PAY_TO = "0x940ecB27d8f4F7009c8BC12969496E9639717638";
 const RPC = process.env.RPC_URL || "https://rpc.monad.xyz";
 const FACILITATOR = "https://x402-facilitator.molandak.org";
+const FACILITATOR_BASE = process.env.FACILITATOR_BASE || "https://facilitator.payai.network";
 const NETWORK = "eip155:143";
+const NETWORK_BASE = "eip155:8453";
 const PORT = process.env.PORT || 8080;
 
 async function rpc(method, params) {
@@ -27,15 +29,21 @@ app.use(express.json({ verify: (req, _res, buf) => { req.rawBody = buf; } }));
 app.use(express.static("public", { index: false })); // dashboard assets (public/index.html served at / below)
 app.get("/", (_req, res) => res.sendFile("index.html", { root: "public" }));
 
-const facilitatorClient = new HTTPFacilitatorClient({ url: FACILITATOR });
-const resourceServer = new x402ResourceServer(facilitatorClient).register(NETWORK, new ExactEvmScheme());
+const facilitatorMonad = new HTTPFacilitatorClient({ url: FACILITATOR });
+const facilitatorBase = new HTTPFacilitatorClient({ url: FACILITATOR_BASE });
+const resourceServer = new x402ResourceServer([facilitatorMonad, facilitatorBase])
+  .register(NETWORK, new ExactEvmScheme())
+  .register(NETWORK_BASE, new ExactEvmScheme());
 await resourceServer.initialize();
 
 app.use(paymentMiddleware(
   {
     "GET /digest": {
-      accepts: [{ scheme: "exact", price: "$0.001", network: NETWORK, payTo: PAY_TO }],
-      description: "Defigent on-chain wallet digest (MON+USDC balances), ERC-8004 agentId 10331",
+      accepts: [
+        { scheme: "exact", price: "$0.001", network: NETWORK, payTo: PAY_TO },
+        { scheme: "exact", price: "$0.001", network: NETWORK_BASE, payTo: PAY_TO },
+      ],
+      description: "Defigent on-chain wallet digest (balances), ERC-8004 agentId 10331 (Monad) / 114426 (Base). Dual-chain x402.",
     },
   },
   resourceServer
