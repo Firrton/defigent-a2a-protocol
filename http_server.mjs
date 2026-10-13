@@ -77,6 +77,7 @@ app.get("/digest", async (req, res) => {
 
 import fs from "fs";
 import os from "os";
+import path from "path";
 
 const BASE = `http://3.238.185.185:8080`;
 const START_TS = Date.now();
@@ -84,6 +85,8 @@ const DATA_DIR = process.env.DEFIGENT_DATA_DIR || "/home/ubuntu/.hermes/cache/sc
 const INBOX_FILE = `${DATA_DIR}/defigent_inbox.jsonl`;
 const WAKE_QUEUE_FILE = `${DATA_DIR}/defigent_wake_queue.jsonl`;
 const WEBHOOK_REJECTS_FILE = `${DATA_DIR}/defigent_webhook_rejects.jsonl`;
+const OUTBOX_FILE = `${DATA_DIR}/defigent_outbox.jsonl`;                 // the operator agent appends its replies here (see "Operator outbox")
+const OUTBOX_REJECTS_FILE = `${DATA_DIR}/defigent_outbox_rejects.jsonl`; // why a line of the outbox was not applied
 const RATE = new Map(); // ip -> [timestamps]
 
 function logInbox(entry) {
@@ -167,8 +170,120 @@ function addMessage(contextId, role, text, verified, sender, meta = null) {
 }
 
 function getHistory(contextId) {
-  return a2a.prepare(`SELECT role, text, verified, sender, ts FROM messages WHERE context_id=? ORDER BY ts ASC`).all(contextId);
+  return a2a.prepare(`SELECT role, text, verified, sender, ts, meta FROM messages WHERE context_id=? ORDER BY ts ASC, id ASC`).all(contextId);
 }
+
+// history item as returned to clients; `data` (the stored data/file parts) is present only on messages that have any
+function historyItem(m) {
+  let data; try { data = m.meta ? JSON.parse(m.meta) : undefined; } catch {}
+  return { role: m.role, text: m.text, verified: !!m.verified, sender: m.sender, ts: m.ts, ...(data !== undefined ? { data } : {}) };
+}
+
+// ---------- Operator outbox: how the operator agent's reasoned reply gets back into a task ----------
+// The operator agent (outside this repo) appends one JSON object per line to OUTBOX_FILE:
+//   {"contextId": "<task id>", "text": "<reply>", "state": "completed|input-required|failed|rejected", "data": {…}, "replyId": "<idempotency key>"}
+// A timer ingests new complete lines every 2 s. No HTTP route: the file is the only way in. Docs: docs/operator-outbox.md
+const OUTBOX_STATES = ["completed", "input-required", "failed", "rejected"];
+const OUTBOX_MAX_TEXT = 4000, OUTBOX_MAX_DATA = 16 * 1024, OUTBOX_MAX_REPLY_ID = 200;
+const OUTBOX_WINDOW = 1 << 20; // bytes read per step; a line longer than this can never be valid
+a2a.exec(`CREATE TABLE IF NOT EXISTS outbox_state (id INTEGER PRIMARY KEY CHECK (id = 1), byte_offset INTEGER NOT NULL, ino TEXT);
+CREATE TABLE IF NOT EXISTS outbox_applied (reply_key TEXT PRIMARY KEY, ts INTEGER NOT NULL);`);
+
+const getOutboxState = () => a2a.prepare(`SELECT byte_offset, ino FROM outbox_state WHERE id=1`).get() || { byte_offset: 0, ino: null };
+function setOutboxState(offset, ino) {
+  a2a.prepare(`INSERT INTO outbox_state (id, byte_offset, ino) VALUES (1,?,?) ON CONFLICT(id) DO UPDATE SET byte_offset=excluded.byte_offset, ino=excluded.ino`).run(offset, ino);
+}
+function rejectOutboxLine(reason, line) {
+  try { fs.appendFileSync(OUTBOX_REJECTS_FILE, JSON.stringify({ ts: Date.now(), reason, line: String(line).slice(0, 300) }) + "\n"); } catch {}
+}
+
+// Returns a rejection reason, or null when the reply was applied (the new offset is saved in the same transaction).
+function applyOutboxLine(line, endOffset, ino) {
+  let o;
+  try { o = JSON.parse(line); } catch { return "line is not valid JSON"; }
+  if (!o || typeof o !== "object" || Array.isArray(o)) return "line is not a JSON object";
+  if (typeof o.contextId !== "string" || !o.contextId) return "contextId must be a non-empty string";
+  const text = typeof o.text === "string" ? o.text.trim() : "";
+  if (!text) return "text must be a non-empty string";
+  if (text.length > OUTBOX_MAX_TEXT) return `text is longer than ${OUTBOX_MAX_TEXT} characters`;
+  const state = o.state === undefined ? "completed" : o.state;
+  if (!OUTBOX_STATES.includes(state)) return `state must be one of ${OUTBOX_STATES.join(", ")}`;
+  if (o.data !== undefined && (!o.data || typeof o.data !== "object" || Array.isArray(o.data) || Buffer.byteLength(JSON.stringify(o.data)) > OUTBOX_MAX_DATA)) return "data must be a plain object of at most 16 kB";
+  if (o.replyId !== undefined && (typeof o.replyId !== "string" || !o.replyId || o.replyId.length > OUTBOX_MAX_REPLY_ID)) return `replyId must be a non-empty string of at most ${OUTBOX_MAX_REPLY_ID} characters`;
+  const task = a2a.prepare(`SELECT state FROM tasks WHERE context_id=?`).get(o.contextId);
+  if (!task) return "unknown task: no task with that contextId";
+  if (task.state === "canceled") return "task is canceled";
+  // idempotency: replyId when given, otherwise a hash of the line itself
+  const key = o.replyId !== undefined ? `id:${o.replyId}` : `sha256:${crypto.createHash("sha256").update(line).digest("hex")}`;
+  if (a2a.prepare(`SELECT 1 FROM outbox_applied WHERE reply_key=?`).get(key)) return "duplicate: this reply was already applied";
+  a2a.transaction(() => {
+    a2a.prepare(`INSERT INTO outbox_applied (reply_key, ts) VALUES (?,?)`).run(key, Date.now());
+    addMessage(o.contextId, "agent", text, true, null, o.data ? JSON.stringify({ data: [o.data], files: [] }) : null);
+    upsertTask(o.contextId, state);
+    setOutboxState(endOffset, ino);
+  })();
+  return null;
+}
+
+let outboxDiscarding = false; // inside a line longer than OUTBOX_WINDOW: skip it up to its newline
+let outboxLastError = "";
+function ingestOutbox() {
+  let fd;
+  try {
+    try { fd = fs.openSync(OUTBOX_FILE, "r"); } catch (e) {
+      if (e?.code === "ENOENT") { outboxDiscarding = false; if (getOutboxState().byte_offset) setOutboxState(0, null); return; } // no file (yet, or any more): whatever comes next is new
+      throw e;
+    }
+    const { size, ino: inoNum } = fs.fstatSync(fd);
+    const ino = String(inoNum);
+    const saved = getOutboxState();
+    let offset = saved.byte_offset;
+    if (size < offset || (saved.ino && saved.ino !== ino)) { offset = 0; outboxDiscarding = false; } // truncated or replaced: start over (replies already applied are deduplicated)
+    if (offset !== saved.byte_offset || saved.ino !== ino) setOutboxState(offset, ino);
+    while (offset < size) {
+      const buf = Buffer.alloc(Math.min(OUTBOX_WINDOW, size - offset));
+      const n = fs.readSync(fd, buf, 0, buf.length, offset);
+      if (n <= 0) break;
+      const chunk = buf.subarray(0, n);
+      const last = chunk.lastIndexOf(0x0a);
+      if (outboxDiscarding) { // the rest of an oversized line
+        outboxDiscarding = chunk.indexOf(0x0a) < 0;
+        offset += outboxDiscarding ? n : chunk.indexOf(0x0a) + 1;
+        setOutboxState(offset, ino);
+        continue;
+      }
+      if (last < 0) {
+        if (n < OUTBOX_WINDOW) break; // a line still being written: wait for its newline
+        rejectOutboxLine(`line is longer than ${OUTBOX_WINDOW} bytes`, chunk.toString("utf8", 0, 300));
+        outboxDiscarding = true; offset += n; setOutboxState(offset, ino);
+        continue;
+      }
+      for (let start = 0; start <= last;) {
+        const nl = chunk.indexOf(0x0a, start);
+        const line = chunk.toString("utf8", start, nl).trim();
+        const end = offset + nl + 1;
+        start = nl + 1;
+        if (!line) continue;
+        let reason;
+        try { reason = applyOutboxLine(line, end, ino); } catch (e) {
+          if (String(e?.code).startsWith("SQLITE")) throw e; // environmental (disk full, locked...): keep the offset and retry on the next tick
+          reason = "internal error: " + String(e?.message || e).slice(0, 100);
+        }
+        if (reason) { rejectOutboxLine(reason, line); setOutboxState(end, ino); }
+      }
+      offset += last + 1;
+      setOutboxState(offset, ino);
+    }
+    outboxLastError = "";
+  } catch (e) {
+    const msg = String(e?.message || e);
+    if (msg !== outboxLastError) console.error("[defigent-http] outbox ingest failed:", msg); // once per distinct error, not every tick
+    outboxLastError = msg;
+  } finally {
+    if (fd !== undefined) try { fs.closeSync(fd); } catch {}
+  }
+}
+setInterval(ingestOutbox, 2000).unref();
 
 // ---------- Trust pipeline: on-chain owner check + reputation (all VERIFIED vs Monad live) ----------
 const IDENTITY_REG = "0x8004A169FB4a3325136EB29fA0ceB6D2e539a432";
@@ -284,6 +399,22 @@ async function verifyAuth(auth, declaredSender) {
 }
 
 // ---------- A2A inbox (JSON-RPC message/send) — tasks + identity ----------
+// Classifier rules. A question is only answered from the canned catalogue when it asks what Defigent offers.
+const SERVICE_QUESTION = /\b(?:services?|prices?|pricing|costs?|endpoints?|x402|digest)\b|\bwhat (?:can|do) you (?:do|offer)\b|\bhow (?:(?:do|can|could|should) (?:i|we)|to) (?:pay|use|integrate)\b/;
+const GREETING_START = /^(?:hi|hello|hey|hola|gm|greetings|saludos|good (?:morning|afternoon|evening))\b/i;
+
+// One wake-queue line: the original fields plus the thread so far and how to answer (reply_via), so the entry is self-describing.
+// The thread text is cut to 300 characters per message; if escaping still pushes the line over ~4 kB the cut is tightened.
+function wakeQueueLine(entry) {
+  const thread = getHistory(entry.contextId).slice(-6);
+  const reply_via = { file: path.resolve(OUTBOX_FILE), line: { contextId: entry.contextId, text: "<your reply>", state: "completed | input-required | failed | rejected" } };
+  let line;
+  for (const cut of [300, 150, 75, 40]) {
+    line = JSON.stringify({ ...entry, thread: thread.map(m => ({ role: m.role, text: m.text.slice(0, cut), verified: !!m.verified })), reply_via });
+    if (line.length <= 4000) break;
+  }
+  return line;
+}
 app.post("/inbox", async (req, res) => {
   const ip = req.ip || "unknown";
   const now = Date.now();
@@ -360,7 +491,7 @@ app.post("/inbox", async (req, res) => {
     const includeArtifacts = p.includeArtifacts !== false && p.includeArtifacts !== "false";
     const tasks = page.map(r => {
       const t = { id: r.context_id, contextId: r.context_id, status: { state: r.state, timestamp: new Date(r.updated_at).toISOString() } };
-      if (historyLen > 0) t.history = getHistory(r.context_id).slice(-historyLen).map(m => ({ role: m.role, text: m.text, verified: !!m.verified, sender: m.sender, ts: m.ts }));
+      if (historyLen > 0) t.history = getHistory(r.context_id).slice(-historyLen).map(historyItem);
       if (includeArtifacts) {
         const arts = a2a.prepare(`SELECT artifact_id, name, parts_json, ts FROM artifacts WHERE task_id=? ORDER BY ts ASC`).all(r.context_id);
         if (arts.length) t.artifacts = arts.map(a => ({ artifactId: a.artifact_id, name: a.name, parts: JSON.parse(a.parts_json) }));
@@ -383,7 +514,7 @@ app.post("/inbox", async (req, res) => {
     if (!t) return res.json({ jsonrpc: "2.0", id: body?.id ?? null, error: { code: -32001, message: "TaskNotFound", data: { contextId: ctx } } });
     const result = { id: t.context_id, contextId: t.context_id, status: { state: t.state, timestamp: new Date(t.updated_at).toISOString() } };
     const hl = Math.max(parseInt(body?.params?.historyLength) || 0, 0);
-    if (hl > 0) result.history = getHistory(ctx).slice(-hl).map(m => ({ role: m.role, text: m.text, verified: !!m.verified, sender: m.sender, ts: m.ts }));
+    if (hl > 0) result.history = getHistory(ctx).slice(-hl).map(historyItem);
     const arts = a2a.prepare(`SELECT artifact_id, name, parts_json, ts FROM artifacts WHERE task_id=? ORDER BY ts ASC`).all(ctx);
     if (arts.length) result.artifacts = arts.map(a => ({ artifactId: a.artifact_id, name: a.name, parts: JSON.parse(a.parts_json) }));
     return res.json({ jsonrpc: "2.0", id: body?.id ?? null, result });
@@ -414,35 +545,42 @@ app.post("/inbox", async (req, res) => {
   const contextId = msg?.contextId || msg?.taskId || `t-${messageId}`;
   upsertTask(contextId, "working");
 
-  const lower = (text || "").toLowerCase();
-  let cls = "other";
-  if (/onboarding probe.*ready/i.test(text) && text.length < 200) cls = "handshake";
-  else if (/hello|hi\b|hola|welcome|greeting|present|soy |i am |i'm /.test(lower)) cls = "greeting";
-  else if (/offer|propuesta|partnership|alianza|collab|colaboración|service proposal/.test(lower)) cls = "offer";
-  else if (/\?/.test(text)) cls = "question";
   // structured offer (Defigent offer schema v1): DataPart {intent:"offer", service, price, asset, expiry?, terms?}
   let structuredOffer = null;
   for (const d of dataParts) {
     if (d?.intent === "offer" && d?.service && d?.price) { structuredOffer = d; break; }
   }
+  // Only short, unambiguous messages are closed with a template; everything else goes to the operator agent.
+  // Order: handshake -> structured offer -> offer keywords -> service question -> plain greeting -> other
+  // (a structured offer DataPart also wins over handshake-looking text, as before: a data offer is never dropped)
+  const trimmed = (text || "").trim();
+  const lower = trimmed.toLowerCase();
+  let cls = "other";
   if (structuredOffer) cls = "offer_structured";
+  else if (/onboarding probe.*ready/i.test(text) && text.length < 200) cls = "handshake";
+  // "do you offer ...?" asks for our services; it is not an offer keyword
+  else if (/offer|propuesta|partnership|alianza|collab|colaboración|service proposal/.test(lower.replace(/\b(?:do|can|could|would|will) you offer\b/g, " "))) cls = "offer";
+  else if (trimmed.length <= 200 && trimmed.includes("?") && SERVICE_QUESTION.test(lower)) cls = "question";
+  else if (trimmed.length <= 60 && !trimmed.includes("?") && GREETING_START.test(trimmed)) cls = "greeting";
 
   logInbox({ ts: now, ip, messageId, cls, from: msg?.role || "unknown", declaredAgent: /agentId[ ]?\d+/i.exec(text)?.[0] || null, verified: ident.verified, sender: ident.address || null, contextId, hasData: dataParts.length > 0, hasFiles: fileParts.length > 0, text: (text || "").slice(0, 2000) });
   addMessage(contextId, "user", text || "(no text; structured parts only)", ident.verified, ident.address || declaredSender, dataParts.length || fileParts.length ? JSON.stringify({ data: dataParts, files: fileParts }) : null);
 
+  // replies never interpolate sender-controlled text (offer fields, task id): the parsed offer travels as the received-offer artifact
+  const POLL = `poll GetTask / tasks/get with the task id from this response (or GET ${BASE}/tasks/{id})`;
   let reply;
   if (cls === "handshake") {
     reply = "READY";
   } else if (cls === "greeting") {
     reply = `Hello! Defigent here (ERC-8004 agentId 10331, Monad). We run the standard A2A inbox you are using right now — any agent on Monad can write to us here. Our paid services run on x402: wallet digest $0.001, agent lookup free. Let's interop.`;
   } else if (cls === "offer_structured") {
-    reply = `Structured offer received (schema v1, machine-readable — thanks!). Service: ${structuredOffer.service}, price: ${structuredOffer.price} ${structuredOffer.asset || "USDC"}. Logged for operator review; response via this inbox or Telegram @FirrtonH. Card: ${BASE}/.well-known/agent-card.json`;
+    reply = `Structured offer received (schema v1, machine-readable — thanks!) and queued for the operator agent. The parsed offer is attached to this task as the received-offer artifact. Its reasoned reply will be posted to this same task: ${POLL}. Card: ${BASE}/.well-known/agent-card.json`;
   } else if (cls === "offer") {
-    reply = `Offer received and logged for operator review (response via this inbox or Telegram @FirrtonH). Tip: send structured offers as DataPart {intent:"offer", service, price, asset, expiry, terms} — see ${BASE}/integration (offer schema v1). Card: ${BASE}/.well-known/agent-card.json`;
+    reply = `Offer queued for the operator agent. Its reasoned reply will be posted to this same task: ${POLL}. Tip: send structured offers as DataPart {intent:"offer", service, price, asset, expiry, terms} — see ${BASE}/integration (offer schema v1). Card: ${BASE}/.well-known/agent-card.json`;
   } else if (cls === "question") {
     reply = `Answering from Defigent KB: services — GET /info (free), GET /digest?address=0x... ($0.001 x402), GET /status (free), GET /.well-known/agent-card.json (A2A). Operator: Telegram @FirrtonH.`;
   } else {
-    reply = `Message logged for operator review. Card: ${BASE}/.well-known/agent-card.json`;
+    reply = `Message queued for the operator agent. Its reasoned reply will be posted to this same task: ${POLL}. Card: ${BASE}/.well-known/agent-card.json`;
   }
 
   addMessage(contextId, "agent", reply, true, null);
@@ -460,14 +598,15 @@ app.post("/inbox", async (req, res) => {
       .run(contextId, art.artifactId, art.name, JSON.stringify(art.parts), Date.now());
   }
   // wake-up queue: operator/agent attention needed (research P0 — kills the 2h blind window)
-  if (["offer", "offer_structured", "other"].includes(cls)) {
+  const toOperator = ["offer", "offer_structured", "other"].includes(cls);
+  if (toOperator) {
     try {
-      fs.appendFileSync(WAKE_QUEUE_FILE,
-        JSON.stringify({ ts: now, contextId, cls, verified: ident.verified, sender: ident.address || declaredSender, preview: (structuredOffer ? JSON.stringify(structuredOffer) : text).slice(0, 140) }) + "\n");
+      fs.appendFileSync(WAKE_QUEUE_FILE, wakeQueueLine({ ts: now, contextId, cls, verified: ident.verified, sender: ident.address || declaredSender, preview: (structuredOffer ? JSON.stringify(structuredOffer) : text).slice(0, 140) }) + "\n");
     } catch {}
   }
-  // task states (0.3.0 wire values; 1.0 maps at transport layer)
-  const finalState = ["handshake", "greeting", "question"].includes(cls) ? "completed" : "input-required";
+  // task states: a template closes the task; a message for the operator stays `working` until the operator answers through the
+  // outbox (and `input-required` only appears when the operator itself asks the sender something)
+  const finalState = toOperator ? "working" : "completed";
   upsertTask(contextId, finalState);
 
   const replyMsg = {
@@ -552,7 +691,7 @@ app.get("/tasks/:contextId", (req, res) => {
   if (!task) return res.status(404).json({ jsonrpc: "2.0", id: null, error: { code: -32001, message: "TaskNotFound", data: { contextId: ctx } } });
   res.json({
     task: { id: task.context_id, state: task.state, createdAt: task.created_at, updatedAt: task.updated_at },
-    history: getHistory(ctx).map(m => ({ role: m.role, text: m.text, verified: !!m.verified, sender: m.sender, ts: m.ts, ...(m.meta ? { data: JSON.parse(m.meta) } : {}) })),
+    history: getHistory(ctx).map(historyItem),
     artifacts: a2a.prepare(`SELECT artifact_id, name, parts_json, ts FROM artifacts WHERE task_id=? ORDER BY ts ASC`).all(ctx)
       .map(a => ({ artifactId: a.artifact_id, name: a.name, parts: JSON.parse(a.parts_json), ts: a.ts })),
   });
@@ -734,7 +873,7 @@ app.get("/integration", (_req, res) => {
       },
       {
         step: "2c", title: "Track the conversation (A2A tasks)",
-        how: `Every message creates/updates a task. The reply carries contextId + task:{id,state}. Read the full thread: curl http://3.238.185.185:8080/tasks/<contextId> — returns state (working/completed/input-required/canceled) + signed history of both sides.`,
+        how: `Every message creates/updates a task. The reply carries contextId + task:{id,state}. Read the full thread: curl http://3.238.185.185:8080/tasks/<contextId> — returns state (working/completed/input-required/canceled) + signed history of both sides. A message that needs reasoning is acknowledged at once and the task stays working while the operator agent answers it; the reasoned reply is appended to this same task later, so poll GET /tasks/<contextId> (or GetTask / tasks/get) until the state leaves working. input-required now means the operator is asking you something: answer with the same contextId.`,
         note: "Pass contextId in your next message to continue the same thread. States: submitted/working/input-required/completed/canceled."
       },
       {
