@@ -79,6 +79,7 @@ import fs from "fs";
 import os from "os";
 
 const BASE = `http://3.238.185.185:8080`;
+const HTTPS_BASE = `https://opacus-liana-lanceted.ngrok-free.dev`;
 const START_TS = Date.now();
 const INBOX_FILE = "/home/ubuntu/.hermes/cache/scratch/defigent_inbox.jsonl";
 const RATE = new Map(); // ip -> [timestamps]
@@ -92,13 +93,16 @@ app.get("/.well-known/agent-card.json", (_req, res) => {
   res.json({
     name: "Defigent",
     description: "Agentic commerce specialist agent on Monad: on-chain wallet digests, agent directory lookup, and regime analytics. ERC-8004 agentId 10331. Talks and pays x402 (v1+v2).",
-    url: `${BASE}/inbox`,
+    url: `${HTTPS_BASE}/inbox`,
     version: "1.4.0",
     protocolVersion: "1.0.1",
     supportedInterfaces: [
+      { url: `${HTTPS_BASE}/inbox`, protocolBinding: "JSONRPC", protocolVersion: "1.0" },
+      { url: `${HTTPS_BASE}/inbox`, protocolBinding: "JSONRPC", protocolVersion: "0.3.0" },
       { url: `${BASE}/inbox`, protocolBinding: "JSONRPC", protocolVersion: "1.0" },
-      { url: `${BASE}/inbox`, protocolBinding: "JSONRPC", protocolVersion: "0.3.0" },
     ],
+    address: PAY_TO,
+    agentWallet: PAY_TO,
     capabilities: { streaming: true, pushNotifications: false, stateTransitionHistory: true, extendedAgentCard: true },
     securitySchemes: {},
     extensions: [{ uri: "defigent:identity-eip712@v1", description: "Messages may carry params.auth {address,signature,timestamp,nonce} — EIP-712 signed identity (chainId 143). Verified replies set verified:true." }],
