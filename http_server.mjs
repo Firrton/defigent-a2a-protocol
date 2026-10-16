@@ -449,9 +449,9 @@ app.post("/inbox", async (req, res) => {
   if (digestMatch && digestValue) cls = "digest";
   else if (/onboarding probe.*ready/i.test(text) && text.length < 200) cls = "handshake";
   else if (/Taifoon work notice\./.test(text) && /dm_[0-9a-f]{24}/.test(text)) cls = "taifoon_notice";
-  else if (/chat\.word_count:\s*Count the words in:\s*"([^"]+)"/i.test(text)) {
+  else if (/chat\.word_count:[^"]*"([^"]+)"/i.test(text)) {
     cls = "word_count";
-    wcTarget = /chat\.word_count:\s*Count the words in:\s*"([^"]+)"/i.exec(text)[1];
+    wcTarget = /chat\.word_count:[^"]*"([^"]+)"/i.exec(text)[1];
   }
   else if (/chat\.(\w+):/i.test(text)) cls = "taifoon_probe"; // practice probe desconocido → operador
   else if (/hello|hi\b|hola|welcome|greeting|present|soy |i am |i'm /.test(lower)) cls = "greeting";
