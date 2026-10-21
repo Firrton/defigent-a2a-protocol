@@ -43,12 +43,12 @@ def enc(sig, types, vals):
 W = client.address
 print('client:', W, '| provider B:', B.address)
 
-# 1. gas a B (0.3 MON)
-h, gu = send(client, B.address, '0x', 300_000_000_000_000_000, 21000)
+# 1. gas a B (0.8 MON — el setBudget con gas fijo 3M @300gwei cuesta ~0.9 MON de cap)
+h, gu = send(client, B.address, '0x', 800_000_000_000_000_000, 21000)
 print('gas a B: 0x1', 'gas', gu)
 
 # 2. crear job (provider ABIERTO, evaluator = client, hook reputación)
-desc = 'DOGFOOD JOB B: return the keccak256 hex digest of the exact UTF-8 text "defigent-dogfood-b-1". Budget: 0.05 USDC.'
+desc = 'DOGFOOD JOB B: return the keccak256 hex digest of the exact UTF-8 text "defigent-dogfood-b-2". Budget: 0.05 USDC.'
 exp = int(time.time()) + 7200
 h, gu = send(client, PROXY, enc('createJob(address,address,uint48,string,address,uint256)',
     ['address','address','uint48','string','address','uint256'],
@@ -74,7 +74,7 @@ h, gu = send(client, PROXY, enc('fund(uint256,address,uint256,bytes)', ['uint256
 print('fund: 0x1 gas', gu)
 
 # 6. B submita el deliverable
-digest = keccak(text='defigent-dogfood-b-1')
+digest = keccak(text='defigent-dogfood-b-2')
 h, gu = send(B, PROXY, enc('submit(uint256,bytes32,bytes)', ['uint256','bytes32','bytes'], [jid, digest, b'']), gas=800_000)
 print('provider submit: 0x1 gas', gu)
 
