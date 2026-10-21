@@ -53,13 +53,16 @@ const HTTPS_BASE = "https://opacus-liana-lanceted.ngrok-free.dev"; // the card's
 const CARD_URL = `${BASE}/.well-known/agent-card.json`;
 // Interim acknowledgement for messages that go to the operator agent: honest about what happens next, no sender text, no task id.
 const POLL_HINT = `poll GetTask / tasks/get with the task id from this response (or GET ${BASE}/tasks/{id})`;
+// Honest about the safety net: the operator may not answer, and the sender is told what happens then (30 minutes unless the env var says otherwise)
+const WAIT_NOTE = (phrase = "30 minutes") => `If no reply arrives within ~${phrase} this task will be marked input-required; a reply can still be posted later.`;
+const TIMEOUT_TEXT = "No operator reply yet. This task stays open: a reply may still be posted here; you can also reach the operator on Telegram @FirrtonH.";
 const TXT = {
   handshake: "READY",
   greeting: "Hello! Defigent here (ERC-8004 agentId 10331, Monad). We run the standard A2A inbox you are using right now — any agent on Monad can write to us here. Our paid services run on x402: wallet digest $0.001, agent lookup free. Let's interop.",
   question: "Answering from Defigent KB: services — GET /info (free), GET /digest?address=0x... ($0.001 x402), GET /status (free), GET /.well-known/agent-card.json (A2A). Operator: Telegram @FirrtonH.",
-  offer: `Offer queued for the operator agent. Its reasoned reply will be posted to this same task: ${POLL_HINT}. Tip: send structured offers as DataPart {intent:"offer", service, price, asset, expiry, terms} — see ${BASE}/integration (offer schema v1). Card: ${CARD_URL}`,
-  structured: `Structured offer received (schema v1, machine-readable — thanks!) and queued for the operator agent. The parsed offer is attached to this task as the received-offer artifact. Its reasoned reply will be posted to this same task: ${POLL_HINT}. Card: ${CARD_URL}`,
-  other: `Message queued for the operator agent. Its reasoned reply will be posted to this same task: ${POLL_HINT}. Card: ${CARD_URL}`,
+  offer: `Offer queued for the operator agent. Its reasoned reply will be posted to this same task: ${POLL_HINT}. ${WAIT_NOTE()} Tip: send structured offers as DataPart {intent:"offer", service, price, asset, expiry, terms} — see ${BASE}/integration (offer schema v1). Card: ${CARD_URL}`,
+  structured: `Structured offer received (schema v1, machine-readable — thanks!) and queued for the operator agent. The parsed offer is attached to this task as the received-offer artifact. Its reasoned reply will be posted to this same task: ${POLL_HINT}. ${WAIT_NOTE()} Card: ${CARD_URL}`,
+  other: `Message queued for the operator agent. Its reasoned reply will be posted to this same task: ${POLL_HINT}. ${WAIT_NOTE()} Card: ${CARD_URL}`,
 };
 const PROBE_TEXT = "[A2A conformance probe] Automated audit by the operator's own Claude Code session. No action or reply needed."; // classifies as `other`
 const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
@@ -102,6 +105,7 @@ class Harness {
     const port = await freePort();
     const env = { ...process.env, DEFIGENT_DATA_DIR: dir, PORT: String(port), RPC_URL: rpcUrl, RPC_BASE_URL: baseRpcUrl };
     delete env.WEBHOOK_SECRET; // make the webhook HMAC path deterministic (a test may set its own below)
+    delete env.DEFIGENT_OPERATOR_TIMEOUT_MS; delete env.DEFIGENT_OPERATOR_SWEEP_MS; // the defaults (30 min / 60 s) unless a group sets its own
     Object.assign(env, extraEnv);
     const h = new Harness({ dir, port, env, budget });
     LIVE.add(h);
@@ -755,7 +759,8 @@ describe("classifier: class, reply, state and wake queue per message class", { t
         assert.match(text, /posted to this same task/);
         assert.match(text, /GetTask \/ tasks\/get/);
         assert.match(text, /GET http:\/\/3\.238\.185\.185:8080\/tasks\/\{id\}/);
-        assert.doesNotMatch(text, /input-required|logged for operator review|Telegram/);
+        assert.match(text, /If no reply arrives within ~30 minutes this task will be marked input-required; a reply can still be posted later\./);
+        assert.doesNotMatch(text, /logged for operator review|Telegram/);
         assert.equal(/structured offers as DataPart/.test(text), c.cls === "offer"); // the free-text offer reply keeps its tip
       }
     });
@@ -1209,6 +1214,154 @@ describe("pending operator: machine-class follow-ups keep the task working and d
       assert.match(plan("SELECT MAX(ts) FROM messages WHERE context_id=? AND role='user'"), /idx_messages_ctx_ts/);
       assert.match(plan("SELECT role FROM messages WHERE context_id=? ORDER BY ts DESC, id DESC LIMIT 6"), /idx_messages_ctx_ts/);
     } finally { db.close(); }
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
+// 13. Operator timeout: a task that waits for an operator that never answers does not stay `working` forever
+// ---------------------------------------------------------------------------------------------------------------------
+// 1500 ms timeout, swept every 300 ms (the production defaults are 30 minutes and 60 s). 1500 ms is worded as "2 seconds".
+const TXT_OTHER_SMALL = TXT.other.replace(WAIT_NOTE(), WAIT_NOTE("2 seconds")); // the ack of an `other` message under SMALL_TIMEOUT
+const SMALL_TIMEOUT = { DEFIGENT_OPERATOR_TIMEOUT_MS: "1500", DEFIGENT_OPERATOR_SWEEP_MS: "300" };
+describe("operator timeout: the sweeper marks unanswered tasks input-required, late replies and follow-ups still work", { timeout: 180000 }, () => {
+  let h;
+  before(async () => { h = await Harness.start({ env: SMALL_TIMEOUT }); });
+  after(async () => { await h?.stop(); });
+  const state = async (ctx) => (await h.get(`/tasks/${ctx}`)).json.task.state;
+  const wake = (ctx) => h.readJsonl("defigent_wake_queue.jsonl").filter((e) => e.contextId === ctx);
+  const fallbacks = async (ctx) => (await h.agentRows(ctx)).filter((m) => m.text === TIMEOUT_TEXT);
+  const swept = (ctx) => h.waitFor(async () => (await state(ctx)) === "input-required", { timeout: 15000, what: `${ctx} swept` });
+
+  it("an unanswered operator-bound task becomes input-required with exactly one fallback message; the ack told the sender so", async () => {
+    const r = await h.post(msgReq("ot-1", textParts("Please send me a quote"), { message: { contextId: "ot-1" } }));
+    const ack = r.json.result.parts[0].text;
+    assert.ok(ack.includes(WAIT_NOTE("2 seconds")), ack); // the configured timeout, in words
+    assert.equal(r.json.result.task.state, "working");
+    const t0 = Date.now();
+    await swept("ot-1");
+    assert.ok(Date.now() - t0 >= 800, "not swept before the timeout"); // posted at ~t0 - a few ms; 1500 ms timeout
+    const rows = await h.agentRows("ot-1");
+    assert.deepEqual(rows.map((m) => m.text), [TXT_OTHER_SMALL, TIMEOUT_TEXT]);
+    assert.equal(rows[1].verified, true);
+    await sleep(1300); // four more sweeps: the fallback is never added twice for the same pending message
+    assert.equal((await fallbacks("ot-1")).length, 1);
+    assert.equal(await state("ot-1"), "input-required");
+    assert.equal(wake("ot-1").length, 1); // the sweep does not touch the wake queue
+  });
+
+  it("a late operator reply still applies: input-required -> the reply's state (completed by default); the sweep did not make it stale", async () => {
+    const [e] = wake("ot-1");
+    h.operatorSays({ contextId: "ot-1", text: "Here is the quote.", inReplyTo: e.ts });
+    await h.waitFor(async () => (await state("ot-1")) === "completed", { what: "late reply completes the task" });
+    assert.deepEqual((await h.agentRows("ot-1")).map((m) => m.text), [TXT_OTHER_SMALL, TIMEOUT_TEXT, "Here is the quote."]);
+    await sleep(700);
+    assert.equal(await state("ot-1"), "completed"); // and the sweeper leaves it alone
+    // no inReplyTo and an explicit state also work after the sweep
+    await h.post(msgReq("ot-2", textParts("Please send me a quote"), { message: { contextId: "ot-2" } }));
+    await swept("ot-2");
+    h.operatorSays({ contextId: "ot-2", text: "We cannot do that.", state: "rejected" });
+    await h.waitFor(async () => (await state("ot-2")) === "rejected", { what: "late reply with its own state" });
+  });
+
+  it("a machine reply into a task that timed out does not close it; an operator-bound follow-up puts it back to working and restarts the timer", async () => {
+    await h.post(msgReq("ot-3a", textParts("Please send me a quote"), { message: { contextId: "ot-3" } }));
+    await swept("ot-3");
+    const d = await h.post(msgReq("ot-3b", textParts('sha256 hash of "abc"'), { message: { contextId: "ot-3" } }));
+    assertHybridReply(d.json.result, { contextId: "ot-3", state: "input-required", text: SHA256_ABC }); // answered by machine, still owed by the operator
+    assert.equal(await state("ot-3"), "input-required");
+    const f = await h.post(msgReq("ot-3c", textParts("And please include the terms"), { message: { contextId: "ot-3" } }));
+    const t0 = Date.now();
+    assertHybridReply(f.json.result, { contextId: "ot-3", state: "working", text: TXT_OTHER_SMALL });
+    assert.equal(await state("ot-3"), "working");
+    await sleep(700);
+    assert.equal(await state("ot-3"), "working"); // the clock restarted at the follow-up: the old message's time is up but it is superseded
+    await swept("ot-3");
+    assert.ok(Date.now() - t0 >= 1000, "timed out 1500 ms after the follow-up, not before");
+    assert.equal((await fallbacks("ot-3")).length, 2); // one per pending message, never twice for the same one
+    await sleep(900);
+    assert.equal((await fallbacks("ot-3")).length, 2);
+  });
+
+  it("tasks closed by a template or a machine class are never touched (notice, digest, word_count, greeting, catalogue question)", async () => {
+    const sent = [
+      ["mc-1", REAL.notice], ["mc-2", 'keccak256 hash of "abc"'], ["mc-3", 'chat.word_count: count the words in "a b c"'], ["mc-4", "hi"], ["mc-5", "What can you do?"],
+    ];
+    for (const [id, text] of sent) assert.equal((await h.post(msgReq(id, textParts(text)))).json.result.task.state, "completed");
+    await sleep(2800); // well past the timeout, with a sweep every 300 ms
+    for (const [id] of sent) {
+      assert.equal(await state(`t-${id}`), "completed", id);
+      assert.deepEqual((await h.get(`/tasks/t-${id}`)).json.history.map((m) => m.role).sort(), ["agent", "user"], id); // no fallback message
+    }
+  });
+});
+
+// 6000 ms timeout: long enough for the operator to answer first (the outbox is read every 2 s)
+describe("operator timeout: answered, failed, rejected and canceled tasks are never touched", { timeout: 180000 }, () => {
+  let h;
+  before(async () => { h = await Harness.start({ env: { DEFIGENT_OPERATOR_TIMEOUT_MS: "6000", DEFIGENT_OPERATOR_SWEEP_MS: "300" } }); });
+  after(async () => { await h?.stop(); });
+  const state = async (ctx) => (await h.get(`/tasks/${ctx}`)).json.task.state;
+
+  it("a task the operator answered before the timeout stays as the operator left it; an unanswered control task is swept", async () => {
+    for (const id of ["ob-ctl", "ob-1", "ob-2", "ob-3", "ob-4"]) await h.post(msgReq(id, textParts("Please send me a quote"), { message: { contextId: id } }));
+    const ts = (ctx) => h.readJsonl("defigent_wake_queue.jsonl").find((e) => e.contextId === ctx).ts;
+    h.operatorSays(
+      { contextId: "ob-1", text: "done", inReplyTo: ts("ob-1") },
+      { contextId: "ob-2", text: "could not", state: "failed", inReplyTo: ts("ob-2") },
+      { contextId: "ob-3", text: "no", state: "rejected", inReplyTo: ts("ob-3") },
+    );
+    assert.equal((await h.postJson("/tasks/cancel", { contextId: "ob-4" })).status, 200);
+    await h.waitFor(async () => (await state("ob-ctl")) === "input-required", { timeout: 20000, what: "the control task times out" });
+    await sleep(1000); // every other task's time is up too by now, and the sweeper has looked at all of them
+    assert.deepEqual(await Promise.all(["ob-1", "ob-2", "ob-3", "ob-4"].map(state)), ["completed", "failed", "rejected", "canceled"]);
+    for (const id of ["ob-1", "ob-2", "ob-3", "ob-4"]) assert.ok(!(await h.agentRows(id)).some((m) => m.text === TIMEOUT_TEXT), id);
+    const db = await h.db();
+    try { assert.deepEqual(db.prepare("SELECT context_id, resolved FROM operator_bound ORDER BY context_id").all().map((r) => [r.context_id, r.resolved]), [["ob-1", 1], ["ob-2", 1], ["ob-3", 1], ["ob-4", 1], ["ob-ctl", 2]]); } finally { db.close(); }
+  });
+});
+
+// 20 s timeout: the fresh task of this group must not age out while the old ones are swept
+describe("operator timeout: at start-up old stuck tasks are swept in bounded slices", { timeout: 180000 }, () => {
+  let h; const OLD = Date.now() - 3600 * 1000, N = 300;
+  before(async () => { h = await Harness.start({ env: { DEFIGENT_OPERATOR_TIMEOUT_MS: "20000", DEFIGENT_OPERATOR_SWEEP_MS: "300" } }); });
+  after(async () => { await h?.stop(); });
+
+  it(`${N} tasks stuck in working without an operator queue, ${N} with an open queue entry, 100 already completed, a canceled one and a fresh one`, async () => {
+    await h.killChild(); // the schema exists; leave the database to the test, then start the server again on it
+    const { default: Database } = await import("better-sqlite3");
+    const db = new Database(join(h.dir, "defigent_a2a.db"));
+    try {
+      const task = db.prepare("INSERT INTO tasks (context_id, state, created_at, updated_at) VALUES (?,?,?,?)");
+      const msg = db.prepare("INSERT INTO messages (context_id, role, text, verified, sender, ts) VALUES (?,?,?,?,?,?)");
+      const bound = db.prepare("INSERT INTO operator_bound (context_id, ts) VALUES (?,?)");
+      db.transaction(() => {
+        const add = (id, state, at, queued) => { task.run(id, state, at, at); msg.run(id, "user", "Please send me a quote", 0, null, at); msg.run(id, "agent", TXT.other, 1, null, at); if (queued) bound.run(id, at); };
+        for (let i = 0; i < N; i++) add(`lg-${i}`, "working", OLD + i, false);   // from before the queue table existed (or left by a crash)
+        for (let i = 0; i < N; i++) add(`bd-${i}`, "working", OLD + i, true);    // waiting for the operator since an hour ago
+        for (let i = 0; i < 100; i++) add(`dn-${i}`, "completed", OLD + i, true); // answered long ago, queue entry never resolved
+        add("cx-1", "canceled", OLD, true);
+        add("fresh-1", "working", Date.now(), true);
+      })();
+    } finally { db.close(); }
+    await h.restart();
+    // the server answers while the backlog is worked off in slices of at most ~50 ms
+    let worst = 0;
+    const count = async () => { const r = await h.db(); try { return r.prepare("SELECT COUNT(*) AS n FROM tasks WHERE state='input-required'").get().n; } finally { r.close(); } };
+    await h.waitFor(async () => { const t = Date.now(); await h.get("/info"); worst = Math.max(worst, Date.now() - t); return (await count()) === 2 * N; }, { timeout: 60000, what: "the backlog is swept" });
+    assert.ok(worst < 1500, `the server stayed responsive while sweeping (worst /info latency ${worst} ms)`);
+    await sleep(900); // idempotent: more sweeps change nothing
+    const r = await h.db();
+    try {
+      assert.equal(r.prepare("SELECT COUNT(*) AS n FROM tasks WHERE state='input-required'").get().n, 2 * N);
+      assert.equal(r.prepare("SELECT COUNT(DISTINCT context_id) AS n FROM messages WHERE text=?").get(TIMEOUT_TEXT).n, 2 * N);
+      assert.equal(r.prepare("SELECT COUNT(*) AS n FROM messages WHERE text=?").get(TIMEOUT_TEXT).n, 2 * N); // exactly one each
+      assert.equal(r.prepare("SELECT COUNT(*) AS n FROM tasks WHERE context_id LIKE 'dn-%' AND state='completed'").get().n, 100);
+      assert.equal(r.prepare("SELECT state FROM tasks WHERE context_id='cx-1'").get().state, "canceled");
+      assert.equal(r.prepare("SELECT state FROM tasks WHERE context_id='fresh-1'").get().state, "working"); // 20 s have not passed
+      assert.equal(r.prepare("SELECT resolved FROM operator_bound WHERE context_id='fresh-1'").get().resolved, 0);
+      assert.equal(r.prepare("SELECT COUNT(*) AS n FROM operator_bound WHERE context_id LIKE 'bd-%' AND resolved=2").get().n, N);
+      assert.equal(r.prepare("SELECT COUNT(*) AS n FROM operator_bound WHERE (context_id LIKE 'dn-%' OR context_id='cx-1') AND resolved=1").get().n, 101);
+    } finally { r.close(); }
   });
 });
 

@@ -3,7 +3,7 @@
 
 ## Flujo en cuatro pasos
 
-1. Llega un mensaje que requiere razonamiento (`cls` = `offer`, `offer_structured`, `other` o `taifoon_probe`, un `chat.*:` de práctica sin respuesta determinista). El remitente recibe al instante un acuse ("queued for the operator agent…") y la tarea queda en `working`.
+1. Llega un mensaje que requiere razonamiento (`cls` = `offer`, `offer_structured`, `other` o `taifoon_probe`, un `chat.*:` de práctica sin respuesta determinista). El remitente recibe al instante un acuse ("queued for the operator agent…", que le avisa de que sin respuesta en ~30 minutos la tarea pasará a `input-required`) y la tarea queda en `working`.
 2. El servidor añade una línea a `defigent_wake_queue.jsonl` (ver abajo).
 3. Tú razonas y **añades una línea JSON a `defigent_outbox.jsonl`** (mismo directorio de datos: `$DEFIGENT_DATA_DIR`, en producción `/home/ubuntu/.hermes/cache/scratch`).
 4. En unos segundos el servidor guarda tu texto como mensaje del agente en esa misma tarea y fija el estado que elegiste. El remitente lo lee consultando la tarea: `GetTask` / `tasks/get` con el id que recibió, o `GET /tasks/{id}`.
@@ -68,7 +68,26 @@ CONTEXT_ID="$CONTEXT_ID" REPLY_TEXT="$REPLY_TEXT" python3 -c 'import json,os;pri
 
 ## Respuestas atrasadas: `inReplyTo`
 
-Si el remitente escribe otra vez mientras razonas, tu respuesta a la primera ya no cierra la conversación. Copia en `inReplyTo` el `ts` de la entrada que contestas: si la tarea tiene un mensaje del remitente más nuevo **que también llegó a la cola**, tu respuesta **se añade igualmente al hilo pero la tarea sigue en `working`** (cualquiera que sea el `state` que pusiste), porque queda un mensaje esperando respuesta. Los mensajes más nuevos que el servidor ya contestó solo (digest, `word_count`, notice de Taifoon) no cuentan. Contesta también a ese, con su `ts`, para cerrarla. Sin `inReplyTo` el servidor aplica el `state` tal cual.
+Si el remitente escribe otra vez mientras razonas, tu respuesta a la primera ya no cierra la conversación. Copia en `inReplyTo` el `ts` de la entrada que contestas: si la tarea tiene un mensaje del remitente más nuevo **que también llegó a la cola**, tu respuesta **se añade igualmente al hilo pero la tarea conserva su estado** (`working` mientras ese mensaje espera; `input-required` si ya venció; cualquiera que sea el `state` que pusiste), porque queda un mensaje esperando respuesta. Los mensajes más nuevos que el servidor ya contestó solo (digest, `word_count`, notice de Taifoon) no cuentan. Contesta también a ese, con su `ts`, para cerrarla. Sin `inReplyTo` el servidor aplica el `state` tal cual.
+
+## Si nadie contesta: el timeout del operador
+
+El operador vive fuera de este repo y puede no estar conectado al outbox cuando se despliega. Para que ninguna tarea se quede en `working` para siempre bajo una promesa que nadie cumple, un barrido periódico hace esto:
+
+- Cuando el último mensaje del remitente que entró en la cola (`taifoon_probe` incluido) lleva más de `DEFIGENT_OPERATOR_TIMEOUT_MS` sin respuesta del operador y la tarea sigue en `working`, la pasa a **`input-required`** y añade **un** mensaje del agente: *"No operator reply yet. This task stays open: a reply may still be posted here; you can also reach the operator on Telegram @FirrtonH."* No toca la wake queue.
+- `input-required` tiene ahora dos significados: "el operador te pregunta algo" (lo escribe una respuesta del outbox) y "se agotó la espera" (lo escribe el barrido; el último mensaje del agente es el texto de arriba). En ambos casos la tarea sigue abierta.
+- Nunca toca tareas `completed`, `canceled`, `failed` o `rejected`, ni las cerradas por plantilla o clase de máquina (saludo, catálogo, digest, `word_count`, notice de Taifoon), ni las que el operador ya contestó.
+- **Una respuesta tardía se aplica con normalidad**: pasa la tarea de `input-required` al `state` de tu línea (`completed` por defecto). El barrido no la hace "atrasada" (no escribe mensajes del remitente ni entradas de cola), y al contestar se dan por atendidos los mensajes hasta `inReplyTo`. Si contestas a un mensaje más viejo que otro ya pendiente o vencido, la respuesta se añade al hilo y la tarea conserva su estado.
+- **Un mensaje nuevo del remitente que va al operador** devuelve la tarea a `working` y el plazo se cuenta desde ese mensaje (el fallback se añade como mucho una vez por mensaje pendiente). Un digest o un `word_count` enviado a una tarea que sigue esperando al operador (en `working` o ya vencida) se responde, pero no la cierra.
+
+| Variable | Defecto | Para qué |
+|---|---|---|
+| `DEFIGENT_OPERATOR_TIMEOUT_MS` | `1800000` (30 min) | Plazo de espera. Se cita en el acuse ("~30 minutes"). Producción no la define. |
+| `DEFIGENT_OPERATOR_SWEEP_MS` | `60000` (60 s) | Cada cuánto se mira. Con 30 min de plazo, la precisión es ±1 min (3 %); cuando no hay nada vencido cuesta dos consultas por índice. |
+
+30 min por ser holgado frente al monitor del operador (cada ~3 min) y corto frente a la paciencia de un cliente A2A que consulta la tarea. Valores no numéricos o fuera de rango (plazo < 1 ms, barrido < 50 ms) se ignoran y se usa el defecto.
+
+**Al arrancar** el barrido también recoge las tareas que llevan tiempo en `working` desde antes del despliegue (sin entrada en la cola, o con la entrada vencida): se tratan igual, de forma acotada. El trabajo va en rebanadas de como máximo 200 tareas o 50 ms con 25 ms de pausa entre ellas, así que las peticiones se siguen atendiendo. Medido con 100 000 tareas atascadas (50 000 sin entrada en la cola y 50 000 con ella): se vacían en ~22 s tras arrancar, con una latencia de `/info` de 30 ms como máximo; con 10 000, en ~3 s. Las tareas ya cerradas o canceladas solo se dan por resueltas, sin mensaje.
 
 ## Límites y comportamiento
 

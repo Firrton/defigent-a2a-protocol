@@ -228,11 +228,27 @@ const OUTBOX_MAX_TEXT = 4000, OUTBOX_MAX_DATA = 16 * 1024, OUTBOX_MAX_REPLY_ID =
 const OUTBOX_WINDOW = 1 << 20; // bytes read per step; a line longer than this can never be valid
 const OUTBOX_TICK_LINES = 200, OUTBOX_TICK_MS = 50; // per tick: stop after this many lines or this much time and continue on the next tick
 const OUTBOX_REJECTS_MAX = 2 * 1024 * 1024; // rotate the rejects log to .1 above this size
-// operator_bound: the sender messages that were queued for the operator (their stored ts). Only those can make an operator reply `stale`:
-// a message answered by a machine class (digest, notice...) is not waiting for anybody.
+
+// The operator lives outside this repo and may not answer (or not be wired to the outbox at all): a task waiting for it is not left `working`
+// forever. After OPERATOR_TIMEOUT_MS without an answer the sweeper below marks it input-required and says so; a late reply still applies.
+const envMs = (name, fallback, min) => { const n = Number(process.env[name]); return Number.isFinite(n) && n >= min ? Math.floor(n) : fallback; };
+const OPERATOR_TIMEOUT_MS = envMs("DEFIGENT_OPERATOR_TIMEOUT_MS", 30 * 60 * 1000, 1);  // 30 minutes
+const OPERATOR_SWEEP_MS = envMs("DEFIGENT_OPERATOR_SWEEP_MS", 60 * 1000, 50);           // looked at once a minute
+const humanDuration = (ms) => ms < 60000 ? `${Math.max(1, Math.round(ms / 1000))} second${Math.max(1, Math.round(ms / 1000)) === 1 ? "" : "s"}` : `${Math.round(ms / 60000)} minute${Math.round(ms / 60000) === 1 ? "" : "s"}`;
+// said to the sender in the acknowledgement of every message that goes to the operator (config only: never sender text)
+const OPERATOR_WAIT_NOTE = `If no reply arrives within ~${humanDuration(OPERATOR_TIMEOUT_MS)} this task will be marked input-required; a reply can still be posted later.`;
+const OPERATOR_TIMEOUT_TEXT = "No operator reply yet. This task stays open: a reply may still be posted here; you can also reach the operator on Telegram @FirrtonH.";
+
+// operator_bound: the sender messages that were queued for the operator (their stored ts). Only those can make an operator reply `stale` and
+// only those start the timeout: a message answered by a machine class (digest, notice...) is not waiting for anybody.
+// resolved: 0 open (waiting), 1 answered or superseded, 2 timed out (the sweeper marked the task input-required)
+const OB_OPEN = 0, OB_DONE = 1, OB_TIMED_OUT = 2;
 a2a.exec(`CREATE TABLE IF NOT EXISTS outbox_state (id INTEGER PRIMARY KEY CHECK (id = 1), byte_offset INTEGER NOT NULL, ino TEXT);
 CREATE TABLE IF NOT EXISTS outbox_applied (reply_key TEXT PRIMARY KEY, ts INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS operator_bound (context_id TEXT NOT NULL, ts INTEGER NOT NULL, PRIMARY KEY (context_id, ts));`);
+CREATE TABLE IF NOT EXISTS operator_bound (context_id TEXT NOT NULL, ts INTEGER NOT NULL, resolved INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (context_id, ts));`);
+try { a2a.exec(`ALTER TABLE operator_bound ADD COLUMN resolved INTEGER NOT NULL DEFAULT 0`); } catch {} // a table made before the column existed
+a2a.exec(`CREATE INDEX IF NOT EXISTS idx_operator_bound_open ON operator_bound(ts) WHERE resolved = 0;  -- the sweeper's queue
+CREATE INDEX IF NOT EXISTS idx_tasks_state_updated ON tasks(state, updated_at);                        -- tasks stuck in working`);
 
 const getOutboxState = () => a2a.prepare(`SELECT byte_offset, ino FROM outbox_state WHERE id=1`).get() || { byte_offset: 0, ino: null };
 function setOutboxState(offset, ino) {
@@ -267,12 +283,15 @@ function applyOutboxLine(line, endOffset, ino) {
   const lastUser = a2a.prepare(`SELECT MAX(id) AS id FROM messages WHERE context_id=? AND role='user'`).get(o.contextId)?.id ?? 0;
   const key = o.replyId !== undefined ? `id:${o.contextId}\n${o.replyId}` : `sha256:${o.contextId}\n${crypto.createHash("sha256").update(line).digest("hex")}\n${lastUser}`;
   if (a2a.prepare(`SELECT 1 FROM outbox_applied WHERE reply_key=?`).get(key)) return "duplicate: this reply was already applied";
-  // a reply to an older sender message is kept in the thread, but the task stays working: a newer message for the operator is waiting
+  // a reply to an older sender message is kept in the thread, but the task keeps its state (working while that newer message waits, or
+  // input-required once it timed out): a newer message for the operator exists that this reply does not answer
   const stale = o.inReplyTo !== undefined && !!a2a.prepare(`SELECT 1 FROM operator_bound WHERE context_id=? AND ts > ? LIMIT 1`).get(o.contextId, o.inReplyTo);
   a2a.transaction(() => {
     a2a.prepare(`INSERT INTO outbox_applied (reply_key, ts) VALUES (?,?)`).run(key, Date.now());
     addMessage(o.contextId, "agent", text, true, null, o.data ? JSON.stringify({ data: [o.data], files: [] }) : null);
-    upsertTask(o.contextId, stale ? "working" : state);
+    upsertTask(o.contextId, stale ? task.state : state);
+    // the operator has answered every sender message up to inReplyTo (all of them without it): none of them times out any more
+    a2a.prepare(`UPDATE operator_bound SET resolved=? WHERE context_id=? AND ts <= ? AND resolved != ?`).run(OB_DONE, o.contextId, o.inReplyTo ?? Number.MAX_SAFE_INTEGER, OB_DONE);
     setOutboxState(endOffset, ino);
   })();
   return null;
@@ -346,6 +365,63 @@ function ingestOutbox() {
   }
 }
 setInterval(ingestOutbox, 2000).unref();
+
+// ---------- Operator timeout sweeper ----------
+// Every OPERATOR_SWEEP_MS (and once shortly after start-up, which also picks up tasks stuck in `working` before this deploy):
+//  1. sender messages queued for the operator whose OPERATOR_TIMEOUT_MS is up, oldest first (partial index on resolved = 0). If the task is
+//     still working and the message is the latest one queued, the task becomes input-required with one fallback message and the row is
+//     marked timed out (that is what makes the sweep idempotent); otherwise (answered, canceled, superseded by a newer message) the row is
+//     just resolved and the task is not touched.
+//  2. tasks that are `working` with nothing queued for the operator at all (started before operator_bound existed, or left behind by a crash)
+//     and have not moved for OPERATOR_TIMEOUT_MS: same treatment, through the (state, updated_at) index.
+// Work per tick is bounded (rows and milliseconds, like the outbox); when a backlog is left the next slice follows in SWEEP_CONTINUE_MS, so
+// the event loop is blocked for at most ~SWEEP_TICK_MS at a time and requests are served in between.
+const SWEEP_TICK_ROWS = 200, SWEEP_TICK_MS = 50, SWEEP_CONTINUE_MS = 25;
+function timeOutTask(contextId, boundTs) {
+  a2a.transaction(() => {
+    a2a.prepare(`UPDATE tasks SET state='input-required', updated_at=? WHERE context_id=? AND state='working'`).run(Date.now(), contextId);
+    addMessage(contextId, "agent", OPERATOR_TIMEOUT_TEXT, true, null);
+    if (boundTs !== null) a2a.prepare(`UPDATE operator_bound SET resolved=? WHERE context_id=? AND ts=?`).run(OB_TIMED_OUT, contextId, boundTs);
+  })();
+}
+// Returns true when work is left over (the budget ran out), so the caller continues soon instead of waiting for the next interval.
+function sweepOperatorTimeouts() {
+  const t0 = Date.now(), cutoff = t0 - OPERATOR_TIMEOUT_MS;
+  let done = 0;
+  const spent = () => done >= SWEEP_TICK_ROWS || Date.now() - t0 >= SWEEP_TICK_MS;
+  const due = a2a.prepare(`SELECT context_id, ts FROM operator_bound WHERE resolved = 0 AND ts <= ? ORDER BY ts LIMIT ?`).all(cutoff, SWEEP_TICK_ROWS);
+  for (const { context_id, ts } of due) {
+    if (spent()) return true;
+    done++;
+    const latest = a2a.prepare(`SELECT MAX(ts) AS ts FROM operator_bound WHERE context_id=?`).get(context_id)?.ts;
+    const state = a2a.prepare(`SELECT state FROM tasks WHERE context_id=?`).get(context_id)?.state;
+    if (ts === latest && state === "working") timeOutTask(context_id, ts);
+    else a2a.prepare(`UPDATE operator_bound SET resolved=? WHERE context_id=? AND ts=?`).run(OB_DONE, context_id, ts);
+  }
+  if (due.length === SWEEP_TICK_ROWS) return true; // a full page: there may be more
+  const stuck = a2a.prepare(`SELECT context_id FROM tasks t WHERE t.state='working' AND t.updated_at <= ?
+    AND NOT EXISTS (SELECT 1 FROM operator_bound b WHERE b.context_id = t.context_id AND b.resolved = 0) ORDER BY t.updated_at LIMIT ?`).all(cutoff, SWEEP_TICK_ROWS);
+  for (const { context_id } of stuck) {
+    if (spent()) return true;
+    done++;
+    timeOutTask(context_id, null);
+  }
+  return stuck.length === SWEEP_TICK_ROWS;
+}
+let sweepChain = false, sweepLastError = "";
+function sweepTick(fromChain = false) {
+  if (sweepChain && !fromChain) return; // a backlog is being worked off in slices already
+  let more = false;
+  try { more = sweepOperatorTimeouts(); sweepLastError = ""; } catch (e) {
+    const msg = String(e?.message || e);
+    if (msg !== sweepLastError) console.error("[defigent-http] operator timeout sweep failed:", msg); // once per distinct error, not every tick
+    sweepLastError = msg;
+  }
+  sweepChain = more;
+  if (more) setTimeout(() => sweepTick(true), SWEEP_CONTINUE_MS).unref();
+}
+setInterval(sweepTick, OPERATOR_SWEEP_MS).unref();
+setTimeout(sweepTick, Math.min(OPERATOR_SWEEP_MS, 1000)).unref();
 
 // ---------- Trust pipeline: on-chain owner check + reputation (all VERIFIED vs Monad live) ----------
 const IDENTITY_REG = "0x8004A169FB4a3325136EB29fA0ceB6D2e539a432";
@@ -645,8 +721,12 @@ app.post("/inbox", async (req, res) => {
   // task lifecycle (A2A)
   const contextId = msg?.contextId || msg?.taskId || `t-${messageId}`;
   const isFollowUp = !!a2a.prepare(`SELECT 1 FROM messages WHERE context_id=? LIMIT 1`).get(contextId); // the task already has messages
-  // `working` is the state of a task that waits for the operator (a closed task is completed, an unanswered question to the sender is input-required)
-  const awaitingOperator = a2a.prepare(`SELECT state FROM tasks WHERE context_id=?`).get(contextId)?.state === "working";
+  // The state a machine reply must leave alone because the operator still owes this task an answer: `working` (waiting for it) or
+  // input-required after the sweeper timed the wait out. (A closed task is completed; an unanswered question to the sender is input-required too,
+  // but then the latest message for the operator is answered, not timed out.)
+  const prevState = a2a.prepare(`SELECT state FROM tasks WHERE context_id=?`).get(contextId)?.state;
+  const owedState = prevState === "working" ? "working"
+    : prevState === "input-required" && a2a.prepare(`SELECT resolved FROM operator_bound WHERE context_id=? ORDER BY ts DESC LIMIT 1`).get(contextId)?.resolved === OB_TIMED_OUT ? "input-required" : null;
   upsertTask(contextId, "working");
 
   // structured offer (Defigent offer schema v1): DataPart {intent:"offer", service, price, asset, expiry?, terms?}
@@ -711,13 +791,13 @@ app.post("/inbox", async (req, res) => {
   } else if (cls === "greeting") {
     reply = `Hello! Defigent here (ERC-8004 agentId 10331, Monad). We run the standard A2A inbox you are using right now — any agent on Monad can write to us here. Our paid services run on x402: wallet digest $0.001, agent lookup free. Let's interop.`;
   } else if (cls === "offer_structured") {
-    reply = `Structured offer received (schema v1, machine-readable — thanks!) and queued for the operator agent. The parsed offer is attached to this task as the received-offer artifact. Its reasoned reply will be posted to this same task: ${POLL}. Card: ${BASE}/.well-known/agent-card.json`;
+    reply = `Structured offer received (schema v1, machine-readable — thanks!) and queued for the operator agent. The parsed offer is attached to this task as the received-offer artifact. Its reasoned reply will be posted to this same task: ${POLL}. ${OPERATOR_WAIT_NOTE} Card: ${BASE}/.well-known/agent-card.json`;
   } else if (cls === "offer") {
-    reply = `Offer queued for the operator agent. Its reasoned reply will be posted to this same task: ${POLL}. Tip: send structured offers as DataPart {intent:"offer", service, price, asset, expiry, terms} — see ${BASE}/integration (offer schema v1). Card: ${BASE}/.well-known/agent-card.json`;
+    reply = `Offer queued for the operator agent. Its reasoned reply will be posted to this same task: ${POLL}. ${OPERATOR_WAIT_NOTE} Tip: send structured offers as DataPart {intent:"offer", service, price, asset, expiry, terms} — see ${BASE}/integration (offer schema v1). Card: ${BASE}/.well-known/agent-card.json`;
   } else if (cls === "question") {
     reply = `Answering from Defigent KB: services — GET /info (free), GET /digest?address=0x... ($0.001 x402), GET /status (free), GET /.well-known/agent-card.json (A2A). Operator: Telegram @FirrtonH.`;
   } else {
-    reply = `Message queued for the operator agent. Its reasoned reply will be posted to this same task: ${POLL}. Card: ${BASE}/.well-known/agent-card.json`;
+    reply = `Message queued for the operator agent. Its reasoned reply will be posted to this same task: ${POLL}. ${OPERATOR_WAIT_NOTE} Card: ${BASE}/.well-known/agent-card.json`;
   }
 
   addMessage(contextId, "agent", reply, true, null);
@@ -749,7 +829,7 @@ app.post("/inbox", async (req, res) => {
   // task states: a template or a machine reply closes the task; a message for the operator stays `working` until the operator answers
   // through the outbox (and `input-required` only appears when the operator itself asks the sender something). A machine reply to a
   // follow-up never closes a task that is still waiting for the operator: that answer is still owed.
-  const finalState = toOperator || awaitingOperator ? "working" : "completed";
+  const finalState = toOperator ? "working" : owedState ?? "completed";
   upsertTask(contextId, finalState);
 
   const replyMsg = {
@@ -1093,7 +1173,7 @@ app.get("/integration", (_req, res) => {
       },
       {
         step: "2c", title: "Track the conversation (A2A tasks)",
-        how: `Every message creates/updates a task. The reply carries contextId + task:{id,state}. Read the full thread: curl http://3.238.185.185:8080/tasks/<contextId> — returns state (working/completed/input-required/canceled/failed/rejected) + signed history of both sides. A message that needs reasoning is acknowledged at once and the task stays working while the operator agent answers it; the reasoned reply is appended to this same task later, so poll GET /tasks/<contextId> (or GetTask / tasks/get) until the state leaves working. input-required now means the operator is asking you something: answer with the same contextId. failed / rejected mean the operator could not do it / declined.`,
+        how: `Every message creates/updates a task. The reply carries contextId + task:{id,state}. Read the full thread: curl http://3.238.185.185:8080/tasks/<contextId> — returns state (working/completed/input-required/canceled/failed/rejected) + signed history of both sides. A message that needs reasoning is acknowledged at once and the task stays working while the operator agent answers it; the reasoned reply is appended to this same task later, so poll GET /tasks/<contextId> (or GetTask / tasks/get) until the state leaves working. input-required means the operator is asking you something (answer with the same contextId) or, when no operator reply arrives within ~${humanDuration(OPERATOR_TIMEOUT_MS)}, that the task timed out waiting: it stays open and a reply may still be posted to it. failed / rejected mean the operator could not do it / declined.`,
         note: "Pass contextId in your next message to continue the same thread. States: submitted/working/input-required/completed/canceled/failed/rejected."
       },
       {
