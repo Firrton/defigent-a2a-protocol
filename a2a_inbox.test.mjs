@@ -27,7 +27,7 @@
 
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, readFileSync, existsSync, readdirSync, appendFileSync, writeFileSync, statSync, renameSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname, isAbsolute } from "node:path";
@@ -68,6 +68,8 @@ const IDENTITY_REG = "0x8004A169FB4a3325136EB29fA0ceB6D2e539a432";
 const REPUTATION_REG = "0x8004BAa17C55a88189AE136b182e5fdA19dE9b63";
 const OUTBOX = "defigent_outbox.jsonl";
 const OUTBOX_REJECTS = "defigent_outbox_rejects.jsonl";
+const WAKE_KEYS = ["ts", "contextId", "cls", "verified", "sender", "preview", "priority", "thread", "reply_via"];
+const OUTBOX_STATES = ["completed", "input-required", "failed", "rejected"];
 const REPLY_KEYS = ["kind", "role", "parts", "messageId", "contextId", "verified", "sender", "task"];
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -103,8 +105,15 @@ class Harness {
     Object.assign(env, extraEnv);
     const h = new Harness({ dir, port, env, budget });
     LIVE.add(h);
-    try { await h.spawnServer(); } catch (e) { await h.stop(); throw e; }
-    return h;
+    // the x402 facilitator is occasionally unreachable for a moment and would cancel a whole group: retry the start up to 2 more times
+    for (let attempt = 0; ; attempt++) {
+      try { await h.spawnServer(); return h; } catch (e) {
+        await h.killChild();
+        if (attempt >= 2) { await h.stop(); throw e; }
+        h.log = "";
+        await sleep(1000);
+      }
+    }
   }
 
   constructor({ dir, port, env, budget }) {
@@ -121,12 +130,17 @@ class Harness {
     await this.waitReady(30000);
   }
 
+  async killChild() {
+    const old = this.child;
+    if (!old || old.exitCode !== null || old.signalCode !== null) return;
+    const exited = new Promise((r) => old.once("exit", r));
+    try { old.kill("SIGKILL"); } catch {}
+    await Promise.race([exited, sleep(5000)]);
+  }
+
   // Kill the server process and start a new one on the same data directory and port (a fresh process: its rate-limit bucket is empty).
   async restart() {
-    const old = this.child;
-    const exited = new Promise((r) => old.once("exit", r));
-    old.kill("SIGKILL");
-    await Promise.race([exited, sleep(5000)]);
+    await this.killChild();
     this.sent = 0;
     this.log = "";
     await this.spawnServer();
@@ -192,16 +206,18 @@ class Harness {
   readText(name) { const p = join(this.dir, name); return existsSync(p) ? readFileSync(p, "utf8") : null; }
   readJsonl(name) { const t = this.readText(name); return t ? t.split("\n").filter(Boolean).map((l) => JSON.parse(l)) : []; }
   append(name, text) { appendFileSync(join(this.dir, name), text); }
+  // write a whole file in one atomic step (new inode), so the server never sees it half written
+  replaceFile(name, text) { const p = join(this.dir, name); writeFileSync(p + ".tmp", text); renameSync(p + ".tmp", p); }
   // The operator agent's side of the contract: one JSON object per line, appended to the outbox file.
   operatorSays(...entries) { this.append(OUTBOX, entries.map((e) => (typeof e === "string" ? e : JSON.stringify(e)) + "\n").join("")); }
   // Poll `fn` until it returns something truthy (the outbox is ingested by a 2 s timer in the server).
-  async waitFor(fn, { timeout = 9000, what = "condition" } = {}) {
+  async waitFor(fn, { timeout = 20000, what = "condition" } = {}) {
     const t0 = Date.now();
     for (;;) {
       const v = await fn();
       if (v) return v;
       if (this.exit) throw new Error(`server exited while waiting for ${what}\n${this.log}`);
-      if (Date.now() - t0 > timeout) throw new Error(`timed out after ${timeout} ms waiting for ${what}`);
+      if (Date.now() - t0 > timeout) throw new Error(`timed out after ${timeout} ms waiting for ${what}\n--- outbox rejects ---\n${(this.readText(OUTBOX_REJECTS) ?? "(none)").slice(-1500)}\n--- server output ---\n${this.log.slice(-1500)}`);
       await sleep(150);
     }
   }
@@ -407,7 +423,7 @@ describe("probes: the nine production probes replayed locally", { timeout: 12000
     // every probe was class `other` and therefore queued for the operator
     const queue = h.readJsonl("defigent_wake_queue.jsonl");
     assert.deepEqual(queue.map((e) => e.contextId), ["t-probe-1", "t-probe-2", "t-probe-1", "t-probe-5"]);
-    assert.deepEqual(Object.keys(queue[0]), ["ts", "contextId", "cls", "verified", "sender", "preview", "thread", "reply_via"]);
+    assert.deepEqual(Object.keys(queue[0]), WAKE_KEYS);
     assert.ok(queue.every((e) => e.cls === "other" && e.verified === false && e.sender === null && e.preview === PROBE_TEXT.slice(0, 140)));
   });
 });
@@ -478,9 +494,10 @@ describe("lifecycle: client-chosen ids, cancel, reopen", { timeout: 120000 }, ()
     assert.deepEqual(c.json, { ok: true, contextId: "custom-ctx-2", state: "canceled" });
     assert.equal((await h.get("/tasks/custom-ctx-2")).json.task.state, "canceled");
     const again = await h.post(msgReq("lc-6", textParts("Hi again"), { message: { contextId: "custom-ctx-2" } }));
-    // GAP(G6): a message to a canceled task reopens it (working -> completed)
-    assertHybridReply(again.json.result, { contextId: "custom-ctx-2", state: "completed", text: TXT.greeting });
-    assert.equal((await h.get("/tasks/custom-ctx-2")).json.task.state, "completed");
+    // GAP(G6): a message to a canceled task reopens it. It is a follow-up in a task that already has messages, so a template never
+    // answers it: it goes to the operator (working), not back to `completed`
+    assertHybridReply(again.json.result, { contextId: "custom-ctx-2", state: "working", text: TXT.other });
+    assert.equal((await h.get("/tasks/custom-ctx-2")).json.task.state, "working");
   });
 
   it("REST cancel errors: missing contextId -> 400, unknown -> 404 (non-JSON-RPC bodies)", async () => {
@@ -581,7 +598,7 @@ describe("tasks/list: pagination, status filter, totalSize", { timeout: 120000 }
   it("an unknown status -> -32602 naming the allowed TASK_STATE_* values", async () => {
     const r = await h.rpc("tasks/list", { status: "bogus" }, { id: 10 });
     // GAP(G3): the message advertises "TASK_STATE_INPUT-REQUIRED", which is no valid 1.0 enum name (it is TASK_STATE_INPUT_REQUIRED)
-    assertRpcError(r, { id: 10, code: -32602, message: "InvalidParams", data: { reason: "status must be one of TASK_STATE_WORKING, TASK_STATE_COMPLETED, TASK_STATE_INPUT-REQUIRED, TASK_STATE_CANCELED" } });
+    assertRpcError(r, { id: 10, code: -32602, message: "InvalidParams", data: { reason: "status must be one of TASK_STATE_WORKING, TASK_STATE_COMPLETED, TASK_STATE_INPUT-REQUIRED, TASK_STATE_CANCELED, TASK_STATE_FAILED, TASK_STATE_REJECTED" } });
   });
 
   it("GET /tasks (REST): bare object, tasks without artifacts or history", async () => {
@@ -762,7 +779,7 @@ describe("classifier: class, reply, state and wake queue per message class", { t
     // greeting/question/handshake are closed by a template; everything else reaches the operator
     assert.deepEqual(queue.map((e) => [e.contextId, e.cls]), queued.map((c) => [`t-${c.id}`, c.cls]));
     for (const e of queue) {
-      assert.deepEqual(Object.keys(e), ["ts", "contextId", "cls", "verified", "sender", "preview", "thread", "reply_via"]);
+      assert.deepEqual(Object.keys(e), WAKE_KEYS);
       assert.equal(typeof e.ts, "number");
       assert.equal(e.verified, false);
       assert.equal(e.sender, null);
@@ -773,15 +790,28 @@ describe("classifier: class, reply, state and wake queue per message class", { t
     assert.equal(preview("cl-10"), "Please send me a quote");
   });
 
+  it("wake queue: ts is the stored timestamp of the sender's message (it is what inReplyTo refers to)", async () => {
+    for (const e of h.readJsonl("defigent_wake_queue.jsonl")) {
+      const stored = (await h.get(`/tasks/${e.contextId}`)).json.history.find((m) => m.role === "user");
+      assert.equal(e.ts, stored.ts, e.contextId);
+    }
+  });
+
   it("wake queue: each entry carries the thread so far and how to answer it (reply_via)", () => {
     const queue = h.readJsonl("defigent_wake_queue.jsonl");
     for (const e of queue) {
       assert.ok(JSON.stringify(e).length < 4000);
-      assert.deepEqual(e.reply_via, { file: join(h.dir, OUTBOX), line: { contextId: e.contextId, text: "<your reply>", state: "completed | input-required | failed | rejected" } });
+      assert.deepEqual(Object.keys(e.reply_via), ["file", "line", "states", "note"]);
+      assert.deepEqual(e.reply_via.line, { contextId: e.contextId, text: "<your reply>", state: "completed", inReplyTo: e.ts }); // a concrete, valid state; inReplyTo prefilled
+      assert.deepEqual(e.reply_via.states, OUTBOX_STATES);
+      assert.equal(e.reply_via.file, join(h.dir, OUTBOX));
+      assert.match(e.reply_via.note, /inReplyTo.*stored timestamp/);
+      assert.equal(e.priority, "normal"); // not signature-verified
       assert.ok(isAbsolute(e.reply_via.file));
       // the thread is the user message followed by the interim acknowledgement the sender just received
       assert.deepEqual(e.thread.map((m) => [m.role, m.verified]), [["user", false], ["agent", true]]);
-      assert.deepEqual(Object.keys(e.thread[0]), ["role", "text", "verified"]);
+      assert.deepEqual(Object.keys(e.thread[0]), ["role", "text", "verified", "sender"]);
+      assert.deepEqual(e.thread.map((m) => m.sender), [null, null]); // unsigned and no declared sender; agent rows never have one
     }
     const e = queue.find((x) => x.contextId === "t-cl-10");
     assert.deepEqual(e.thread.map((m) => m.text), ["Please send me a quote", TXT.other.slice(0, 300)]); // text is cut to 300 characters
@@ -957,7 +987,7 @@ describe("wake queue: thread = last six messages, reply_via, lines stay small", 
     assert.ok(second.thread.length === 6 && second.thread.some((m) => m.text.length < 300) && second.thread.every((m) => m.text.length > 0));
     assert.equal(second.thread.at(-1).role, "agent"); // the newest message is always kept
     assert.equal(second.preview, '"'.repeat(140));
-    assert.deepEqual(Object.keys(second), ["ts", "contextId", "cls", "verified", "sender", "preview", "thread", "reply_via"]);
+    assert.deepEqual(Object.keys(second), WAKE_KEYS);
   });
 });
 
@@ -1014,18 +1044,14 @@ describe("validation: permissive parsing, 500s, size limits", { timeout: 120000 
     assertRpcError(r, { id: null, code: -32603, message: "InternalError", status: 500 });
   });
 
-  it("a non-primitive contextId -> HTTP 500 (SQLite binding error)", async () => {
+  it("a non-primitive contextId -> -32602 InvalidParams naming the field (it used to be a SQLite binding 500)", async () => {
     const r = await h.post(msgReq("va-7", textParts("obj ctx"), { message: { contextId: { a: 1 } } }));
-    // GAP(G7): contextId has no type check; better-sqlite3 refuses to bind an object
-    assertRpcError(r, { id: null, code: -32603, message: "InternalError", status: 500 });
+    assertRpcError(r, { id: "va-7", code: -32602, message: "InvalidParams", data: { field: "contextId", reason: "contextId must match ^[\\w.:-]{1,128}$" } });
   });
 
-  it("retrying that messageId after the SQLite 500 returns {duplicate:true}: the id is poisoned", async () => {
+  it("retrying that messageId with a valid contextId is processed normally: validation runs before the dedupe key is stored", async () => {
     const r = await h.post(msgReq("va-7", textParts("a valid retry"), { id: "retry-2" }));
-    // GAP(G14): the dedupe key is stored (http_server.mjs:402-403) before the failing upsertTask, so every retry is a silent duplicate
-    assertRpcResult(r, "retry-2");
-    assert.deepEqual(r.json.result, { duplicate: true });
-    assert.equal((await h.get("/tasks/t-va-7")).status, 404); // nothing was ever stored
+    assertHybridReply(r.json.result, { contextId: "t-va-7", state: "working", text: TXT.other });
   });
 
   it("text longer than 4000 chars is silently truncated to 4000 (no error)", async () => {
@@ -1318,10 +1344,28 @@ describe("rate limit: 10 requests per minute per IP on /inbox", { timeout: 12000
     assert.equal((await h.get("/tasks/t-rl-11")).status, 404); // the rejected message was not stored
   });
 
-  it("the limiter runs before version negotiation and ignores X-Forwarded-For (no trust proxy)", async () => {
-    const r = await h.post(msgReq("rl-12", textParts("x")), { headers: { "A2A-Version": "9.9", "X-Forwarded-For": "203.0.113.9" } });
+  it("the limiter runs before version negotiation (a full bucket answers 429 even for an unsupported version)", async () => {
+    const r = await h.post(msgReq("rl-12", textParts("x")), { headers: { "A2A-Version": "9.9" } });
     assert.equal(r.status, 429);
     assert.deepEqual(r.json, { error: "rate limit 10/min" });
+  });
+
+  // trust proxy "loopback": a client reaching us through the local tunnel agent arrives from 127.0.0.1, and req.ip is the address the agent appended
+  const XFF = (ip) => ({ "X-Forwarded-For": ip });
+  const tooMany = (r) => r.status === 429;
+
+  it("from loopback, different forwarded addresses get separate buckets (the 127.0.0.1 bucket is already full here)", async () => {
+    for (let i = 1; i <= 10; i++) assert.ok(!tooMany(await h.rpc("GetTask", { id: "nope" }, { id: i, headers: XFF("198.51.100.1") })), `request ${i} from 198.51.100.1`);
+    assert.ok(tooMany(await h.rpc("GetTask", { id: "nope" }, { id: 11, headers: XFF("198.51.100.1") })));
+    assert.ok(!tooMany(await h.rpc("GetTask", { id: "nope" }, { id: 12, headers: XFF("198.51.100.2") }))); // another client behind the same proxy
+    assert.ok(tooMany(await h.rpc("GetTask", { id: "nope" }))); // no header at all: still the shared 127.0.0.1 bucket
+  });
+
+  it("with a chain the bucket is the last address (the proxy's), so a client cannot pick its bucket by prepending", async () => {
+    for (let i = 1; i <= 10; i++) assert.ok(!tooMany(await h.rpc("GetTask", { id: "nope" }, { id: i, headers: XFF("2.2.2.2") })));
+    assert.ok(tooMany(await h.rpc("GetTask", { id: "nope" }, { id: 11, headers: XFF("1.1.1.1, 2.2.2.2") })));
+    assert.ok(tooMany(await h.rpc("GetTask", { id: "nope" }, { id: 12, headers: XFF("9.9.9.9, 8.8.8.8, 2.2.2.2") })));
+    assert.ok(!tooMany(await h.rpc("GetTask", { id: "nope" }, { id: 13, headers: XFF("2.2.2.2, 3.3.3.3") }))); // here 3.3.3.3 is the client
   });
 
   it("only /inbox is limited: the card and GET /tasks still answer", async () => {
@@ -1471,6 +1515,7 @@ describe("operator outbox: replies appended by the operator agent reach the task
   });
 
   it("end to end: the wake-queue entry says how to answer, and the reply shows up in the same task (GET /tasks/:id and tasks/get)", async () => {
+    const rejectsBefore = h.readJsonl(OUTBOX_REJECTS).length;
     const entry = h.readJsonl("defigent_wake_queue.jsonl").find((e) => e.contextId === "ob-1");
     // the operator does exactly what reply_via says: append one JSON line to that file, filling in the template
     appendFileSync(entry.reply_via.file, JSON.stringify({ contextId: entry.reply_via.line.contextId, text: "  Our quote: 1 USDC.  ", data: { quote: { price: "1.00", asset: "USDC" } }, replyId: "ob-1-a" }) + "\n");
@@ -1493,7 +1538,7 @@ describe("operator outbox: replies appended by the operator agent reach the task
     assert.deepEqual([r.json.result.history[0].role, r.json.result.history[0].text, r.json.result.history[0].data.data], ["agent", "Our quote: 1 USDC.", [{ quote: { price: "1.00", asset: "USDC" } }]]);
     // answering is not a new inbound message: nothing new is queued for the operator, and nothing was rejected
     assert.equal(h.readJsonl("defigent_wake_queue.jsonl").filter((e) => e.contextId === "ob-1").length, 1);
-    assert.equal(h.readText(OUTBOX_REJECTS), null);
+    assert.equal(h.readJsonl(OUTBOX_REJECTS).length, rejectsBefore);
   });
 
   it("every allowed state is applied to the task (input-required, failed, rejected, completed)", async () => {
@@ -1511,6 +1556,7 @@ describe("operator outbox: replies appended by the operator agent reach the task
   });
 
   it("invalid lines are never applied, never throw, are explained in the rejects file and do not block the lines after them", async () => {
+    const rejectsBefore = h.readJsonl(OUTBOX_REJECTS).length;
     await h.postJson("/tasks/cancel", { contextId: "ob-7" });
     const bigData = { blob: "y".repeat(16 * 1024) }; // serialises to more than 16 kB
     const bad = [
@@ -1533,7 +1579,7 @@ describe("operator outbox: replies appended by the operator agent reach the task
     ];
     h.operatorSays(...bad.map(([line]) => line), { contextId: "ob-6", text: "Finally a valid reply.", replyId: "ob-6-good" });
     await h.waitFor(async () => (await h.get("/tasks/ob-6")).json.task.state === "completed", { what: "the valid line after the invalid ones" });
-    const rejects = h.readJsonl(OUTBOX_REJECTS);
+    const rejects = h.readJsonl(OUTBOX_REJECTS).slice(rejectsBefore);
     assert.equal(rejects.length, bad.length);
     rejects.forEach((rj, i) => {
       assert.deepEqual(Object.keys(rj), ["ts", "reason", "line"]);
@@ -1551,19 +1597,21 @@ describe("operator outbox: replies appended by the operator agent reach the task
   });
 
   it("a line without its trailing newline is not applied until the newline arrives", async () => {
+    const rejectsBefore = h.readJsonl(OUTBOX_REJECTS).length;
     const line = JSON.stringify({ contextId: "ob-8", text: "half written", replyId: "ob-8-a" });
     h.append(OUTBOX, line.slice(0, 30));
     await sleep(2600); // at least one full tick sees the partial line
     assert.equal((await h.agentRows("ob-8")).length, 1); // only the interim acknowledgement
-    assert.equal(h.readJsonl(OUTBOX_REJECTS).length, 16); // and the fragment was not rejected either (16 from the previous test)
+    assert.equal(h.readJsonl(OUTBOX_REJECTS).length, rejectsBefore); // and the fragment was not rejected either
     h.append(OUTBOX, line.slice(30)); // still no newline
     h.append(OUTBOX, "\n");
     await h.waitFor(async () => (await h.agentRows("ob-8")).length === 2, { what: "the completed line" });
     assert.equal((await h.agentRows("ob-8")).at(-1).text, "half written");
-    assert.equal(h.readJsonl(OUTBOX_REJECTS).length, 16);
+    assert.equal(h.readJsonl(OUTBOX_REJECTS).length, rejectsBefore);
   });
 
   it("the same reply is applied once: by replyId, or by the content of the line when there is no replyId", async () => {
+    const rejectsBefore = h.readJsonl(OUTBOX_REJECTS).length;
     const noId = { contextId: "ob-9", text: "no replyId" };
     h.operatorSays(
       { contextId: "ob-9", text: "first", replyId: "same-id" },
@@ -1575,7 +1623,7 @@ describe("operator outbox: replies appended by the operator agent reach the task
     await h.waitFor(async () => (await h.agentRows("ob-9")).length >= 4, { what: "ob-9 replies" });
     await sleep(300);
     assert.deepEqual((await h.agentRows("ob-9")).map((m) => m.text), [TXT.other, "first", "no replyId", "no replyId"]);
-    const dups = h.readJsonl(OUTBOX_REJECTS).slice(16);
+    const dups = h.readJsonl(OUTBOX_REJECTS).slice(rejectsBefore);
     assert.equal(dups.length, 2);
     assert.ok(dups.every((d) => /duplicate/.test(d.reason)));
   });
@@ -1596,7 +1644,8 @@ describe("operator outbox: restart, truncation, rotation and a missing file", { 
       { contextId: "pr-1", text: "second", state: "input-required" },
       "this line is not JSON",
     );
-    await h.waitFor(async () => (await h.agentRows("pr-1")).length === 3 && h.readJsonl(OUTBOX_REJECTS).length === 1, { what: "first batch" });
+    const rejectsBefore = h.readJsonl(OUTBOX_REJECTS).length;
+    await h.waitFor(async () => (await h.agentRows("pr-1")).length === 3 && h.readJsonl(OUTBOX_REJECTS).length === rejectsBefore + 1, { what: "first batch" });
     await h.waitFor(async () => (await offsetInDb()) === statSync(FILE()).size, { what: "offset == file size in bytes" });
     assert.ok(statSync(FILE()).size > readFileSync(FILE(), "utf8").length); // the offset counts bytes, not characters
     const before = (await h.get("/tasks/pr-1")).json;
@@ -1605,7 +1654,7 @@ describe("operator outbox: restart, truncation, rotation and a missing file", { 
     const after = (await h.get("/tasks/pr-1")).json;
     assert.deepEqual(after.history, before.history); // nothing applied twice
     assert.equal(after.task.state, "input-required");
-    assert.equal(h.readJsonl(OUTBOX_REJECTS).length, 1); // and the old lines were not even read again (a re-read would log the bad line and two duplicates)
+    assert.equal(h.readJsonl(OUTBOX_REJECTS).length, rejectsBefore + 1); // and the old lines were not even read again (a re-read would log the bad line and two duplicates)
     h.operatorSays({ contextId: "pr-1", text: "after the restart" });
     await h.waitFor(async () => (await h.get("/tasks/pr-1")).json.task.state === "completed", { what: "line appended after the restart" });
     assert.equal((await h.agentRows("pr-1")).at(-1).text, "after the restart");
@@ -1662,5 +1711,369 @@ describe("operator outbox: restart, truncation, rotation and a missing file", { 
     assert.match(rj[0].reason, /longer than/);
     assert.equal(rj[0].line.length, 300);
     assert.equal(await offsetInDb(), statSync(FILE()).size);
+  });
+});
+
+// characters built at run time (the source stays plain ASCII)
+const LS = String.fromCharCode(0x2028), PS = String.fromCharCode(0x2029), NEL = String.fromCharCode(0x85);
+const EURO = String.fromCharCode(0x20ac), GRIN = String.fromCodePoint(0x1f600), CTRL1 = String.fromCharCode(1), REPLACEMENT = String.fromCharCode(0xfffd);
+const SEPARATORS = new RegExp(`[${LS}${PS}${NEL}]`);
+
+// ---------------------------------------------------------------------------------------------------------------------
+// 12. Review follow-up: hostile identifiers, follow-ups, states, bounded ingest, dedupe keys, stale replies, history cost
+// ---------------------------------------------------------------------------------------------------------------------
+describe("identifiers: contextId, taskId and messageId from the sender are validated, the declared sender is capped", { timeout: 120000 }, () => {
+  let h;
+  before(async () => { h = await Harness.start(); });
+  after(async () => { await h?.stop(); });
+  const RULE = "^[\\w.:-]{1,128}$";
+
+  it("an id outside ^[\\w.:-]{1,128}$ -> -32602 InvalidParams naming the field; nothing is stored, queued or logged", async () => {
+    const bad = [
+      ["contextId", "m-1", { contextId: "has space" }],
+      ["contextId", "m-2", { contextId: "c".repeat(129) }],
+      ["taskId", "m-3", { contextId: "fine-ctx", taskId: "<script>alert(1)</script>" }],
+      ["messageId", "bad\nid", {}],
+      ["contextId", "m-5", { contextId: 12345 }],
+    ];
+    for (const [field, messageId, message] of bad) {
+      const r = await h.post(msgReq(messageId, textParts("Please send me a quote"), { id: `bad-${field}`, message }));
+      assertRpcError(r, { id: `bad-${field}`, code: -32602, message: "InvalidParams", data: { field, reason: `${field} must match ${RULE}` } });
+    }
+    assert.equal((await h.get("/tasks")).json.totalSize, 0);
+    for (const f of ["defigent_wake_queue.jsonl", "defigent_inbox.jsonl"]) assert.equal((h.readText(f) ?? "").trim(), "", f);
+    // and the rejected messageId is not poisoned: the same message with a valid contextId is processed
+    const ok = await h.post(msgReq("m-1", textParts("Please send me a quote"), { message: { contextId: "valid-1" } }));
+    assertHybridReply(ok.json.result, { contextId: "valid-1", state: "working", text: TXT.other });
+  });
+
+  it("128 characters of [\\w.:-] are accepted as a contextId", async () => {
+    const ctx = "a:b.c-d_".repeat(16);
+    assert.equal(ctx.length, 128);
+    const r = await h.post(msgReq("m-6", textParts("Please send me a quote"), { message: { contextId: ctx } }));
+    assertHybridReply(r.json.result, { contextId: ctx, state: "working", text: TXT.other });
+  });
+
+  it("a messageId of 129 characters is rejected, naming messageId", async () => {
+    const r = await h.post(msgReq("m".repeat(129), textParts("x")));
+    assert.equal(r.json.error.code, -32602);
+    assert.equal(r.json.error.data.field, "messageId");
+  });
+
+  it("a declared sender is cut to 120 characters at intake, in the history and in the wake queue", async () => {
+    await h.post(msgReq("m-8", textParts("Please send me a quote"), { message: { contextId: "sender-cap", sender: "S".repeat(300) } }));
+    assert.equal((await h.get("/tasks/sender-cap")).json.history.find((m) => m.role === "user").sender, "S".repeat(120));
+    const e = h.readJsonl("defigent_wake_queue.jsonl").find((x) => x.contextId === "sender-cap");
+    assert.equal(e.sender, "S".repeat(120));
+    assert.equal(e.thread[0].sender, "S".repeat(42)); // thread entries carry a short form
+  });
+});
+
+describe("follow-ups always reach the operator; a template closes only a short first message", { timeout: 120000 }, () => {
+  let h;
+  before(async () => { h = await Harness.start(); });
+  after(async () => { await h?.stop(); });
+  const CASES = [
+    // first messages: these still close with a template
+    { id: "fu-1", ctx: "fu-ctx-1", text: "Hello Defigent", cls: "greeting" },
+    { id: "fu-2", ctx: "fu-ctx-2", text: "What do you offer?", cls: "question" },
+    { id: "fu-3", ctx: "fu-ctx-3", text: "How do I pay with x402?", cls: "question" },
+    // first messages that carry a commitment or a number: the operator must see them
+    { id: "fu-4", ctx: "fu-ctx-4", text: "Hello, 5 USDC per call is fine for us.", cls: "other" },
+    { id: "fu-5", ctx: "fu-ctx-5", text: "yes, price is 3 USDC. ok?", cls: "other" },
+    { id: "fu-6", ctx: "fu-ctx-6", text: "hola quiero contratar tus servicios", cls: "other" },
+    { id: "fu-7", ctx: "fu-ctx-7", text: "Hi, please send 5 USDC to 0xabc", cls: "other" },
+    // follow-ups into tasks that already have messages (the first two were closed by a template): never auto-closed
+    { id: "fu-8", ctx: "fu-ctx-1", text: "Hello, 5 USDC per call is fine for us.", cls: "other", followUp: true },
+    { id: "fu-9", ctx: "fu-ctx-1", text: "Hi", cls: "other", followUp: true },
+    { id: "fu-10", ctx: "fu-ctx-2", text: "Hi, I have a partnership idea", cls: "offer", followUp: true }, // offer detection is kept
+  ];
+  const routed = {}; // wake-queue entries expected per task
+  for (const c of CASES) {
+    it(`${c.followUp ? "follow-up" : "first message"} ${JSON.stringify(c.text)} -> ${c.cls}`, async () => {
+      const r = await h.post(msgReq(c.id, textParts(c.text), { message: { contextId: c.ctx } }));
+      const closed = c.cls === "greeting" || c.cls === "question";
+      assertHybridReply(r.json.result, { contextId: c.ctx, state: closed ? "completed" : "working", text: { greeting: TXT.greeting, question: TXT.question, other: TXT.other, offer: TXT.offer }[c.cls] });
+      assert.equal(h.readJsonl("defigent_inbox.jsonl").find((e) => e.messageId === c.id).cls, c.cls);
+      if (!closed) routed[c.ctx] = (routed[c.ctx] ?? 0) + 1;
+      const queued = h.readJsonl("defigent_wake_queue.jsonl").filter((e) => e.contextId === c.ctx);
+      assert.equal(queued.length, routed[c.ctx] ?? 0, `${c.id}: wake-queue entries for ${c.ctx}`);
+      if (c.followUp) assert.equal(queued.at(-1).thread.filter((m) => m.role === "user").at(-1).text, c.text); // the follow-up is what the operator is shown
+      assert.equal((await h.get(`/tasks/${c.ctx}`)).json.task.state, closed ? "completed" : "working");
+    });
+  }
+});
+
+describe("states: failed and rejected are filterable and shown by the dashboard", { timeout: 120000 }, () => {
+  let h;
+  before(async () => {
+    h = await Harness.start();
+    await h.post(msgReq("st-1", textParts("Please send me a quote"), { message: { contextId: "st-1" } }));
+    await h.post(msgReq("st-2", textParts("Please send me a quote"), { message: { contextId: "st-2" } }));
+    h.operatorSays({ contextId: "st-1", text: "Could not do it.", state: "failed" }, { contextId: "st-2", text: "Declined.", state: "rejected" });
+    await h.waitFor(async () => (await h.get("/tasks/st-2")).json.task.state === "rejected", { what: "both states" });
+  });
+  after(async () => { await h?.stop(); });
+
+  it("tasks/list accepts TASK_STATE_FAILED and TASK_STATE_REJECTED and returns only those tasks", async () => {
+    const f = (await h.rpc("ListTasks", { status: "TASK_STATE_FAILED" }, { id: 1 })).json.result;
+    assert.deepEqual(f.tasks.map((t) => [t.id, t.status.state]), [["st-1", "failed"]]);
+    const r = (await h.rpc("tasks/list", { status: "rejected" }, { id: 2 })).json.result;
+    assert.deepEqual(r.tasks.map((t) => [t.id, t.status.state]), [["st-2", "rejected"]]);
+  });
+
+  it("GET /tasks?status= accepts them too", async () => {
+    assert.deepEqual((await h.get("/tasks?status=failed")).json.tasks.map((t) => t.id), ["st-1"]);
+    assert.deepEqual((await h.get("/tasks?status=TASK_STATE_REJECTED")).json.tasks.map((t) => t.id), ["st-2"]);
+    assert.equal((await h.get("/tasks?status=bogus")).status, 400);
+  });
+
+  it("/integration lists the states the server can produce, including failed and rejected", async () => {
+    const step = (await h.get("/integration")).json.steps.find((x) => x.step === "2c");
+    for (const state of ["working", "completed", "input-required", "canceled", "failed", "rejected"]) assert.ok(step.note.includes(state) && step.how.includes(state), state);
+    assert.match(step.how, /operator agent/);
+  });
+
+  it("the dashboard knows the two states (label and colour)", () => {
+    const html = readFileSync(join(ROOT, "public", "index.html"), "utf8");
+    assert.match(html, /const STATES = \{[^}]*failed: "Failed"[^}]*rejected: "Rejected"[^}]*\}/);
+    assert.match(html, /\.st-failed \{ --sc: var\(--err\); \}/);
+    assert.match(html, /\.st-rejected \{ --sc: var\(--err\); \}/);
+  });
+});
+
+describe("wake queue lines: priority, thread senders, escaping and a byte bound", { timeout: 120000 }, () => {
+  let h; const acct = newAccount();
+  before(async () => { h = await Harness.start(); });
+  after(async () => { await h?.stop(); });
+  const entries = (ctx) => h.readJsonl("defigent_wake_queue.jsonl").filter((e) => e.contextId === ctx);
+
+  it("priority is high for a signature-verified sender and normal otherwise; thread entries carry the short sender", async () => {
+    await h.post(msgReq("wk-1", textParts("Please send me a signed quote"), { message: { contextId: "wk-1" }, params: { auth: await makeAuth(acct) } }));
+    await h.post(msgReq("wk-2", textParts("Please send me a quote"), { message: { contextId: "wk-2", sender: "0xDeclaredButUnsigned" } }));
+    const [signed] = entries("wk-1"), [plain] = entries("wk-2");
+    assert.equal(signed.verified, true); assert.equal(signed.priority, "high");
+    assert.deepEqual(signed.thread.map((m) => m.sender), [acct.address, null]);
+    assert.equal(plain.verified, false); assert.equal(plain.priority, "normal");
+    assert.deepEqual(plain.thread.map((m) => m.sender), ["0xDeclaredButUnsigned", null]);
+    assert.deepEqual(Object.keys(signed), WAKE_KEYS);
+  });
+
+  it("a thread with more than one author shows each author", async () => {
+    await h.post(msgReq("wk-3", textParts("Another question about the quote"), { message: { contextId: "wk-2", sender: "bob" } }));
+    assert.deepEqual(entries("wk-2")[1].thread.map((m) => m.sender), ["0xDeclaredButUnsigned", null, "bob", null]);
+  });
+
+  it("U+2028, U+2029 and U+0085 are escaped in the JSONL lines the server writes (inbox log and wake queue)", async () => {
+    const text = `line one${LS}line two${PS}line three${NEL}end`;
+    await h.post(msgReq("wk-4", textParts(text), { message: { contextId: "wk-4", sender: `s${LS}s` } }));
+    for (const f of ["defigent_inbox.jsonl", "defigent_wake_queue.jsonl"]) {
+      const raw = h.readText(f);
+      assert.ok(!SEPARATORS.test(raw), `${f} contains a raw separator`);
+      assert.ok(raw.includes("\\u2028") && raw.includes("\\u2029") && raw.includes("\\u0085"), f);
+    }
+    const logged = h.readJsonl("defigent_inbox.jsonl").find((e) => e.messageId === "wk-4");
+    assert.equal(logged.text, text); // escaping is lossless
+    assert.equal(entries("wk-4")[0].sender, `s${LS}s`);
+  });
+
+  it("a wake-queue line never exceeds 4000 bytes, even with the longest ids and sender and every character escaped", async () => {
+    const ctx = "a".repeat(128);
+    await h.post(msgReq("wk-5", textParts(CTRL1.repeat(4000)), { message: { contextId: ctx, sender: CTRL1.repeat(300) } })); // each \u0001 costs 6 bytes once escaped
+    const rawLine = h.readText("defigent_wake_queue.jsonl").split("\n").filter(Boolean).at(-1);
+    assert.ok(Buffer.byteLength(rawLine) <= 4000, `${Buffer.byteLength(rawLine)} bytes`);
+    const e = JSON.parse(rawLine);
+    assert.equal(e.contextId, ctx);
+    assert.equal(e.sender.length, 120);
+    assert.ok(e.thread.length >= 1 && e.thread.at(-1).role === "agent");
+    // multi-byte text is measured in bytes too: 4000 euro signs are 12000 bytes
+    await h.post(msgReq("wk-6", textParts(EURO.repeat(4000)), { message: { contextId: "wk-6" } }));
+    assert.ok(Buffer.byteLength(h.readText("defigent_wake_queue.jsonl").split("\n").filter(Boolean).at(-1)) <= 4000);
+  });
+});
+
+describe("webhook allow-list behind the local proxy (trust proxy: loopback)", { timeout: 120000 }, () => {
+  let h; const QUICKNODE = "141.148.40.227";
+  before(async () => { h = await Harness.start(); });
+  after(async () => { await h?.stop(); });
+  const hook = (xff) => h.request("POST", "/webhooks/onchain", { headers: { "content-type": "application/json", ...(xff ? { "X-Forwarded-For": xff } : {}) }, body: JSON.stringify({ event: { blockNumber: 1 } }) });
+
+  it("a request from loopback with no forwarded address is still not allow-listed", async () => {
+    assert.equal((await hook()).status, 403);
+  });
+
+  it("the allow-list now sees the client address the tunnel appended, so QuickNode through the tunnel is recognised", async () => {
+    assert.equal((await hook(QUICKNODE)).status, 204);
+    assert.equal((await hook(`9.9.9.9, ${QUICKNODE}`)).status, 204); // the proxy's entry is the last one
+  });
+
+  it("a client cannot talk its way onto the allow-list by prepending the address", async () => {
+    assert.equal((await hook(`${QUICKNODE}, 9.9.9.9`)).status, 403);
+  });
+
+  it("the reject log records the forwarded client address, and escapes line separators in what a client controls", async () => {
+    await h.request("POST", "/webhooks/onchain", { headers: { "content-type": "application/json", "X-Forwarded-For": "198.51.100.7" }, body: JSON.stringify({ [`a${LS}b`]: 1 }) });
+    const rejects = h.readJsonl("defigent_webhook_rejects.jsonl");
+    assert.equal(rejects.at(-1).ip, "198.51.100.7");
+    assert.deepEqual(rejects.at(-1).bodyKeys, [`a${LS}b`]);
+    assert.ok(!SEPARATORS.test(h.readText("defigent_webhook_rejects.jsonl")));
+  });
+});
+
+describe("operator outbox: idempotency keys, stale replies, CRLF and history size", { timeout: 180000 }, () => {
+  let h;
+  before(async () => {
+    h = await Harness.start();
+    for (const n of [1, 2, 3]) await h.post(msgReq(`dd-${n}`, textParts("Please send me a quote"), { message: { contextId: `dd-${n}` } }));
+  });
+  after(async () => { await h?.stop(); });
+  const wakeOf = (ctx) => h.readJsonl("defigent_wake_queue.jsonl").filter((e) => e.contextId === ctx);
+  const texts = async (ctx) => (await h.agentRows(ctx)).map((m) => m.text);
+
+  it("a replyId is scoped to its task: the same replyId on two tasks applies to both, and repeating it on one is a duplicate", async () => {
+    const rejectsBefore = h.readJsonl(OUTBOX_REJECTS).length;
+    h.operatorSays({ contextId: "dd-1", text: "for one", replyId: "shared" }, { contextId: "dd-2", text: "for two", replyId: "shared" }, { contextId: "dd-1", text: "for one again", replyId: "shared" });
+    await h.waitFor(async () => (await texts("dd-1")).length === 2 && (await texts("dd-2")).length === 2, { what: "both tasks answered" });
+    await sleep(300);
+    assert.deepEqual(await texts("dd-1"), [TXT.other, "for one"]);
+    assert.deepEqual(await texts("dd-2"), [TXT.other, "for two"]);
+    assert.deepEqual(h.readJsonl(OUTBOX_REJECTS).slice(rejectsBefore).map((r) => r.reason.split(":")[0]), ["duplicate"]);
+  });
+
+  it("without a replyId the key includes the task's latest sender message: the same answer after a new message applies again, a replay does not", async () => {
+    const line = { contextId: "dd-3", text: "Yes, 5 USDC works." };
+    h.operatorSays(line, line);
+    await h.waitFor(async () => (await texts("dd-3")).length === 2, { what: "first answer" });
+    await sleep(300);
+    assert.deepEqual(await texts("dd-3"), [TXT.other, "Yes, 5 USDC works."]); // the identical second line was a duplicate
+    await h.post(msgReq("dd-3b", textParts("Please send me a quote again"), { message: { contextId: "dd-3" } }));
+    h.operatorSays(line); // same bytes, but it answers a newer sender message
+    await h.waitFor(async () => (await texts("dd-3")).length === 4, { what: "same answer after a new message" });
+    assert.deepEqual((await texts("dd-3")).slice(2), [TXT.other, "Yes, 5 USDC works."]);
+    // a replay of old lines after the file was replaced is ignored: no sender message arrived in between
+    const rejectsBefore = h.readJsonl(OUTBOX_REJECTS).length;
+    h.replaceFile(OUTBOX, JSON.stringify(line) + "\n" + JSON.stringify(line) + " ".repeat(300) + "\n"); // bigger, new inode: read from the start
+    await h.waitFor(async () => h.readJsonl(OUTBOX_REJECTS).length === rejectsBefore + 2, { what: "replayed lines rejected as duplicates" });
+    assert.equal((await texts("dd-3")).length, 4);
+  });
+
+  it("inReplyTo: a reply to an older message is appended but leaves the task working while a newer message waits", async () => {
+    await h.post(msgReq("dd-4a", textParts("Please send me a quote"), { message: { contextId: "dd-4" } }));
+    await h.post(msgReq("dd-4b", textParts("And please include the terms"), { message: { contextId: "dd-4" } }));
+    const [first, second] = wakeOf("dd-4");
+    assert.ok(second.ts > first.ts);
+    // even a terminal state from the operator does not close a task that has a newer message
+    h.operatorSays({ contextId: "dd-4", text: "answer to the first", state: "failed", inReplyTo: first.ts, replyId: "dd-4-a" });
+    await h.waitFor(async () => (await texts("dd-4")).includes("answer to the first"), { what: "stale reply appended" });
+    assert.equal((await h.get("/tasks/dd-4")).json.task.state, "working");
+    h.operatorSays({ contextId: "dd-4", text: "answer to the second", inReplyTo: second.ts, replyId: "dd-4-b" });
+    await h.waitFor(async () => (await h.get("/tasks/dd-4")).json.task.state === "completed", { what: "reply to the newest message closes the task" });
+    assert.deepEqual((await texts("dd-4")).slice(-2), ["answer to the first", "answer to the second"]);
+  });
+
+  it("inReplyTo must be a number", async () => {
+    const rejectsBefore = h.readJsonl(OUTBOX_REJECTS).length;
+    h.operatorSays({ contextId: "dd-4", text: "x", inReplyTo: "soon" }, { contextId: "dd-4", text: "x", inReplyTo: null });
+    await h.waitFor(async () => h.readJsonl(OUTBOX_REJECTS).length === rejectsBefore + 2, { what: "two rejects" });
+    assert.ok(h.readJsonl(OUTBOX_REJECTS).slice(rejectsBefore).every((r) => /inReplyTo/.test(r.reason)));
+  });
+
+  it("CRLF line endings are accepted and do not leak into rejects", async () => {
+    await h.post(msgReq("dd-5", textParts("Please send me a quote"), { message: { contextId: "dd-5" } }));
+    const rejectsBefore = h.readJsonl(OUTBOX_REJECTS).length;
+    h.append(OUTBOX, JSON.stringify({ contextId: "dd-5", text: "crlf one", replyId: "crlf-1" }) + "\r\nnot json\r\n" + JSON.stringify({ contextId: "dd-5", text: "crlf two", replyId: "crlf-2" }) + "\r\n");
+    await h.waitFor(async () => (await texts("dd-5")).length === 3, { what: "both CRLF lines" });
+    assert.deepEqual((await texts("dd-5")).slice(1), ["crlf one", "crlf two"]);
+    const rj = h.readJsonl(OUTBOX_REJECTS).slice(rejectsBefore);
+    assert.deepEqual(rj.map((r) => r.line), ["not json"]);
+  });
+
+  it("history is bounded: historyLength is capped at 100 and tasks/list leaves out `data`, while tasks/get and GET /tasks/:id keep it", async () => {
+    await h.post(msgReq("dd-6", textParts("Please send me a quote"), { message: { contextId: "dd-6" } }));
+    h.operatorSays(...Array.from({ length: 130 }, (_, i) => ({ contextId: "dd-6", text: `r${i}`, data: { i }, replyId: `h-${i}` })));
+    await h.waitFor(async () => (await h.agentRows("dd-6")).length === 131, { what: "130 replies" });
+    const get = (await h.rpc("tasks/get", { id: "dd-6", historyLength: 1000 }, { id: "g" })).json.result.history;
+    assert.equal(get.length, 100); // capped, and it is the newest 100, oldest first
+    assert.deepEqual([get[0].text, get.at(-1).text], ["r30", "r129"]);
+    assert.deepEqual(get.at(-1).data, { data: [{ i: 129 }], files: [] });
+    const list = (await h.rpc("tasks/list", { historyLength: 1000, includeArtifacts: false }, { id: "l" })).json.result.tasks.find((t) => t.id === "dd-6").history;
+    assert.equal(list.length, 100);
+    assert.ok(list.every((m) => Object.keys(m).join() === "role,text,verified,sender,ts")); // no `data` in a list
+    assert.deepEqual([list[0].text, list.at(-1).text], ["r30", "r129"]);
+    const full = (await h.get("/tasks/dd-6")).json.history; // GET /tasks/:id is the whole thread
+    assert.equal(full.length, 132);
+    assert.deepEqual(full.at(-1).data, { data: [{ i: 129 }], files: [] });
+  });
+});
+
+describe("operator outbox: bounded work per tick, read boundaries, special files and the rejects log", { timeout: 240000 }, () => {
+  let h; const FILE = () => join(h.dir, OUTBOX);
+  before(async () => {
+    h = await Harness.start();
+    for (const n of [1, 2]) await h.post(msgReq(`bd-${n}`, textParts("Please send me a quote"), { message: { contextId: `bd-${n}` } }));
+  });
+  after(async () => { await h?.stop(); });
+
+  it("a multi-byte character straddling the 1 MiB read window is decoded intact", async () => {
+    const WINDOW = 1 << 20, prefix = '{"contextId":"bd-1","text":"';
+    const line = (i, blob) => JSON.stringify({ contextId: "bd-1", text: "t".repeat(4000), data: { blob: "d".repeat(blob), i }, replyId: `fill-${i}` }) + "\n";
+    const target = WINDOW - 2 - prefix.length - 2500; // bytes of filler before the last line, which then starts 2500 bytes before the window ends
+    const k = Math.ceil(target / 18000);
+    const b = Math.floor((target - k * Buffer.byteLength(line(k - 1, 0))) / k); // blob size that makes k lines add up to just under the target
+    let fill = Array.from({ length: k }, (_, i) => line(i, b));
+    let total = fill.reduce((n, l) => n + Buffer.byteLength(l), 0);
+    assert.ok(total <= target, `filler ${total} > ${target}`);
+    fill[k - 1] = line(k - 1, b + (target - total)); // pad the last filler so the total is exact
+    total = fill.reduce((n, l) => n + Buffer.byteLength(l), 0);
+    assert.equal(total, target);
+    const pad = WINDOW - 2 - total - prefix.length;
+    const last = `${prefix}${"x".repeat(pad)}${GRIN} end"}\n`;
+    const content = fill.join("") + last;
+    assert.equal(Buffer.from(content).subarray(WINDOW - 2, WINDOW + 2).toString("utf8"), GRIN); // the emoji's four bytes span the window boundary
+    h.replaceFile(OUTBOX, content);
+    await h.waitFor(async () => (await h.agentRows("bd-1")).length === k + 2, { what: "all lines, the emoji line included", timeout: 20000 });
+    assert.equal((await h.agentRows("bd-1")).at(-1).text, `${"x".repeat(pad)}${GRIN} end`);
+    assert.ok(!(await h.agentRows("bd-1")).some((m) => m.text.includes(REPLACEMENT)));
+  });
+
+  it("at most 200 lines (or 50 ms) are applied per tick: 450 valid lines all arrive, over several ticks, in order", async () => {
+    h.operatorSays(...Array.from({ length: 450 }, (_, i) => ({ contextId: "bd-2", text: `n-${i}`, replyId: `n-${i}` })));
+    const seen = [];
+    await h.waitFor(async () => { const n = (await h.agentRows("bd-2")).length - 1; if (n > 0) seen.push(n); return n === 450; }, { what: "450 replies", timeout: 30000 });
+    assert.ok(seen[0] <= 200, `the first tick applied ${seen[0]} lines`);
+    assert.ok(new Set(seen).size >= 2, "the lines arrived in at least two steps");
+    assert.deepEqual((await h.agentRows("bd-2")).slice(1).map((m) => m.text), Array.from({ length: 450 }, (_, i) => `n-${i}`));
+  });
+
+  it("a FIFO at the outbox path is skipped without blocking the process, and a regular file afterwards works", { skip: process.platform === "win32" }, async () => {
+    rmSync(FILE());
+    execFileSync("mkfifo", [FILE()]);
+    await sleep(2600);
+    assert.equal(h.exit, null);
+    assert.equal((await h.get("/.well-known/agent-card.json")).status, 200); // an event loop stuck in open() would not answer
+    assert.ok(!/outbox/i.test(h.log), h.log);
+    rmSync(FILE());
+    h.operatorSays({ contextId: "bd-2", text: "after the fifo", replyId: "after-fifo" });
+    await h.waitFor(async () => (await h.agentRows("bd-2")).at(-1).text === "after the fifo", { what: "line after the fifo" });
+  });
+
+  it("the rejects log is rotated to .1 when it passes 2 MB (replacing the previous .1) and a new one is started", async () => {
+    const rej = join(h.dir, OUTBOX_REJECTS);
+    writeFileSync(rej + ".1", "OLD\n");
+    writeFileSync(rej, JSON.stringify({ ts: 1, reason: "padding", line: "p".repeat(2.2 * 1024 * 1024) }) + "\n");
+    h.operatorSays("first line after the cap", "second line after the cap");
+    await h.waitFor(async () => existsSync(rej) && h.readJsonl(OUTBOX_REJECTS).length === 2, { what: "new rejects log with two records" });
+    assert.ok(statSync(rej + ".1").size > 2 * 1024 * 1024);
+    assert.ok(!readFileSync(rej + ".1", "utf8").includes("OLD"));
+    assert.deepEqual(h.readJsonl(OUTBOX_REJECTS).map((r) => r.line), ["first line after the cap", "second line after the cap"]);
+  });
+
+  it("U+2028, U+2029 and U+0085 inside a rejected line are escaped in the rejects log", async () => {
+    const rejectsBefore = h.readJsonl(OUTBOX_REJECTS).length;
+    const bad = `not json ${LS} one ${PS} two ${NEL} three`;
+    h.operatorSays(bad);
+    await h.waitFor(async () => h.readJsonl(OUTBOX_REJECTS).length === rejectsBefore + 1, { what: "the reject" });
+    assert.ok(!SEPARATORS.test(h.readText(OUTBOX_REJECTS)));
+    assert.equal(h.readJsonl(OUTBOX_REJECTS).at(-1).line, bad);
   });
 });

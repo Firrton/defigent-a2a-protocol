@@ -23,6 +23,10 @@ async function rpc(method, params) {
 }
 
 const app = express();
+// Production is also reached through a local tunnel agent, so those clients arrive from 127.0.0.1. With "loopback" trusted, req.ip is the
+// last address the proxy appended to X-Forwarded-For when the peer is loopback (a client cannot choose it by prepending) and the socket
+// address for every other peer.
+app.set("trust proxy", "loopback");
 app.use(express.json({ verify: (req, _res, buf) => { req.rawBody = buf; } }));
 app.use(express.static("public", { index: false })); // dashboard assets (public/index.html served at / below)
 app.get("/", (_req, res) => res.sendFile("index.html", { root: "public" }));
@@ -90,8 +94,13 @@ const OUTBOX_FILE = `${DATA_DIR}/defigent_outbox.jsonl`;                 // the 
 const OUTBOX_REJECTS_FILE = `${DATA_DIR}/defigent_outbox_rejects.jsonl`; // why a line of the outbox was not applied
 const RATE = new Map(); // ip -> [timestamps]
 
+// One JSONL line. U+2028, U+2029 and U+0085 are escaped because some line readers split on them (JSON itself allows them raw inside strings).
+function jsonl(obj) {
+  return JSON.stringify(obj).replace(/[\u2028\u2029\u0085]/g, c => "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0")) + "\n";
+}
+
 function logInbox(entry) {
-  try { fs.appendFileSync(INBOX_FILE, JSON.stringify(entry) + "\n"); } catch {}
+  try { fs.appendFileSync(INBOX_FILE, jsonl(entry)); } catch {}
 }
 
 // ---------- A2A agent card (well-known standard) ----------
@@ -168,28 +177,42 @@ function upsertTask(contextId, state) {
     .run(contextId, state, now, now);
 }
 
+// Returns the stored timestamp. A sender message gets a ts strictly greater than the task's previous sender message, so "newer than ts"
+// (outbox inReplyTo) is unambiguous even when two messages land in the same millisecond.
 function addMessage(contextId, role, text, verified, sender, meta = null) {
+  let ts = Date.now();
+  if (role === "user") ts = Math.max(ts, (a2a.prepare(`SELECT MAX(ts) AS t FROM messages WHERE context_id=? AND role='user'`).get(contextId)?.t ?? 0) + 1);
   a2a.prepare(`INSERT INTO messages (context_id, role, text, verified, sender, ts, meta) VALUES (?,?,?,?,?,?,?)`)
-    .run(contextId, role, text, verified ? 1 : 0, sender || null, Date.now(), meta);
+    .run(contextId, role, text, verified ? 1 : 0, sender || null, ts, meta);
+  return ts;
 }
 
-function getHistory(contextId) {
-  return a2a.prepare(`SELECT role, text, verified, sender, ts, meta FROM messages WHERE context_id=? ORDER BY ts ASC, id ASC`).all(contextId);
+// Oldest first. With `limit` only the newest `limit` rows are read (the index-friendly way: newest first, then reversed).
+function getHistory(contextId, limit, withMeta = true) {
+  const cols = withMeta ? "role, text, verified, sender, ts, meta" : "role, text, verified, sender, ts";
+  if (limit === undefined) return a2a.prepare(`SELECT ${cols} FROM messages WHERE context_id=? ORDER BY ts ASC, id ASC`).all(contextId);
+  return a2a.prepare(`SELECT ${cols} FROM messages WHERE context_id=? ORDER BY ts DESC, id DESC LIMIT ?`).all(contextId, limit).reverse();
 }
 
-// history item as returned to clients; `data` (the stored data/file parts) is present only on messages that have any
+// `historyLength` as read from a request: a non-negative integer, never more than 100
+const historyLimit = (v) => Math.min(Math.max(parseInt(v) || 0, 0), 100);
+
+// history item as returned to clients; `data` (the stored data/file parts) is present only on messages that have any, and never in lists
 function historyItem(m) {
   let data; try { data = m.meta ? JSON.parse(m.meta) : undefined; } catch {}
   return { role: m.role, text: m.text, verified: !!m.verified, sender: m.sender, ts: m.ts, ...(data !== undefined ? { data } : {}) };
 }
+const historyItemNoData = ({ role, text, verified, sender, ts }) => ({ role, text, verified: !!verified, sender, ts });
 
 // ---------- Operator outbox: how the operator agent's reasoned reply gets back into a task ----------
 // The operator agent (outside this repo) appends one JSON object per line to OUTBOX_FILE:
-//   {"contextId": "<task id>", "text": "<reply>", "state": "completed|input-required|failed|rejected", "data": {…}, "replyId": "<idempotency key>"}
-// A timer ingests new complete lines every 2 s. No HTTP route: the file is the only way in. Docs: docs/operator-outbox.md
+//   {"contextId": "<task id>", "text": "<reply>", "state": "completed|input-required|failed|rejected", "data": {…}, "replyId": "<idempotency key>", "inReplyTo": <ts of the wake-queue entry>}
+// A timer ingests new complete lines every 2 s, a bounded amount of work per tick. No HTTP route: the file is the only way in. Docs: docs/operator-outbox.md
 const OUTBOX_STATES = ["completed", "input-required", "failed", "rejected"];
 const OUTBOX_MAX_TEXT = 4000, OUTBOX_MAX_DATA = 16 * 1024, OUTBOX_MAX_REPLY_ID = 200;
 const OUTBOX_WINDOW = 1 << 20; // bytes read per step; a line longer than this can never be valid
+const OUTBOX_TICK_LINES = 200, OUTBOX_TICK_MS = 50; // per tick: stop after this many lines or this much time and continue on the next tick
+const OUTBOX_REJECTS_MAX = 2 * 1024 * 1024; // rotate the rejects log to .1 above this size
 a2a.exec(`CREATE TABLE IF NOT EXISTS outbox_state (id INTEGER PRIMARY KEY CHECK (id = 1), byte_offset INTEGER NOT NULL, ino TEXT);
 CREATE TABLE IF NOT EXISTS outbox_applied (reply_key TEXT PRIMARY KEY, ts INTEGER NOT NULL);`);
 
@@ -198,7 +221,10 @@ function setOutboxState(offset, ino) {
   a2a.prepare(`INSERT INTO outbox_state (id, byte_offset, ino) VALUES (1,?,?) ON CONFLICT(id) DO UPDATE SET byte_offset=excluded.byte_offset, ino=excluded.ino`).run(offset, ino);
 }
 function rejectOutboxLine(reason, line) {
-  try { fs.appendFileSync(OUTBOX_REJECTS_FILE, JSON.stringify({ ts: Date.now(), reason, line: String(line).slice(0, 300) }) + "\n"); } catch {}
+  try {
+    try { if (fs.statSync(OUTBOX_REJECTS_FILE).size > OUTBOX_REJECTS_MAX) fs.renameSync(OUTBOX_REJECTS_FILE, OUTBOX_REJECTS_FILE + ".1"); } catch {} // replaces a previous .1
+    fs.appendFileSync(OUTBOX_REJECTS_FILE, jsonl({ ts: Date.now(), reason, line: String(line).slice(0, 300) }));
+  } catch {}
 }
 
 // Returns a rejection reason, or null when the reply was applied (the new offset is saved in the same transaction).
@@ -214,16 +240,21 @@ function applyOutboxLine(line, endOffset, ino) {
   if (!OUTBOX_STATES.includes(state)) return `state must be one of ${OUTBOX_STATES.join(", ")}`;
   if (o.data !== undefined && (!o.data || typeof o.data !== "object" || Array.isArray(o.data) || Buffer.byteLength(JSON.stringify(o.data)) > OUTBOX_MAX_DATA)) return "data must be a plain object of at most 16 kB";
   if (o.replyId !== undefined && (typeof o.replyId !== "string" || !o.replyId || o.replyId.length > OUTBOX_MAX_REPLY_ID)) return `replyId must be a non-empty string of at most ${OUTBOX_MAX_REPLY_ID} characters`;
+  if (o.inReplyTo !== undefined && (typeof o.inReplyTo !== "number" || !Number.isFinite(o.inReplyTo))) return "inReplyTo must be a number (the ts of the wake-queue entry being answered)";
   const task = a2a.prepare(`SELECT state FROM tasks WHERE context_id=?`).get(o.contextId);
   if (!task) return "unknown task: no task with that contextId";
   if (task.state === "canceled") return "task is canceled";
-  // idempotency: replyId when given, otherwise a hash of the line itself
-  const key = o.replyId !== undefined ? `id:${o.replyId}` : `sha256:${crypto.createHash("sha256").update(line).digest("hex")}`;
+  // idempotency, scoped to the task: replyId when given; otherwise a hash of the line plus the task's latest sender message, so the
+  // same answer to a newer sender message is applied again while a replay of old lines (same latest message) is ignored
+  const lastUser = a2a.prepare(`SELECT MAX(id) AS id FROM messages WHERE context_id=? AND role='user'`).get(o.contextId)?.id ?? 0;
+  const key = o.replyId !== undefined ? `id:${o.contextId}\n${o.replyId}` : `sha256:${o.contextId}\n${crypto.createHash("sha256").update(line).digest("hex")}\n${lastUser}`;
   if (a2a.prepare(`SELECT 1 FROM outbox_applied WHERE reply_key=?`).get(key)) return "duplicate: this reply was already applied";
+  // a reply to an older sender message is kept in the thread, but the task stays working: a newer message is waiting for an answer
+  const stale = o.inReplyTo !== undefined && !!a2a.prepare(`SELECT 1 FROM messages WHERE context_id=? AND role='user' AND ts > ? LIMIT 1`).get(o.contextId, o.inReplyTo);
   a2a.transaction(() => {
     a2a.prepare(`INSERT INTO outbox_applied (reply_key, ts) VALUES (?,?)`).run(key, Date.now());
     addMessage(o.contextId, "agent", text, true, null, o.data ? JSON.stringify({ data: [o.data], files: [] }) : null);
-    upsertTask(o.contextId, state);
+    upsertTask(o.contextId, stale ? "working" : state);
     setOutboxState(endOffset, ino);
   })();
   return null;
@@ -231,42 +262,51 @@ function applyOutboxLine(line, endOffset, ino) {
 
 let outboxDiscarding = false; // inside a line longer than OUTBOX_WINDOW: skip it up to its newline
 let outboxLastError = "";
+function outboxGone() { outboxDiscarding = false; if (getOutboxState().byte_offset) setOutboxState(0, null); } // no file (yet, or any more): whatever comes next is new
 function ingestOutbox() {
   let fd;
   try {
-    try { fd = fs.openSync(OUTBOX_FILE, "r"); } catch (e) {
-      if (e?.code === "ENOENT") { outboxDiscarding = false; if (getOutboxState().byte_offset) setOutboxState(0, null); return; } // no file (yet, or any more): whatever comes next is new
-      throw e;
-    }
+    // only a regular file is ever read: a FIFO or a device at that path must not block the process
+    let st;
+    try { st = fs.lstatSync(OUTBOX_FILE); } catch (e) { if (e?.code === "ENOENT") return outboxGone(); throw e; }
+    if (!st.isFile()) return;
+    try { fd = fs.openSync(OUTBOX_FILE, fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK || 0) | (fs.constants.O_NOFOLLOW || 0)); } catch (e) { if (e?.code === "ENOENT") return outboxGone(); throw e; }
     const { size, ino: inoNum } = fs.fstatSync(fd);
     const ino = String(inoNum);
     const saved = getOutboxState();
     let offset = saved.byte_offset;
     if (size < offset || (saved.ino && saved.ino !== ino)) { offset = 0; outboxDiscarding = false; } // truncated or replaced: start over (replies already applied are deduplicated)
     if (offset !== saved.byte_offset || saved.ino !== ino) setOutboxState(offset, ino);
+    const t0 = Date.now();
+    let done = 0; // units of work this tick (lines, or windows of an oversized line)
+    const spent = () => done > 0 && (done >= OUTBOX_TICK_LINES || Date.now() - t0 >= OUTBOX_TICK_MS);
     while (offset < size) {
+      if (spent()) return; // the offset is already saved for everything processed: continue on the next tick
       const buf = Buffer.alloc(Math.min(OUTBOX_WINDOW, size - offset));
       const n = fs.readSync(fd, buf, 0, buf.length, offset);
       if (n <= 0) break;
       const chunk = buf.subarray(0, n);
       const last = chunk.lastIndexOf(0x0a);
       if (outboxDiscarding) { // the rest of an oversized line
-        outboxDiscarding = chunk.indexOf(0x0a) < 0;
-        offset += outboxDiscarding ? n : chunk.indexOf(0x0a) + 1;
-        setOutboxState(offset, ino);
+        const nl = chunk.indexOf(0x0a);
+        outboxDiscarding = nl < 0;
+        offset += nl < 0 ? n : nl + 1;
+        setOutboxState(offset, ino); done++;
         continue;
       }
       if (last < 0) {
         if (n < OUTBOX_WINDOW) break; // a line still being written: wait for its newline
         rejectOutboxLine(`line is longer than ${OUTBOX_WINDOW} bytes`, chunk.toString("utf8", 0, 300));
-        outboxDiscarding = true; offset += n; setOutboxState(offset, ino);
+        outboxDiscarding = true; offset += n; setOutboxState(offset, ino); done++;
         continue;
       }
       for (let start = 0; start <= last;) {
+        if (spent()) { setOutboxState(offset + start, ino); return; }
         const nl = chunk.indexOf(0x0a, start);
-        const line = chunk.toString("utf8", start, nl).trim();
+        const line = chunk.toString("utf8", start, nl).trim(); // trim also drops the \r of a CRLF line ending
         const end = offset + nl + 1;
         start = nl + 1;
+        done++;
         if (!line) continue;
         let reason;
         try { reason = applyOutboxLine(line, end, ino); } catch (e) {
@@ -406,16 +446,28 @@ async function verifyAuth(auth, declaredSender) {
 // Classifier rules. A question is only answered from the canned catalogue when it asks what Defigent offers.
 const SERVICE_QUESTION = /\b(?:services?|prices?|pricing|costs?|endpoints?|x402|digest)\b|\bwhat (?:can|do) you (?:do|offer)\b|\bhow (?:(?:do|can|could|should) (?:i|we)|to) (?:pay|use|integrate)\b/;
 const GREETING_START = /^(?:hi|hello|hey|hola|gm|greetings|saludos|good (?:morning|afternoon|evening))\b/i;
+const ID_RULE = /^[\w.:-]{1,128}$/; // contextId, taskId and messageId chosen by the sender are copied by the operator: keep them boring
+const MAX_SENDER = 120; // declared (unverified) sender, cut at intake
 
-// One wake-queue line: the original fields plus the thread so far and how to answer (reply_via), so the entry is self-describing.
-// The thread text is cut to 300 characters per message; if escaping still pushes the line over ~4 kB the cut is tightened.
+// One wake-queue line: the original fields plus the priority, the thread so far and how to answer (reply_via), so the entry is self-describing.
+// `ts` is the stored timestamp of the sender's message: the operator copies it into `inReplyTo`. The line is kept within 4000 BYTES: thread
+// text is cut to 300 characters per message, and if escaping or multi-byte text still pushes it over, the cut is tightened and then the
+// oldest thread entries are dropped (ids and sender are already capped at intake, so the fixed part is small).
+const WAKE_MAX_BYTES = 4000;
 function wakeQueueLine(entry) {
-  const thread = getHistory(entry.contextId).slice(-6);
-  const reply_via = { file: path.resolve(OUTBOX_FILE), line: { contextId: entry.contextId, text: "<your reply>", state: "completed | input-required | failed | rejected" } };
+  const thread = getHistory(entry.contextId, 6, false);
+  const reply_via = {
+    file: path.resolve(OUTBOX_FILE),
+    line: { contextId: entry.contextId, text: "<your reply>", state: "completed", inReplyTo: entry.ts },
+    states: OUTBOX_STATES,
+    note: "inReplyTo is this entry's ts, the stored timestamp of the sender's message: copy it so that a reply to an older message does not close the task while a newer one is waiting. Replace text; state is optional (default completed)."
+  };
+  const priority = entry.verified ? "high" : "normal";
   let line;
-  for (const cut of [300, 150, 75, 40]) {
-    line = JSON.stringify({ ...entry, thread: thread.map(m => ({ role: m.role, text: m.text.slice(0, cut), verified: !!m.verified })), reply_via });
-    if (line.length <= 4000) break;
+  for (const [cut, keep] of [[300, 6], [150, 6], [75, 6], [40, 6], [40, 3], [40, 1], [0, 1]]) {
+    line = jsonl({ ts: entry.ts, contextId: entry.contextId, cls: entry.cls, verified: entry.verified, sender: entry.sender, preview: entry.preview, priority,
+      thread: thread.slice(-keep).map(m => ({ role: m.role, text: m.text.slice(0, cut), verified: !!m.verified, sender: m.sender ? m.sender.slice(0, 42) : null })), reply_via });
+    if (Buffer.byteLength(line) - 1 <= WAKE_MAX_BYTES) break;
   }
   return line;
 }
@@ -463,7 +515,7 @@ app.post("/inbox", async (req, res) => {
     const p = body?.params || {};
     const pageSize = Math.min(Math.max(parseInt(p.pageSize) || 50, 1), 100);
     const statusFilter = typeof p.status === "string" ? p.status.replace("TASK_STATE_", "").toLowerCase().replace(/_/g, "-") : null;
-    const VALID_STATES = ["working", "completed", "input-required", "canceled"];
+    const VALID_STATES = ["working", "completed", "input-required", "canceled", "failed", "rejected"];
     if (statusFilter && !VALID_STATES.includes(statusFilter)) {
       return res.json({ jsonrpc: "2.0", id: body?.id ?? null, error: { code: -32602, message: "InvalidParams", data: { reason: `status must be one of ${VALID_STATES.map(s => "TASK_STATE_" + s.toUpperCase()).join(", ")}` } } });
     }
@@ -491,11 +543,11 @@ app.post("/inbox", async (req, res) => {
     const rows = a2a.prepare(`SELECT context_id, state, created_at, updated_at FROM tasks ${whereSql} ORDER BY updated_at DESC, context_id ASC LIMIT ?`).all(...args, pageSize + 1);
     const hasMore = rows.length > pageSize;
     const page = rows.slice(0, pageSize);
-    const historyLen = Math.max(parseInt(p.historyLength) || 0, 0);
+    const historyLen = historyLimit(p.historyLength);
     const includeArtifacts = p.includeArtifacts !== false && p.includeArtifacts !== "false";
     const tasks = page.map(r => {
       const t = { id: r.context_id, contextId: r.context_id, status: { state: r.state, timestamp: new Date(r.updated_at).toISOString() } };
-      if (historyLen > 0) t.history = getHistory(r.context_id).slice(-historyLen).map(historyItem);
+      if (historyLen > 0) t.history = getHistory(r.context_id, historyLen, false).map(historyItemNoData);
       if (includeArtifacts) {
         const arts = a2a.prepare(`SELECT artifact_id, name, parts_json, ts FROM artifacts WHERE task_id=? ORDER BY ts ASC`).all(r.context_id);
         if (arts.length) t.artifacts = arts.map(a => ({ artifactId: a.artifact_id, name: a.name, parts: JSON.parse(a.parts_json) }));
@@ -517,14 +569,21 @@ app.post("/inbox", async (req, res) => {
     const t = a2a.prepare(`SELECT * FROM tasks WHERE context_id=?`).get(ctx);
     if (!t) return res.json({ jsonrpc: "2.0", id: body?.id ?? null, error: { code: -32001, message: "TaskNotFound", data: { contextId: ctx } } });
     const result = { id: t.context_id, contextId: t.context_id, status: { state: t.state, timestamp: new Date(t.updated_at).toISOString() } };
-    const hl = Math.max(parseInt(body?.params?.historyLength) || 0, 0);
-    if (hl > 0) result.history = getHistory(ctx).slice(-hl).map(historyItem);
+    const hl = historyLimit(body?.params?.historyLength);
+    if (hl > 0) result.history = getHistory(ctx, hl).map(historyItem);
     const arts = a2a.prepare(`SELECT artifact_id, name, parts_json, ts FROM artifacts WHERE task_id=? ORDER BY ts ASC`).all(ctx);
     if (arts.length) result.artifacts = arts.map(a => ({ artifactId: a.artifact_id, name: a.name, parts: JSON.parse(a.parts_json) }));
     return res.json({ jsonrpc: "2.0", id: body?.id ?? null, result });
   }
 
   const msg = body?.params?.message || body?.message || body;
+  // identifiers chosen by the sender end up in the operator's files and prompts: refuse anything but [\w.:-]{1,128} before storing anything
+  for (const field of ["contextId", "taskId", "messageId"]) {
+    const v = msg?.[field];
+    if (v !== undefined && v !== null && v !== "" && !(typeof v === "string" && ID_RULE.test(v))) {
+      return res.json({ jsonrpc: "2.0", id: body?.id ?? null, error: { code: -32602, message: "InvalidParams", data: { field, reason: `${field} must match ${ID_RULE.source}` } } });
+    }
+  }
   // A2A v1.0 full parts: TextPart {text} | DataPart {data:object} | FilePart {raw|url + mediaType}
   const partsIn = msg?.parts || [];
   const text = partsIn.map(p => p.text || "").join(" ").slice(0, 4000);
@@ -542,11 +601,13 @@ app.post("/inbox", async (req, res) => {
 
   // identity verification (optional but honored)
   const auth = body?.params?.auth || msg?.auth || null;
-  const declaredSender = msg?.sender || msg?.from || null;
+  const declaredSenderRaw = msg?.sender || msg?.from || null;
+  const declaredSender = typeof declaredSenderRaw === "string" ? declaredSenderRaw.slice(0, MAX_SENDER) : null;
   const ident = await verifyAuth(auth, declaredSender);
 
   // task lifecycle (A2A)
   const contextId = msg?.contextId || msg?.taskId || `t-${messageId}`;
+  const isFollowUp = !!a2a.prepare(`SELECT 1 FROM messages WHERE context_id=? LIMIT 1`).get(contextId); // the task already has messages
   upsertTask(contextId, "working");
 
   // structured offer (Defigent offer schema v1): DataPart {intent:"offer", service, price, asset, expiry?, terms?}
@@ -554,21 +615,23 @@ app.post("/inbox", async (req, res) => {
   for (const d of dataParts) {
     if (d?.intent === "offer" && d?.service && d?.price) { structuredOffer = d; break; }
   }
-  // Only short, unambiguous messages are closed with a template; everything else goes to the operator agent.
-  // Order: handshake -> structured offer -> offer keywords -> service question -> plain greeting -> other
-  // (a structured offer DataPart also wins over handshake-looking text, as before: a data offer is never dropped)
+  // Only a short, unambiguous FIRST message is closed with a template; everything else goes to the operator agent. A follow-up in a task
+  // that already has messages is never auto-closed (offer detection still applies).
+  // Order: structured offer -> handshake -> offer keywords -> service question -> plain greeting -> other
+  // (a structured offer DataPart wins over handshake-looking text, as before: a data offer is never dropped)
   const trimmed = (text || "").trim();
   const lower = trimmed.toLowerCase();
   let cls = "other";
   if (structuredOffer) cls = "offer_structured";
-  else if (/onboarding probe.*ready/i.test(text) && text.length < 200) cls = "handshake";
+  else if (!isFollowUp && /onboarding probe.*ready/i.test(text) && text.length < 200) cls = "handshake";
   // "do you offer ...?" asks for our services; it is not an offer keyword
   else if (/offer|propuesta|partnership|alianza|collab|colaboración|service proposal/.test(lower.replace(/\b(?:do|can|could|would|will) you offer\b/g, " "))) cls = "offer";
-  else if (trimmed.length <= 200 && trimmed.includes("?") && SERVICE_QUESTION.test(lower)) cls = "question";
-  else if (trimmed.length <= 60 && !trimmed.includes("?") && GREETING_START.test(trimmed)) cls = "greeting";
+  // a question with a number in it ("price is 3 USDC, ok?") may be a commitment: only the bare token x402 is allowed to carry digits
+  else if (!isFollowUp && trimmed.length <= 200 && trimmed.includes("?") && SERVICE_QUESTION.test(lower) && !/\d/.test(lower.replace(/\bx402\b/g, ""))) cls = "question";
+  else if (!isFollowUp && trimmed.length <= 60 && !trimmed.includes("?") && trimmed.split(/\s+/).length <= 4 && !/\d/.test(trimmed) && GREETING_START.test(trimmed)) cls = "greeting";
 
   logInbox({ ts: now, ip, messageId, cls, from: msg?.role || "unknown", declaredAgent: /agentId[ ]?\d+/i.exec(text)?.[0] || null, verified: ident.verified, sender: ident.address || null, contextId, hasData: dataParts.length > 0, hasFiles: fileParts.length > 0, text: (text || "").slice(0, 2000) });
-  addMessage(contextId, "user", text || "(no text; structured parts only)", ident.verified, ident.address || declaredSender, dataParts.length || fileParts.length ? JSON.stringify({ data: dataParts, files: fileParts }) : null);
+  const userTs = addMessage(contextId, "user", text || "(no text; structured parts only)", ident.verified, ident.address || declaredSender, dataParts.length || fileParts.length ? JSON.stringify({ data: dataParts, files: fileParts }) : null);
 
   // replies never interpolate sender-controlled text (offer fields, task id): the parsed offer travels as the received-offer artifact
   const POLL = `poll GetTask / tasks/get with the task id from this response (or GET ${BASE}/tasks/{id})`;
@@ -605,7 +668,7 @@ app.post("/inbox", async (req, res) => {
   const toOperator = ["offer", "offer_structured", "other"].includes(cls);
   if (toOperator) {
     try {
-      fs.appendFileSync(WAKE_QUEUE_FILE, wakeQueueLine({ ts: now, contextId, cls, verified: ident.verified, sender: ident.address || declaredSender, preview: (structuredOffer ? JSON.stringify(structuredOffer) : text).slice(0, 140) }) + "\n");
+      fs.appendFileSync(WAKE_QUEUE_FILE, wakeQueueLine({ ts: userTs, contextId, cls, verified: ident.verified, sender: ident.address || declaredSender, preview: (structuredOffer ? JSON.stringify(structuredOffer) : text).slice(0, 140) }));
     } catch {}
   }
   // task states: a template closes the task; a message for the operator stays `working` until the operator answers through the
@@ -661,7 +724,7 @@ app.get("/tasks", (req, res) => {
     const p = fakeBody.params;
     const pageSize = Math.min(Math.max(parseInt(p.pageSize) || 50, 1), 100);
     const statusFilter = typeof p.status === "string" ? p.status.replace("TASK_STATE_", "").toLowerCase().replace(/_/g, "-") : null;
-    const VALID_STATES = ["working", "completed", "input-required", "canceled"];
+    const VALID_STATES = ["working", "completed", "input-required", "canceled", "failed", "rejected"];
     if (statusFilter && !VALID_STATES.includes(statusFilter)) {
       return res.status(400).json({ jsonrpc: "2.0", id: null, error: { code: -32602, message: "InvalidParams", data: { reason: "invalid status filter" } } });
     }
@@ -777,14 +840,14 @@ app.post("/webhooks/onchain", (req, res) => {
     // logueamos el intento para adaptar la auth a lo que QuickNode envíe de verdad
     try {
       fs.appendFileSync(WEBHOOK_REJECTS_FILE,
-        JSON.stringify({ ts: Date.now(), ip, headers: req.headers, bodyKeys: Object.keys(req.body || {}) }) + "\n");
+        jsonl({ ts: Date.now(), ip, headers: req.headers, bodyKeys: Object.keys(req.body || {}) }));
     } catch {}
     return res.status(403).json({ error: "forbidden (valid signature or QuickNode IP required)" });
   }
   res.status(204).end();
   try {
     fs.appendFileSync(WAKE_QUEUE_FILE,
-      JSON.stringify({ ts: Date.now(), cls: "onchain_event", source: "quicknode-webhook", preview: JSON.stringify(req.body || {}).slice(0, 300) }) + "\n");
+      jsonl({ ts: Date.now(), cls: "onchain_event", source: "quicknode-webhook", preview: JSON.stringify(req.body || {}).slice(0, 300) }));
   } catch {}
 });
 
@@ -877,8 +940,8 @@ app.get("/integration", (_req, res) => {
       },
       {
         step: "2c", title: "Track the conversation (A2A tasks)",
-        how: `Every message creates/updates a task. The reply carries contextId + task:{id,state}. Read the full thread: curl http://3.238.185.185:8080/tasks/<contextId> — returns state (working/completed/input-required/canceled) + signed history of both sides. A message that needs reasoning is acknowledged at once and the task stays working while the operator agent answers it; the reasoned reply is appended to this same task later, so poll GET /tasks/<contextId> (or GetTask / tasks/get) until the state leaves working. input-required now means the operator is asking you something: answer with the same contextId.`,
-        note: "Pass contextId in your next message to continue the same thread. States: submitted/working/input-required/completed/canceled."
+        how: `Every message creates/updates a task. The reply carries contextId + task:{id,state}. Read the full thread: curl http://3.238.185.185:8080/tasks/<contextId> — returns state (working/completed/input-required/canceled/failed/rejected) + signed history of both sides. A message that needs reasoning is acknowledged at once and the task stays working while the operator agent answers it; the reasoned reply is appended to this same task later, so poll GET /tasks/<contextId> (or GetTask / tasks/get) until the state leaves working. input-required now means the operator is asking you something: answer with the same contextId. failed / rejected mean the operator could not do it / declined.`,
+        note: "Pass contextId in your next message to continue the same thread. States: submitted/working/input-required/completed/canceled/failed/rejected."
       },
       {
         step: 3, title: "Run our paid service (x402)",
