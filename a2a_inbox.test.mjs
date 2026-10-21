@@ -959,6 +959,112 @@ describe("classifier: intent rules for greetings and questions (G2)", { timeout:
   }
 });
 
+// Machine classes that production (origin/main) already answers deterministically: Taifoon work notices, practice probes and
+// digest probes. They match very specific texts, so they win over the generic offer / question / greeting rules and are not
+// gated by "follow-up"; their replies are what Taifoon reads from the HTTP response, so they must not change.
+const NOTICE = "Taifoon work notice. Demand dm_0123456789abcdef01234567 matches your skills (offer: 0.10 USDC). Are you interested?";
+const NOTICE_REPLY = '{"interested": true}';
+const KECCAK_ABC = "0x4e03657aea45a94fc7d47ba826c8d667c0d1e6e33a64a036ec44f58fa12d6c45"; // keccak256("abc"), viem-style 0x prefix
+const SHA256_ABC = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"; // sha256("abc")
+const PROBE_REPLY = "Practice probe received and logged for operator review. Defigent supports deterministic classes: mcp.digest (sha256/keccak256), chat.word_count, web.search. Operator: Telegram @FirrtonH.";
+describe("machine classes from production: Taifoon notices, practice probes and digest probes keep their deterministic replies", { timeout: 120000 }, () => {
+  let h;
+  before(async () => { h = await Harness.start(); });
+  after(async () => { await h?.stop(); });
+
+  const classOf = (messageId) => h.readJsonl("defigent_inbox.jsonl").find((e) => e.messageId === messageId).cls;
+  const wakeOf = (contextId) => h.readJsonl("defigent_wake_queue.jsonl").filter((e) => e.contextId === contextId);
+
+  it("a Taifoon work notice gets {\"interested\": true} and a completed task, although it says 'offer' and ends in '?'", async () => {
+    const r = await h.post(msgReq("tf-1", textParts(NOTICE)));
+    assertHybridReply(r.json.result, { contextId: "t-tf-1", state: "completed", text: NOTICE_REPLY });
+    assert.deepEqual(JSON.parse(r.json.result.parts[0].text), { interested: true }); // machine-readable: this body is what Taifoon reads
+    const t = (await h.get("/tasks/t-tf-1")).json;
+    assert.equal(t.task.state, "completed");
+    assert.deepEqual(rolesOf(t.history), ["agent", "user"]);
+    assert.deepEqual(t.artifacts, []);
+    assert.equal(classOf("tf-1"), "taifoon_notice");
+    // the operator is still told about the demand (as before), but the task is already closed and nothing is expected from it
+    const q = wakeOf("t-tf-1");
+    assert.deepEqual(q.map((e) => e.cls), ["taifoon_notice"]);
+    assert.deepEqual(Object.keys(q[0]), WAKE_KEYS);
+  });
+
+  it("a notice that lands in a task which already has messages is still answered by machine (not gated by the follow-up rule)", async () => {
+    await h.post(msgReq("tf-2a", textParts("Please send me a quote"), { message: { contextId: "tf-ctx" } }));
+    const r = await h.post(msgReq("tf-2b", textParts(NOTICE), { message: { contextId: "tf-ctx" } }));
+    assertHybridReply(r.json.result, { contextId: "tf-ctx", state: "completed", text: NOTICE_REPLY });
+    assert.equal(classOf("tf-2b"), "taifoon_notice");
+  });
+
+  it("'Taifoon work notice.' without a demand id (dm_ + 24 hex) is not a notice: it goes to the operator", async () => {
+    const r = await h.post(msgReq("tf-3", textParts("Taifoon work notice. Please look at the board.")));
+    assertHybridReply(r.json.result, { contextId: "t-tf-3", state: "working", text: TXT.other });
+    assert.equal(classOf("tf-3"), "other");
+  });
+
+  it("mcp.digest probe: the keccak256 of a quoted string is computed, returned as the reply and attached as an artifact (beats the greeting rule)", async () => {
+    const r = await h.post(msgReq("tf-4", textParts('Hi! Could you tell me the keccak256 hash of "abc"?')));
+    assertHybridReply(r.json.result, { contextId: "t-tf-4", state: "completed", text: KECCAK_ABC });
+    const t = (await h.get("/tasks/t-tf-4")).json;
+    assert.equal(t.task.state, "completed");
+    assert.deepEqual(t.artifacts.map((a) => [a.name, a.parts]), [["digest-result", [{ data: { algorithm: "keccak256", input: "abc", digest: KECCAK_ABC } }]]]);
+    assert.equal(classOf("tf-4"), "digest");
+    assert.deepEqual(wakeOf("t-tf-4"), []);
+  });
+
+  it("mcp.digest probe: sha256 comes back as bare hex", async () => {
+    const r = await h.post(msgReq("tf-5", textParts('sha256 hash of "abc"')));
+    assertHybridReply(r.json.result, { contextId: "t-tf-5", state: "completed", text: SHA256_ABC });
+    assert.deepEqual((await h.get("/tasks/t-tf-5")).json.artifacts.map((a) => [a.name, a.parts[0].data.algorithm, a.parts[0].data.digest]), [["digest-result", "sha256", SHA256_ABC]]);
+  });
+
+  it("chat.word_count practice probe: the words of the quoted text are counted and the task is completed", async () => {
+    const r = await h.post(msgReq("tf-6", textParts('chat.word_count: count the words in "the quick brown fox"')));
+    assertHybridReply(r.json.result, { contextId: "t-tf-6", state: "completed", text: "4" });
+    assert.equal(classOf("tf-6"), "word_count");
+    assert.deepEqual(wakeOf("t-tf-6"), []);
+  });
+
+  it("an unknown chat.* practice probe gets the canned reply and reaches the operator (task stays working)", async () => {
+    const r = await h.post(msgReq("tf-7", textParts('chat.sentiment: classify the sentiment of "great work"')));
+    assertHybridReply(r.json.result, { contextId: "t-tf-7", state: "working", text: PROBE_REPLY });
+    assert.equal(classOf("tf-7"), "taifoon_probe");
+    assert.deepEqual(wakeOf("t-tf-7").map((e) => e.cls), ["taifoon_probe"]); // the reply promises "operator review": the operator is woken and may answer through the outbox
+  });
+
+  // The generic rules that this branch rewrote still decide everything the machine classes do not claim
+  it("'What services do you offer and how do I pay with x402?' is a question (canned catalogue, completed), not an offer", async () => {
+    const r = await h.post(msgReq("tf-8", textParts("What services do you offer and how do I pay with x402?")));
+    assertHybridReply(r.json.result, { contextId: "t-tf-8", state: "completed", text: TXT.question });
+    assert.equal(classOf("tf-8"), "question");
+    assert.deepEqual((await h.get("/tasks/t-tf-8")).json.artifacts.map((a) => a.name), ["defigent-services-catalog"]);
+    assert.deepEqual(wakeOf("t-tf-8"), []);
+  });
+
+  it("a short 'hi' still gets the greeting (completed, not queued)", async () => {
+    const r = await h.post(msgReq("tf-9", textParts("hi")));
+    assertHybridReply(r.json.result, { contextId: "t-tf-9", state: "completed", text: TXT.greeting });
+    assert.equal(classOf("tf-9"), "greeting");
+    assert.deepEqual(wakeOf("t-tf-9"), []);
+  });
+
+  it("origin/main surface that rides along: /jobs landing, MCP initialize and the defigent_hash tool", async () => {
+    const jobs = await h.get("/jobs");
+    assert.equal(jobs.status, 200);
+    assert.match(jobs.headers["content-type"], /^text\/html/);
+    assert.match(jobs.text, /ERC-8183/);
+    const init = await h.postJson("/mcp", { jsonrpc: "2.0", id: 1, method: "initialize", params: {} });
+    assert.equal(init.json.result.protocolVersion, "2026-07-28");
+    assert.equal(init.json.result.serverInfo.name, "defigent");
+    const list = await h.postJson("/mcp", { jsonrpc: "2.0", id: 2, method: "tools/list" });
+    assert.ok(list.json.result.tools.map((x) => x.name).includes("defigent_hash"));
+    const hash = (algorithm) => h.postJson("/mcp", { jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "defigent_hash", arguments: { algorithm, text: "abc" } } });
+    assert.deepEqual((await hash("sha256")).json.result.content, [{ type: "text", text: SHA256_ABC }]);
+    assert.deepEqual((await hash("keccak256")).json.result.content, [{ type: "text", text: KECCAK_ABC.slice(2) }]); // the MCP tool returns keccak without 0x
+  });
+});
+
 describe("wake queue: thread = last six messages, reply_via, lines stay small", { timeout: 120000 }, () => {
   let h;
   before(async () => { h = await Harness.start(); });
