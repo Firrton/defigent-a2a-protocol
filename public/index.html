@@ -203,7 +203,7 @@
   .rug i::before { content: ""; position: absolute; inset: -14px -3px 0; }
   .rug i:hover { height: 30px; opacity: 1; }
   .rug-axis { display: flex; justify-content: space-between; gap: 12px; font-size: 11px; color: var(--text3); margin-top: 7px; }
-  .st-working { --sc: var(--info); } .st-completed { --sc: var(--ok); } .st-input-required { --sc: var(--warn); } .st-canceled { --sc: var(--err); } .st-unknown { --sc: #8a909c; }
+  .st-working { --sc: var(--info); } .st-completed { --sc: var(--ok); } .st-input-required { --sc: var(--warn); } .st-canceled { --sc: var(--err); } .st-failed { --sc: var(--err); } .st-rejected { --sc: var(--err); } .st-unknown { --sc: #8a909c; }
   .task { border-bottom: 1px solid var(--line); } .task:last-child { border-bottom: 0; }
   .task.new { animation: arrive 2.4s var(--ease); } @keyframes arrive { 0% { background: rgba(139,123,255,.24); } 100% { background: transparent; } }
   .t-head { display: flex; align-items: center; gap: 14px; width: 100%; min-height: 48px; padding: 8px 16px; text-align: left; transition: background .12s; }
@@ -484,7 +484,7 @@ const SVGNS = "http://www.w3.org/2000/svg";
 const REDUCED = matchMedia("(prefers-reduced-motion: reduce)").matches;
 const POLL_MS = 15000, NET_MS = 300000, PAGE = 20, SAMPLE = 100, COLLAPSED = 10;
 const PALETTE = ["#6ea8ff", "#56c8d8", "#f0b54a", "#ee7fb1", "#f08a6c"], NEUTRAL = "#8a909c";
-const STATES = { working: "Working", completed: "Completed", "input-required": "Input required", canceled: "Canceled" };
+const STATES = { working: "Working", completed: "Completed", "input-required": "Input required", canceled: "Canceled", failed: "Failed", rejected: "Rejected" };
 const nf = new Intl.NumberFormat("en-US");
 
 const S = { selfId: "10331", net: null, lat: [], up: null, upAt: 0, prev: null, lastSync: 0, epSig: "" };
