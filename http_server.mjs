@@ -181,7 +181,8 @@ CREATE TABLE IF NOT EXISTS artifacts (
   parts_json TEXT NOT NULL,
   ts INTEGER NOT NULL,
   FOREIGN KEY (task_id) REFERENCES tasks(context_id)
-);`);
+);
+CREATE INDEX IF NOT EXISTS idx_messages_ctx_ts ON messages(context_id, ts);`);
 try { a2a.exec(`ALTER TABLE messages ADD COLUMN meta TEXT`); } catch {}
 
 function upsertTask(contextId, state) {
@@ -227,8 +228,11 @@ const OUTBOX_MAX_TEXT = 4000, OUTBOX_MAX_DATA = 16 * 1024, OUTBOX_MAX_REPLY_ID =
 const OUTBOX_WINDOW = 1 << 20; // bytes read per step; a line longer than this can never be valid
 const OUTBOX_TICK_LINES = 200, OUTBOX_TICK_MS = 50; // per tick: stop after this many lines or this much time and continue on the next tick
 const OUTBOX_REJECTS_MAX = 2 * 1024 * 1024; // rotate the rejects log to .1 above this size
+// operator_bound: the sender messages that were queued for the operator (their stored ts). Only those can make an operator reply `stale`:
+// a message answered by a machine class (digest, notice...) is not waiting for anybody.
 a2a.exec(`CREATE TABLE IF NOT EXISTS outbox_state (id INTEGER PRIMARY KEY CHECK (id = 1), byte_offset INTEGER NOT NULL, ino TEXT);
-CREATE TABLE IF NOT EXISTS outbox_applied (reply_key TEXT PRIMARY KEY, ts INTEGER NOT NULL);`);
+CREATE TABLE IF NOT EXISTS outbox_applied (reply_key TEXT PRIMARY KEY, ts INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS operator_bound (context_id TEXT NOT NULL, ts INTEGER NOT NULL, PRIMARY KEY (context_id, ts));`);
 
 const getOutboxState = () => a2a.prepare(`SELECT byte_offset, ino FROM outbox_state WHERE id=1`).get() || { byte_offset: 0, ino: null };
 function setOutboxState(offset, ino) {
@@ -263,8 +267,8 @@ function applyOutboxLine(line, endOffset, ino) {
   const lastUser = a2a.prepare(`SELECT MAX(id) AS id FROM messages WHERE context_id=? AND role='user'`).get(o.contextId)?.id ?? 0;
   const key = o.replyId !== undefined ? `id:${o.contextId}\n${o.replyId}` : `sha256:${o.contextId}\n${crypto.createHash("sha256").update(line).digest("hex")}\n${lastUser}`;
   if (a2a.prepare(`SELECT 1 FROM outbox_applied WHERE reply_key=?`).get(key)) return "duplicate: this reply was already applied";
-  // a reply to an older sender message is kept in the thread, but the task stays working: a newer message is waiting for an answer
-  const stale = o.inReplyTo !== undefined && !!a2a.prepare(`SELECT 1 FROM messages WHERE context_id=? AND role='user' AND ts > ? LIMIT 1`).get(o.contextId, o.inReplyTo);
+  // a reply to an older sender message is kept in the thread, but the task stays working: a newer message for the operator is waiting
+  const stale = o.inReplyTo !== undefined && !!a2a.prepare(`SELECT 1 FROM operator_bound WHERE context_id=? AND ts > ? LIMIT 1`).get(o.contextId, o.inReplyTo);
   a2a.transaction(() => {
     a2a.prepare(`INSERT INTO outbox_applied (reply_key, ts) VALUES (?,?)`).run(key, Date.now());
     addMessage(o.contextId, "agent", text, true, null, o.data ? JSON.stringify({ data: [o.data], files: [] }) : null);
@@ -457,13 +461,30 @@ async function verifyAuth(auth, declaredSender) {
 }
 
 // ---------- A2A inbox (JSON-RPC message/send) — tasks + identity ----------
-// Classifier rules. A question is only answered from the canned catalogue when it asks what Defigent offers.
-const SERVICE_QUESTION = /\b(?:services?|prices?|pricing|costs?|endpoints?|x402|digest)\b|\bwhat (?:can|do) you (?:do|offer)\b|\bhow (?:(?:do|can|could|should) (?:i|we)|to) (?:pay|use|integrate)\b/;
+// Classifier rules. A question is only answered from the canned catalogue when it asks what Defigent is, does or sells (crawlers ask
+// these first). The open-ended phrasings ("what is this", "can you help") and the liveness checks only count when they end the message.
+const SERVICE_QUESTION = new RegExp([
+  String.raw`\b(?:services?|prices?|pricing|costs?|endpoints?|x402|digest)\b`,                  // what we sell
+  String.raw`\b(?:capabilit(?:y|ies)|tools?|skills?|features?)\b`,                              // what we can do
+  String.raw`\bwhat (?:can|do) you (?:do|offer|provide)\b`,
+  String.raw`\bwhat does (?:defigent|it|this agent|this service|your agent|your service) (?:do|offer|provide)\b`,
+  String.raw`\bwho are you\b`,
+  String.raw`\bwhat are you (?:able|for|good at|capable)\b`,
+  String.raw`\bwhat(?:'s| is) this(?: agent| service| bot)?(?: for| about)?\s*\?*\s*$`,
+  String.raw`\bcan you help(?: me| us)?\s*\?*\s*$`,
+  String.raw`\bare you (?:online|there|alive|up|running|live)\s*\?*\s*$`,                       // liveness checks
+  String.raw`\bhow (?:(?:do|can|could|should) (?:i|we)|to) (?:pay|use|integrate)\b`,
+].join("|"));
+// "do you offer ...?" / "what does Defigent offer?" ask for OUR services; "offer" is not an offer keyword there
+const ASKS_WHAT_WE_OFFER = /\b(?:(?:do|can|could|would|will) you|(?:does|can|could|would|will) (?:defigent|it|this agent|this service|your agent|your service)) offer\b/g;
 const GREETING_START = /^(?:hi|hello|hey|hola|gm|greetings|saludos|good (?:morning|afternoon|evening))\b/i;
-const ID_RULE = /^[\w.:-]{1,128}$/; // contextId, taskId and messageId chosen by the sender are copied by the operator: keep them boring
+// contextId, taskId and messageId chosen by the sender are copied by the operator: keep them boring. A task created without a contextId
+// is named `t-<messageId>` and clients echo that id back, so messageId is capped 2 characters lower: every id we hand out passes the rule.
+const ID_RULES = { contextId: /^[\w.:-]{1,128}$/, taskId: /^[\w.:-]{1,128}$/, messageId: /^[\w.:-]{1,126}$/ };
 const MAX_SENDER = 120; // declared (unverified) sender, cut at intake
 
 // One wake-queue line: the original fields plus the priority, the thread so far and how to answer (reply_via), so the entry is self-describing.
+// Informational entries (replyExpected false: a Taifoon notice, already answered by machine) carry `reply_expected: false` instead of reply_via.
 // `ts` is the stored timestamp of the sender's message: the operator copies it into `inReplyTo`. The line is kept within 4000 BYTES: thread
 // text is cut to 300 characters per message, and if escaping or multi-byte text still pushes it over, the cut is tightened and then the
 // oldest thread entries are dropped (ids and sender are already capped at intake, so the fixed part is small).
@@ -480,7 +501,8 @@ function wakeQueueLine(entry) {
   let line;
   for (const [cut, keep] of [[300, 6], [150, 6], [75, 6], [40, 6], [40, 3], [40, 1], [0, 1]]) {
     line = jsonl({ ts: entry.ts, contextId: entry.contextId, cls: entry.cls, verified: entry.verified, sender: entry.sender, preview: entry.preview, priority,
-      thread: thread.slice(-keep).map(m => ({ role: m.role, text: m.text.slice(0, cut), verified: !!m.verified, sender: m.sender ? m.sender.slice(0, 42) : null })), reply_via });
+      thread: thread.slice(-keep).map(m => ({ role: m.role, text: m.text.slice(0, cut), verified: !!m.verified, sender: m.sender ? m.sender.slice(0, 42) : null })),
+      ...(entry.replyExpected === false ? { reply_expected: false } : { reply_via }) });
     if (Buffer.byteLength(line) - 1 <= WAKE_MAX_BYTES) break;
   }
   return line;
@@ -592,10 +614,11 @@ app.post("/inbox", async (req, res) => {
 
   const msg = body?.params?.message || body?.message || body;
   // identifiers chosen by the sender end up in the operator's files and prompts: refuse anything but [\w.:-]{1,128} before storing anything
-  for (const field of ["contextId", "taskId", "messageId"]) {
+  for (const [field, rule] of Object.entries(ID_RULES)) {
+    if (typeof msg?.[field] === "number" && Number.isFinite(msg[field]) && msg[field] !== 0) msg[field] = String(msg[field]); // numeric ids were accepted before: keep them (0 still means "absent")
     const v = msg?.[field];
-    if (v !== undefined && v !== null && v !== "" && !(typeof v === "string" && ID_RULE.test(v))) {
-      return res.json({ jsonrpc: "2.0", id: body?.id ?? null, error: { code: -32602, message: "InvalidParams", data: { field, reason: `${field} must match ${ID_RULE.source}` } } });
+    if (v !== undefined && v !== null && v !== "" && v !== 0 && !(typeof v === "string" && rule.test(v))) {
+      return res.json({ jsonrpc: "2.0", id: body?.id ?? null, error: { code: -32602, message: "InvalidParams", data: { field, reason: `${field} must match ${rule.source}` } } });
     }
   }
   // A2A v1.0 full parts: TextPart {text} | DataPart {data:object} | FilePart {raw|url + mediaType}
@@ -622,6 +645,8 @@ app.post("/inbox", async (req, res) => {
   // task lifecycle (A2A)
   const contextId = msg?.contextId || msg?.taskId || `t-${messageId}`;
   const isFollowUp = !!a2a.prepare(`SELECT 1 FROM messages WHERE context_id=? LIMIT 1`).get(contextId); // the task already has messages
+  // `working` is the state of a task that waits for the operator (a closed task is completed, an unanswered question to the sender is input-required)
+  const awaitingOperator = a2a.prepare(`SELECT state FROM tasks WHERE context_id=?`).get(contextId)?.state === "working";
   upsertTask(contextId, "working");
 
   // structured offer (Defigent offer schema v1): DataPart {intent:"offer", service, price, asset, expiry?, terms?}
@@ -655,14 +680,18 @@ app.post("/inbox", async (req, res) => {
   else if (/Taifoon work notice\./.test(text) && /dm_[0-9a-f]{24}/.test(text)) cls = "taifoon_notice";
   else if (wcMatch) cls = "word_count";
   else if (/chat\.(\w+):/i.test(text)) cls = "taifoon_probe"; // practice probe desconocido → operador
-  // "do you offer ...?" asks for our services; it is not an offer keyword
-  else if (/offer|propuesta|partnership|alianza|collab|colaboración|service proposal/.test(lower.replace(/\b(?:do|can|could|would|will) you offer\b/g, " "))) cls = "offer";
+  // "do you offer ...?" / "what does Defigent offer?" ask for our services; they are not offer keywords
+  else if (/offer|propuesta|partnership|alianza|collab|colaboración|service proposal/.test(lower.replace(ASKS_WHAT_WE_OFFER, " "))) cls = "offer";
   // a question with a number in it ("price is 3 USDC, ok?") may be a commitment: only the bare token x402 is allowed to carry digits
   else if (!isFollowUp && trimmed.length <= 200 && trimmed.includes("?") && SERVICE_QUESTION.test(lower) && !/\d/.test(lower.replace(/\bx402\b/g, ""))) cls = "question";
   else if (!isFollowUp && trimmed.length <= 60 && !trimmed.includes("?") && trimmed.split(/\s+/).length <= 4 && !/\d/.test(trimmed) && GREETING_START.test(trimmed)) cls = "greeting";
 
+  // toOperator: the operator has to reason and answer through the outbox. taifoon_probe is one too: its canned reply promises "operator review".
+  const toOperator = ["offer", "offer_structured", "other", "taifoon_probe"].includes(cls);
   logInbox({ ts: now, ip, messageId, cls, from: msg?.role || "unknown", declaredAgent: /agentId[ ]?\d+/i.exec(text)?.[0] || null, verified: ident.verified, sender: ident.address || null, contextId, hasData: dataParts.length > 0, hasFiles: fileParts.length > 0, text: (text || "").slice(0, 2000) });
   const userTs = addMessage(contextId, "user", text || "(no text; structured parts only)", ident.verified, ident.address || declaredSender, dataParts.length || fileParts.length ? JSON.stringify({ data: dataParts, files: fileParts }) : null);
+
+  if (toOperator) a2a.prepare(`INSERT OR IGNORE INTO operator_bound (context_id, ts) VALUES (?,?)`).run(contextId, userTs);
 
   // replies never interpolate sender-controlled text (offer fields, task id): the parsed offer travels as the received-offer artifact
   const POLL = `poll GetTask / tasks/get with the task id from this response (or GET ${BASE}/tasks/{id})`;
@@ -710,17 +739,17 @@ app.post("/inbox", async (req, res) => {
       .run(contextId, art.artifactId, art.name, JSON.stringify(art.parts), Date.now());
   }
   // wake-up queue: operator/agent attention needed (research P0 — kills the 2h blind window)
-  // toOperator: the operator has to reason and answer through the outbox. taifoon_probe is one too: its canned reply promises "operator review".
-  // taifoon_notice is already fully answered by the machine reply, but the operator is still woken to see the demand.
-  const toOperator = ["offer", "offer_structured", "other", "taifoon_probe"].includes(cls);
+  // taifoon_notice is already fully answered by the machine reply and its task is completed: the operator is woken to see the demand,
+  // but no answer is expected (reply_expected:false, no reply_via).
   if (toOperator || cls === "taifoon_notice") {
     try {
-      fs.appendFileSync(WAKE_QUEUE_FILE, wakeQueueLine({ ts: userTs, contextId, cls, verified: ident.verified, sender: ident.address || declaredSender, preview: (structuredOffer ? JSON.stringify(structuredOffer) : text).slice(0, 140) }));
+      fs.appendFileSync(WAKE_QUEUE_FILE, wakeQueueLine({ ts: userTs, contextId, cls, verified: ident.verified, sender: ident.address || declaredSender, preview: (structuredOffer ? JSON.stringify(structuredOffer) : text).slice(0, 140), replyExpected: toOperator }));
     } catch {}
   }
   // task states: a template or a machine reply closes the task; a message for the operator stays `working` until the operator answers
-  // through the outbox (and `input-required` only appears when the operator itself asks the sender something)
-  const finalState = toOperator ? "working" : "completed";
+  // through the outbox (and `input-required` only appears when the operator itself asks the sender something). A machine reply to a
+  // follow-up never closes a task that is still waiting for the operator: that answer is still owed.
+  const finalState = toOperator || awaitingOperator ? "working" : "completed";
   upsertTask(contextId, finalState);
 
   const replyMsg = {

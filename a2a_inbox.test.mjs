@@ -964,6 +964,7 @@ describe("classifier: intent rules for greetings and questions (G2)", { timeout:
 // gated by "follow-up"; their replies are what Taifoon reads from the HTTP response, so they must not change.
 const NOTICE = "Taifoon work notice. Demand dm_0123456789abcdef01234567 matches your skills (offer: 0.10 USDC). Are you interested?";
 const NOTICE_REPLY = '{"interested": true}';
+const NOTICE_WAKE_KEYS = WAKE_KEYS.filter((k) => k !== "reply_via").concat("reply_expected"); // informational wake lines (nothing to answer)
 const KECCAK_ABC = "0x4e03657aea45a94fc7d47ba826c8d667c0d1e6e33a64a036ec44f58fa12d6c45"; // keccak256("abc"), viem-style 0x prefix
 const SHA256_ABC = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"; // sha256("abc")
 const PROBE_REPLY = "Practice probe received and logged for operator review. Defigent supports deterministic classes: mcp.digest (sha256/keccak256), chat.word_count, web.search. Operator: Telegram @FirrtonH.";
@@ -987,14 +988,16 @@ describe("machine classes from production: Taifoon notices, practice probes and 
     // the operator is still told about the demand (as before), but the task is already closed and nothing is expected from it
     const q = wakeOf("t-tf-1");
     assert.deepEqual(q.map((e) => e.cls), ["taifoon_notice"]);
-    assert.deepEqual(Object.keys(q[0]), WAKE_KEYS);
+    assert.deepEqual(Object.keys(q[0]), NOTICE_WAKE_KEYS); // no reply_via: the task is closed and an answer would only reopen it
+    assert.equal(q[0].reply_expected, false);
   });
 
-  it("a notice that lands in a task which already has messages is still answered by machine (not gated by the follow-up rule)", async () => {
+  it("a notice that lands in a task which already has messages is still answered by machine (not gated by the follow-up rule), but does not close a task that waits for the operator", async () => {
     await h.post(msgReq("tf-2a", textParts("Please send me a quote"), { message: { contextId: "tf-ctx" } }));
     const r = await h.post(msgReq("tf-2b", textParts(NOTICE), { message: { contextId: "tf-ctx" } }));
-    assertHybridReply(r.json.result, { contextId: "tf-ctx", state: "completed", text: NOTICE_REPLY });
+    assertHybridReply(r.json.result, { contextId: "tf-ctx", state: "working", text: NOTICE_REPLY }); // the quote request is still owed an answer
     assert.equal(classOf("tf-2b"), "taifoon_notice");
+    assert.equal((await h.get("/tasks/tf-ctx")).json.task.state, "working");
   });
 
   it("'Taifoon work notice.' without a demand id (dm_ + 24 hex) is not a notice: it goes to the operator", async () => {
@@ -1062,6 +1065,108 @@ describe("machine classes from production: Taifoon notices, practice probes and 
     const hash = (algorithm) => h.postJson("/mcp", { jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "defigent_hash", arguments: { algorithm, text: "abc" } } });
     assert.deepEqual((await hash("sha256")).json.result.content, [{ type: "text", text: SHA256_ABC }]);
     assert.deepEqual((await hash("keccak256")).json.result.content, [{ type: "text", text: KECCAK_ABC.slice(2) }]); // the MCP tool returns keccak without 0x
+  });
+});
+
+// Exact messages seen in production traffic (326 tasks in 6 days). Replies and states are what origin/main answers, so the merge must not move them.
+const REAL = {
+  notice: 'Taifoon work notice. Job: Digest of a text (mcp.digest), demand dm_50f0ddb47de3fb5b783a8012. Pay: 0.05 dUSDC (test money on the Taifoon devnet), paid at a passing grade. To take such jobs reply {"interested": true}: your endpoint is then probed with practice tasks of this class and listed once its probes pass. To stop these notices reply {"opt_out": true}.',
+  ready: "Taifoon onboarding probe: reply with the single word READY.",
+  crawler: "What can you do?",
+  agentprobe: "agentprobe.org liveness check. Reply with the single word OK and take no other action.",
+};
+// Crawlers open with questions about what Defigent is and does; origin/main answered all of them from the catalogue.
+const CRAWLER_CASES = [
+  ["What are your capabilities?", "question"],
+  ["Who are you?", "question"],
+  ["What tools do you have?", "question"],
+  ["What skills do you have?", "question"],
+  ["What features do you have?", "question"],
+  ["Can you help me?", "question"],
+  ["What is this agent for?", "question"],
+  ["Are you online?", "question"],
+  ["What does Defigent offer?", "question"],   // "offer" here asks about OUR services: it is not an offer
+  ["What does this agent offer?", "question"],
+  ["What are you able to do?", "question"],
+  ["What are you for?", "question"],
+  ["What's this?", "question"],
+  ["Are you there?", "question"],
+  ["What is this error?", "other"],              // the open-ended phrasings only count at the end of the message
+  ["Can you help me build a swap router?", "other"],
+  ["Are you up to building a custom bridge?", "other"],
+  ["What does Defigent offer for 5 USDC?", "other"], // a number: the operator must see it
+];
+for (const [part, cases] of [[1, CRAWLER_CASES.slice(0, 9)], [2, CRAWLER_CASES.slice(9)]]) { // one server per 9 messages: the rate limit is never weakened
+  describe(`classifier: crawler questions about capabilities and identity are answered from the catalogue again (${part}/2)`, { timeout: 120000 }, () => {
+    let h;
+    before(async () => { h = await Harness.start(); });
+    after(async () => { await h?.stop(); });
+    cases.forEach(([text, cls], i) => {
+      it(`${cls}: ${JSON.stringify(text)}`, async () => {
+        const id = `cq-${part}-${i + 1}`;
+        const closed = cls === "question";
+        const r = await h.post(msgReq(id, textParts(text)));
+        assertHybridReply(r.json.result, { contextId: `t-${id}`, state: closed ? "completed" : "working", text: closed ? TXT.question : TXT.other });
+        assert.equal(h.readJsonl("defigent_inbox.jsonl").find((e) => e.messageId === id).cls, cls);
+        assert.equal(h.readJsonl("defigent_wake_queue.jsonl").some((e) => e.contextId === `t-${id}`), !closed);
+      });
+    });
+  });
+}
+
+// A machine reply to a follow-up must not close a task that still waits for the operator, and only operator-bound messages make a reply stale
+describe("pending operator: machine-class follow-ups keep the task working and do not make the operator's reply stale", { timeout: 180000 }, () => {
+  let h;
+  before(async () => { h = await Harness.start(); });
+  after(async () => { await h?.stop(); });
+  const wake = (ctx) => h.readJsonl("defigent_wake_queue.jsonl").filter((e) => e.contextId === ctx);
+  const state = async (ctx) => (await h.get(`/tasks/${ctx}`)).json.task.state;
+
+  it("sha256 digest sent into a task waiting for the operator: answered, task stays working; the operator's reply to the first message then completes it", async () => {
+    await h.post(msgReq("po-1a", textParts("Please send me a quote"), { message: { contextId: "po-1" } }));
+    const [first] = wake("po-1");
+    const r = await h.post(msgReq("po-1b", textParts('sha256 hash of "abc"'), { message: { contextId: "po-1" } }));
+    assertHybridReply(r.json.result, { contextId: "po-1", state: "working", text: SHA256_ABC }); // the digest is still computed and returned
+    assert.equal(await state("po-1"), "working");
+    assert.deepEqual(wake("po-1").map((e) => e.cls), ["other"]); // the digest was not queued
+    h.operatorSays({ contextId: "po-1", text: "Here is the quote.", inReplyTo: first.ts });
+    // before the fix this reply counted as stale (a newer user message existed) and the task stayed working forever
+    await h.waitFor(async () => (await state("po-1")) === "completed", { what: "the operator reply closes the task" });
+    assert.deepEqual((await h.agentRows("po-1")).map((m) => m.text), [TXT.other, SHA256_ABC, "Here is the quote."]);
+  });
+
+  it("once the operator has answered, a machine follow-up closes the task as usual; an operator-bound follow-up still makes the older reply stale", async () => {
+    const r = await h.post(msgReq("po-2", textParts('sha256 hash of "abc"'), { message: { contextId: "po-1" } }));
+    assertHybridReply(r.json.result, { contextId: "po-1", state: "completed", text: SHA256_ABC });
+    await h.post(msgReq("po-3a", textParts("Please send me a quote"), { message: { contextId: "po-3" } }));
+    await h.post(msgReq("po-3b", textParts("And please include the terms"), { message: { contextId: "po-3" } }));
+    const [a, b] = wake("po-3");
+    h.operatorSays({ contextId: "po-3", text: "re first", inReplyTo: a.ts, replyId: "po-3-a" });
+    await h.waitFor(async () => (await h.agentRows("po-3")).some((m) => m.text === "re first"), { what: "reply to the first" });
+    assert.equal(await state("po-3"), "working");
+    h.operatorSays({ contextId: "po-3", text: "re second", inReplyTo: b.ts, replyId: "po-3-b" });
+    await h.waitFor(async () => (await state("po-3")) === "completed", { what: "reply to the second" });
+  });
+
+  it("a Taifoon notice and a word_count probe behave the same way: answered by machine, task not closed while the operator owes an answer", async () => {
+    await h.post(msgReq("po-4a", textParts("Please send me a quote"), { message: { contextId: "po-4" } }));
+    const n = await h.post(msgReq("po-4b", textParts(REAL.notice), { message: { contextId: "po-4" } }));
+    assertHybridReply(n.json.result, { contextId: "po-4", state: "working", text: '{"interested": true}' });
+    const w = await h.post(msgReq("po-4c", textParts('chat.word_count: count the words in "a b c"'), { message: { contextId: "po-4" } }));
+    assertHybridReply(w.json.result, { contextId: "po-4", state: "working", text: "3" });
+    const [first] = wake("po-4").filter((e) => e.cls === "other");
+    h.operatorSays({ contextId: "po-4", text: "Quote sent.", inReplyTo: first.ts });
+    await h.waitFor(async () => (await state("po-4")) === "completed", { what: "the operator reply closes the task" });
+  });
+
+  it("the sender-message index exists and serves the per-task lookups", async () => {
+    const db = await h.db();
+    try {
+      assert.deepEqual(db.prepare("SELECT name, tbl_name FROM sqlite_master WHERE type='index' AND name='idx_messages_ctx_ts'").all(), [{ name: "idx_messages_ctx_ts", tbl_name: "messages" }]);
+      const plan = (sql) => db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all("po-1").map((r) => r.detail).join(" | ");
+      assert.match(plan("SELECT MAX(ts) FROM messages WHERE context_id=? AND role='user'"), /idx_messages_ctx_ts/);
+      assert.match(plan("SELECT role FROM messages WHERE context_id=? ORDER BY ts DESC, id DESC LIMIT 6"), /idx_messages_ctx_ts/);
+    } finally { db.close(); }
   });
 });
 
@@ -1849,7 +1954,7 @@ describe("identifiers: contextId, taskId and messageId from the sender are valid
   let h;
   before(async () => { h = await Harness.start(); });
   after(async () => { await h?.stop(); });
-  const RULE = "^[\\w.:-]{1,128}$";
+  const RULE = { contextId: "^[\\w.:-]{1,128}$", taskId: "^[\\w.:-]{1,128}$", messageId: "^[\\w.:-]{1,126}$" }; // messageId is 2 shorter: `t-<messageId>` becomes a contextId
 
   it("an id outside ^[\\w.:-]{1,128}$ -> -32602 InvalidParams naming the field; nothing is stored, queued or logged", async () => {
     const bad = [
@@ -1857,11 +1962,11 @@ describe("identifiers: contextId, taskId and messageId from the sender are valid
       ["contextId", "m-2", { contextId: "c".repeat(129) }],
       ["taskId", "m-3", { contextId: "fine-ctx", taskId: "<script>alert(1)</script>" }],
       ["messageId", "bad\nid", {}],
-      ["contextId", "m-5", { contextId: 12345 }],
+      ["contextId", "m-5", { contextId: 1e21 }], // a number whose text form is "1e+21"
     ];
     for (const [field, messageId, message] of bad) {
       const r = await h.post(msgReq(messageId, textParts("Please send me a quote"), { id: `bad-${field}`, message }));
-      assertRpcError(r, { id: `bad-${field}`, code: -32602, message: "InvalidParams", data: { field, reason: `${field} must match ${RULE}` } });
+      assertRpcError(r, { id: `bad-${field}`, code: -32602, message: "InvalidParams", data: { field, reason: `${field} must match ${RULE[field]}` } });
     }
     assert.equal((await h.get("/tasks")).json.totalSize, 0);
     for (const f of ["defigent_wake_queue.jsonl", "defigent_inbox.jsonl"]) assert.equal((h.readText(f) ?? "").trim(), "", f);
@@ -1877,10 +1982,11 @@ describe("identifiers: contextId, taskId and messageId from the sender are valid
     assertHybridReply(r.json.result, { contextId: ctx, state: "working", text: TXT.other });
   });
 
-  it("a messageId of 129 characters is rejected, naming messageId", async () => {
-    const r = await h.post(msgReq("m".repeat(129), textParts("x")));
+  it("a messageId of 127 characters is rejected, naming messageId (126 is the limit: see the echo test below)", async () => {
+    const r = await h.post(msgReq("m".repeat(127), textParts("x")));
     assert.equal(r.json.error.code, -32602);
     assert.equal(r.json.error.data.field, "messageId");
+    assert.equal(r.json.error.data.reason, `messageId must match ${RULE.messageId}`);
   });
 
   it("a declared sender is cut to 120 characters at intake, in the history and in the wake queue", async () => {
@@ -1889,6 +1995,33 @@ describe("identifiers: contextId, taskId and messageId from the sender are valid
     const e = h.readJsonl("defigent_wake_queue.jsonl").find((x) => x.contextId === "sender-cap");
     assert.equal(e.sender, "S".repeat(120));
     assert.equal(e.thread[0].sender, "S".repeat(42)); // thread entries carry a short form
+  });
+});
+
+describe("identifiers: numeric ids are still accepted and a `t-<messageId>` task id can be echoed back", { timeout: 120000 }, () => {
+  let h;
+  before(async () => { h = await Harness.start(); });
+  after(async () => { await h?.stop(); });
+
+  it("126 characters of messageId create a 128-character task id that the client can send back as its contextId", async () => {
+    const id = "m".repeat(126);
+    const ok = await h.post(msgReq(id, textParts("Please send me a quote")));
+    const ctx = ok.json.result.contextId;
+    assert.equal(ctx, `t-${id}`);
+    assert.equal(ctx.length, 128);
+    const echoed = await h.post(msgReq("m-echo", textParts("And the terms?"), { message: { contextId: ctx } })); // a client answering in the task it was given
+    assertHybridReply(echoed.json.result, { contextId: ctx, state: "working", text: TXT.other });
+  });
+
+  it("numeric messageId, contextId and taskId (accepted before the validation existed) are kept, stored as their text", async () => {
+    const a = await h.post(msgReq(12345, textParts("Please send me a quote")));
+    assert.equal(a.json.result.contextId, "t-12345");
+    const b = await h.post(msgReq("m-num-2", textParts("Please send me a quote"), { message: { contextId: 777 } }));
+    assert.equal(b.json.result.contextId, "777");
+    const c = await h.post(msgReq("m-num-3", textParts("Please send me a quote"), { message: { taskId: 42 } }));
+    assert.equal(c.json.result.contextId, "42");
+    assert.equal((await h.get("/tasks/777")).status, 200);
+    assert.equal(h.readJsonl("defigent_inbox.jsonl").find((e) => e.contextId === "t-12345").messageId, "12345");
   });
 });
 
