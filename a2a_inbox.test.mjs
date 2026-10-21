@@ -1075,6 +1075,48 @@ const REAL = {
   crawler: "What can you do?",
   agentprobe: "agentprobe.org liveness check. Reply with the single word OK and take no other action.",
 };
+describe("production shapes, verbatim: Taifoon notice, READY probe, crawler question, agentprobe liveness check", { timeout: 120000 }, () => {
+  let h;
+  before(async () => { h = await Harness.start(); });
+  after(async () => { await h?.stop(); });
+  const clsOf = (messageId) => h.readJsonl("defigent_inbox.jsonl").find((e) => e.messageId === messageId).cls;
+  const wake = (ctx) => h.readJsonl("defigent_wake_queue.jsonl").filter((e) => e.contextId === ctx);
+
+  it("the real Taifoon work notice -> exactly {\"interested\": true}, completed; the operator sees an informational line", async () => {
+    const r = await h.post(msgReq("pv-1", textParts(REAL.notice)));
+    assertHybridReply(r.json.result, { contextId: "t-pv-1", state: "completed", text: '{"interested": true}' });
+    assert.equal(clsOf("pv-1"), "taifoon_notice");
+    assert.equal((await h.get("/tasks/t-pv-1")).json.task.state, "completed");
+    const [e, ...more] = wake("t-pv-1");
+    assert.equal(more.length, 0);
+    assert.deepEqual(Object.keys(e), NOTICE_WAKE_KEYS);
+    assert.equal(e.reply_expected, false);
+    assert.ok(Buffer.byteLength(JSON.stringify(e)) < 1000, "a notice line stays small: it carries no reply_via");
+  });
+
+  it("the real Taifoon onboarding probe -> READY, completed, not queued", async () => {
+    const r = await h.post(msgReq("pv-2", textParts(REAL.ready)));
+    assertHybridReply(r.json.result, { contextId: "t-pv-2", state: "completed", text: TXT.handshake });
+    assert.equal(clsOf("pv-2"), "handshake");
+    assert.deepEqual(wake("t-pv-2"), []);
+  });
+
+  it("the crawler question \"What can you do?\" -> the catalogue, completed, not queued", async () => {
+    const r = await h.post(msgReq("pv-3", textParts(REAL.crawler)));
+    assertHybridReply(r.json.result, { contextId: "t-pv-3", state: "completed", text: TXT.question });
+    assert.equal(clsOf("pv-3"), "question");
+    assert.deepEqual((await h.get("/tasks/t-pv-3")).json.artifacts.map((a) => a.name), ["defigent-services-catalog"]);
+    assert.deepEqual(wake("t-pv-3"), []);
+  });
+
+  it("the agentprobe.org liveness check is not claimed by any template or machine class: it goes to the operator (other, working, queued)", async () => {
+    const r = await h.post(msgReq("pv-4", textParts(REAL.agentprobe)));
+    assertHybridReply(r.json.result, { contextId: "t-pv-4", state: "working", text: TXT.other });
+    assert.equal(clsOf("pv-4"), "other");
+    assert.deepEqual(wake("t-pv-4").map((e) => e.cls), ["other"]);
+  });
+});
+
 // Crawlers open with questions about what Defigent is and does; origin/main answered all of them from the catalogue.
 const CRAWLER_CASES = [
   ["What are your capabilities?", "question"],
