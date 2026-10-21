@@ -8,7 +8,9 @@ import { HTTPFacilitatorClient } from "@x402/core/server";
 const PAY_TO = "0x940ecB27d8f4F7009c8BC12969496E9639717638";
 const RPC = process.env.RPC_URL || "https://rpc.monad.xyz";
 const FACILITATOR = "https://x402-facilitator.molandak.org";
+const FACILITATOR_BASE = process.env.FACILITATOR_BASE || "https://facilitator.payai.network";
 const NETWORK = "eip155:143";
+const NETWORK_BASE = "eip155:8453";
 const PORT = process.env.PORT || 8080;
 
 async function rpc(method, params) {
@@ -30,16 +32,23 @@ app.set("trust proxy", "loopback");
 app.use(express.json({ verify: (req, _res, buf) => { req.rawBody = buf; } }));
 app.use(express.static("public", { index: false })); // dashboard assets (public/index.html served at / below)
 app.get("/", (_req, res) => res.sendFile("index.html", { root: "public" }));
+app.get("/jobs", (_req, res) => res.sendFile("jobs.html", { root: "public" }));
 
-const facilitatorClient = new HTTPFacilitatorClient({ url: FACILITATOR });
-const resourceServer = new x402ResourceServer(facilitatorClient).register(NETWORK, new ExactEvmScheme());
+const facilitatorMonad = new HTTPFacilitatorClient({ url: FACILITATOR });
+const facilitatorBase = new HTTPFacilitatorClient({ url: FACILITATOR_BASE });
+const resourceServer = new x402ResourceServer([facilitatorMonad, facilitatorBase])
+  .register(NETWORK, new ExactEvmScheme())
+  .register(NETWORK_BASE, new ExactEvmScheme());
 await resourceServer.initialize();
 
 app.use(paymentMiddleware(
   {
     "GET /digest": {
-      accepts: [{ scheme: "exact", price: "$0.001", network: NETWORK, payTo: PAY_TO }],
-      description: "Defigent on-chain wallet digest (MON+USDC balances), ERC-8004 agentId 10331",
+      accepts: [
+        { scheme: "exact", price: "$0.001", network: NETWORK, payTo: PAY_TO },
+        { scheme: "exact", price: "$0.001", network: NETWORK_BASE, payTo: PAY_TO },
+      ],
+      description: "Defigent on-chain wallet digest (balances), ERC-8004 agentId 10331 (Monad) / 114426 (Base). Dual-chain x402.",
     },
   },
   resourceServer
@@ -107,7 +116,7 @@ function logInbox(entry) {
 app.get("/.well-known/agent-card.json", (_req, res) => {
   res.json({
     name: "Defigent",
-    description: "Agentic commerce specialist agent on Monad: on-chain wallet digests, agent directory lookup, and regime analytics. ERC-8004 agentId 10331. Talks and pays x402 (v1+v2).",
+    description: "Agentic commerce specialist agent on Monad and Base: on-chain wallet digests, agent directory lookup, and regime analytics. ERC-8004 agentId 10331 (Monad) and 114426 (Base). Talks and pays x402 (v1+v2).",
     url: `${HTTPS_BASE}/inbox`,
     version: "1.4.0",
     protocolVersion: "1.0.1",
@@ -125,19 +134,24 @@ app.get("/.well-known/agent-card.json", (_req, res) => {
     defaultInputModes: ["text/plain", "application/json"],
     defaultOutputModes: ["text/plain", "application/json"],
     skills: [
-      { id: "digest", name: "Wallet digest", description: "On-chain MON+USDC balance digest for any address on Monad mainnet. Paid $0.001 USDC via x402.", tags: ["analytics", "monad", "x402"] },
+      { id: "digest", name: "Wallet digest", description: "On-chain balance digest for any address (Monad MON+USDC / Base ETH+USDC). Paid $0.001 USDC via x402 (Monad or Base).", tags: ["analytics", "monad", "base", "x402"] },
+      { id: "jobs", name: "Agentic jobs (ERC-8183)", description: "Escrowed agent jobs on our ERC-8183 deployment 0x61625eA32DaD03403db27cd94D6D3FE23b4A4a65 (Monad, fees 0/0). Negotiate over this inbox; the contract settles.", tags: ["jobs", "erc-8183", "escrow"] },
       { id: "agent-lookup", name: "Agent lookup", description: "Read any ERC-8004 agent registration from the Monad identity registry. Free.", tags: ["directory", "erc8004"] },
       { id: "status", name: "Status", description: "Live heartbeat: latency, uptime, balances, prices. Free.", tags: ["infra"] },
     ],
     provider: { organization: "Defigent (operator: FirrtonH)", url: `${BASE}/info` },
     registration: { agentId: 10331, registry: "eip155:143:0x8004A169FB4a3325136EB29fA0ceB6D2e539a432" },
+    registrations: [
+      { agentId: 10331, registry: "eip155:143:0x8004A169FB4a3325136EB29fA0ceB6D2e539a432" },
+      { agentId: 114426, registry: "eip155:8453:0x8004A169FB4a3325136EB29fA0ceB6D2e539a432" },
+    ],
   });
 });
 
 // ---------- A2A v2: SQLite tasks + signed sender identity ----------
 import Database from "better-sqlite3";
 import crypto from "crypto";
-import { verifyTypedData } from "viem";
+import { verifyTypedData, keccak256, toHex } from "viem";
 
 const A2A_DB = `${DATA_DIR}/defigent_a2a.db`;
 const a2a = new Database(A2A_DB);
@@ -616,14 +630,31 @@ app.post("/inbox", async (req, res) => {
     if (d?.intent === "offer" && d?.service && d?.price) { structuredOffer = d; break; }
   }
   // Only a short, unambiguous FIRST message is closed with a template; everything else goes to the operator agent. A follow-up in a task
-  // that already has messages is never auto-closed (offer detection still applies).
-  // Order: structured offer -> handshake -> offer keywords -> service question -> plain greeting -> other
-  // (a structured offer DataPart wins over handshake-looking text, as before: a data offer is never dropped)
+  // that already has messages is never auto-closed by the generic rules (offer detection still applies).
+  // Order: structured offer -> machine classes (Taifoon probes/notices, deterministic, as in production) -> handshake -> offer keywords
+  //        -> service question -> plain greeting -> other
+  // (a structured offer DataPart wins over everything, as before: a data offer is never dropped. The machine classes match very specific
+  //  texts, so they win over the generic offer/question/greeting rules and are not gated by isFollowUp.)
   const trimmed = (text || "").trim();
   const lower = trimmed.toLowerCase();
   let cls = "other";
+  // Taifoon mcp.digest class probe: deterministic, safe — hash a quoted string (content is DATA, computed, never executed)
+  const digestMatch = /(?:keccak256|sha256)\s+hash\s+of\s+"([^"]{1,4096})"/i.exec(text || "");
+  let digestValue = null;
+  if (digestMatch) {
+    try {
+      digestValue = /sha256/i.test(digestMatch[0])
+        ? crypto.createHash("sha256").update(digestMatch[1], "utf8").digest("hex")
+        : keccak256(toHex(digestMatch[1]));
+    } catch { digestValue = null; }
+  }
+  const wcMatch = /chat\.word_count:[^"]*"([^"]+)"/i.exec(text || ""); // the rotating practice probe: 'count the words in "X"'
   if (structuredOffer) cls = "offer_structured";
+  else if (digestMatch && digestValue) cls = "digest";
   else if (!isFollowUp && /onboarding probe.*ready/i.test(text) && text.length < 200) cls = "handshake";
+  else if (/Taifoon work notice\./.test(text) && /dm_[0-9a-f]{24}/.test(text)) cls = "taifoon_notice";
+  else if (wcMatch) cls = "word_count";
+  else if (/chat\.(\w+):/i.test(text)) cls = "taifoon_probe"; // practice probe desconocido → operador
   // "do you offer ...?" asks for our services; it is not an offer keyword
   else if (/offer|propuesta|partnership|alianza|collab|colaboración|service proposal/.test(lower.replace(/\b(?:do|can|could|would|will) you offer\b/g, " "))) cls = "offer";
   // a question with a number in it ("price is 3 USDC, ok?") may be a commitment: only the bare token x402 is allowed to carry digits
@@ -638,6 +669,16 @@ app.post("/inbox", async (req, res) => {
   let reply;
   if (cls === "handshake") {
     reply = "READY";
+  } else if (cls === "taifoon_notice") {
+    // respuesta MÁQUINA: {"interested": true} — el demand se liquida en segundos; el HTTP response de este POST es lo que Taifoon lee
+    reply = '{"interested": true}';
+  } else if (cls === "word_count") {
+    // Taifoon practice probe: conteo de palabras del texto citado (respuestas deterministas)
+    reply = String(wcMatch[1].trim().split(/\s+/).filter(Boolean).length);
+  } else if (cls === "taifoon_probe") {
+    reply = `Practice probe received and logged for operator review. Defigent supports deterministic classes: mcp.digest (sha256/keccak256), chat.word_count, web.search. Operator: Telegram @FirrtonH.`;
+  } else if (cls === "digest") {
+    reply = String(digestValue);
   } else if (cls === "greeting") {
     reply = `Hello! Defigent here (ERC-8004 agentId 10331, Monad). We run the standard A2A inbox you are using right now — any agent on Monad can write to us here. Our paid services run on x402: wallet digest $0.001, agent lookup free. Let's interop.`;
   } else if (cls === "offer_structured") {
@@ -652,6 +693,10 @@ app.post("/inbox", async (req, res) => {
 
   addMessage(contextId, "agent", reply, true, null);
   // artifact: structured outputs travel as artifacts (A2A v1.0 §4.1.7)
+  if (cls === "digest") {
+    a2a.prepare(`INSERT INTO artifacts (task_id, artifact_id, name, parts_json, ts) VALUES (?,?,?,?,?)`)
+      .run(contextId, `art-digest-${now}`, "digest-result", JSON.stringify([{ data: { algorithm: /sha256/i.test(digestMatch[0]) ? "sha256" : "keccak256", input: digestMatch[1], digest: digestValue } }]), Date.now());
+  }
   if (cls === "question" || cls === "offer_structured") {
     const art = cls === "question"
       ? { artifactId: `art-services-${now}`, name: "defigent-services-catalog", parts: [{ data: { services: [
@@ -665,14 +710,16 @@ app.post("/inbox", async (req, res) => {
       .run(contextId, art.artifactId, art.name, JSON.stringify(art.parts), Date.now());
   }
   // wake-up queue: operator/agent attention needed (research P0 — kills the 2h blind window)
-  const toOperator = ["offer", "offer_structured", "other"].includes(cls);
-  if (toOperator) {
+  // toOperator: the operator has to reason and answer through the outbox. taifoon_probe is one too: its canned reply promises "operator review".
+  // taifoon_notice is already fully answered by the machine reply, but the operator is still woken to see the demand.
+  const toOperator = ["offer", "offer_structured", "other", "taifoon_probe"].includes(cls);
+  if (toOperator || cls === "taifoon_notice") {
     try {
       fs.appendFileSync(WAKE_QUEUE_FILE, wakeQueueLine({ ts: userTs, contextId, cls, verified: ident.verified, sender: ident.address || declaredSender, preview: (structuredOffer ? JSON.stringify(structuredOffer) : text).slice(0, 140) }));
     } catch {}
   }
-  // task states: a template closes the task; a message for the operator stays `working` until the operator answers through the
-  // outbox (and `input-required` only appears when the operator itself asks the sender something)
+  // task states: a template or a machine reply closes the task; a message for the operator stays `working` until the operator answers
+  // through the outbox (and `input-required` only appears when the operator itself asks the sender something)
   const finalState = toOperator ? "working" : "completed";
   upsertTask(contextId, finalState);
 
@@ -766,52 +813,92 @@ app.get("/tasks/:contextId", (req, res) => {
 
 // ---------- MCP 2026-07-28 stateless surface (headers Mcp-Method/Mcp-Name; cada request self-contained) ----------
 const MCP_TOOLS = [
+  { name: "defigent_hash", description: "Compute the SHA-256 or Keccak-256 hex digest of a UTF-8 text.", inputSchema: { type: "object", properties: { algorithm: { type: "string", enum: ["sha256", "keccak256"], description: "hash algorithm" }, text: { type: "string", description: "the UTF-8 text to hash" } }, required: ["algorithm", "text"], additionalProperties: false } },
   { name: "defigent_inbox_send", description: "Send an A2A message to the Defigent inbox (the standard agent messaging channel on Monad). Returns the inbox reply + task state. Optional: contextId to continue a thread.", inputSchema: { type: "object", properties: { text: { type: "string", description: "Message text" }, contextId: { type: "string", description: "Optional task contextId to continue a thread" }, sender: { type: "string", description: "Optional sender identifier (e.g. ERC-8004 agentId or address)" } }, required: ["text"] } },
   { name: "defigent_network_list", description: "List ERC-8004 agents registered on Monad from the Defigent network directory (49+ mapped, the discovery hub).", inputSchema: { type: "object", properties: { limit: { type: "number", description: "Max agents to return (default 20)" } } } },
   { name: "defigent_status", description: "Live Defigent storefront status: uptime, RPC latency, head block, inbox count. Free.", inputSchema: { type: "object", properties: {} } },
 ];
-app.get("/mcp", (_req, res) => {
-  res.json({ server: { name: "defigent", version: "1.4.0", description: "Defigent A2A inbox + network directory as stateless MCP server (spec 2026-07-28: Mcp-Method/Mcp-Name headers, no session state)" }, protocolVersion: "2026-07-28", transport: "stateless-http", tools: MCP_TOOLS, x402_note: "Paid x402 services (GET /digest) remain on the HTTP storefront; MCP surface exposes the free messaging/discovery tools." });
-});
-app.post("/mcp", async (req, res) => {
-  const method = String(req.headers["mcp-method"] || "");
-  const body = req.body || {};
-  if (!method) return res.status(400).json({ error: "Mcp-Method header required (server/discover, tools/list, tools/call)" });
-  if (method === "server/discover") {
-    return res.json({ protocolVersion: "2026-07-28", server: { name: "defigent", version: "1.4.0" }, capabilities: { tools: {} }, tools: MCP_TOOLS });
-  }
-  if (method === "tools/list") return res.json({ tools: MCP_TOOLS });
-  if (method === "tools/call") {
-    const name = body?.name || body?.params?.name;
-    const args = body?.arguments || body?.params?.arguments || {};
-    try {
-      if (name === "defigent_inbox_send") {
-        if (!args.text) return res.json({ isError: true, content: [{ type: "text", text: "Missing required arg: text" }] });
-        const msgId = `mcp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-        const payload = { jsonrpc: "2.0", id: 1, method: "message/send", params: { message: { role: "agent", sender: args.sender || "mcp-client", parts: [{ type: "text", text: String(args.text).slice(0, 4000) }], messageId: msgId, kind: "message", ...(args.contextId ? { contextId: String(args.contextId) } : {}) } } };
-        const r = await fetch(`http://127.0.0.1:${PORT}/inbox`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
-        const j = await r.json();
-        const result = j.result || j;
-        return res.json({ content: [{ type: "text", text: result?.parts?.[0]?.text || JSON.stringify(result).slice(0, 800) }], meta: { contextId: result?.contextId, task: result?.task, verified: result?.verified } });
-      }
-      if (name === "defigent_network_list") {
-        const db = loadNetwork();
-        const lim = Math.min(Number(args.limit) || 20, 100);
-        const agents = [...db.agents].sort((a, b) => (b.agentId || 0) - (a.agentId || 0)).slice(0, lim)
-          .map(a => ({ agentId: a.agentId, name: a.name || null, hasInbox: !!a.inbox, x402: !!a.x402 }));
-        return res.json({ content: [{ type: "text", text: JSON.stringify({ total: db.agents.length, agents }, null, 1) }] });
-      }
-      if (name === "defigent_status") {
-        const t0 = Date.now();
-        const b = await rpc("eth_blockNumber", []);
-        return res.json({ content: [{ type: "text", text: JSON.stringify({ uptime_s: Math.floor((Date.now() - START_TS) / 1000), rpc_latency_ms: Date.now() - t0, head_block: BigInt(b).toString(), inbox_messages: (function(){ try { return fs.readFileSync(INBOX_FILE, "utf8").split("\n").filter(Boolean).length; } catch { return 0; } })() }) }] });
-      }
-      return res.json({ isError: true, content: [{ type: "text", text: `Unknown tool: ${name}. Available: ${MCP_TOOLS.map(t => t.name).join(", ")}` }] });
-    } catch (err) {
-      return res.json({ isError: true, content: [{ type: "text", text: "Tool error: " + String(err).slice(0, 200) }] });
+
+// MCP tool dispatch (shared by header routing and standard body-method routing)
+async function mcpToolCall(name, args) {
+  if (name === "defigent_hash") {
+    const { algorithm, text } = args || {};
+    if (!["sha256", "keccak256"].includes(algorithm) || typeof text !== "string") {
+      return { isError: true, content: [{ type: "text", text: "Missing/invalid args: algorithm (sha256|keccak256) + text" }] };
     }
+    let digest;
+    if (algorithm === "sha256") digest = crypto.createHash("sha256").update(text, "utf8").digest("hex");
+    else digest = keccak256(toHex(text)).slice(2); // viem returns 0x-prefixed
+    return { content: [{ type: "text", text: digest }] };
   }
-  return res.status(400).json({ error: `Unsupported Mcp-Method: ${method}` });
+  if (name === "defigent_inbox_send") {
+    if (!args?.text) return { isError: true, content: [{ type: "text", text: "Missing required arg: text" }] };
+    const msgId = `mcp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const payload = { jsonrpc: "2.0", id: 1, method: "message/send", params: { message: { role: "agent", sender: args.sender || "mcp-client", parts: [{ type: "text", text: String(args.text).slice(0, 4000) }], messageId: msgId, kind: "message", ...(args.contextId ? { contextId: String(args.contextId) } : {}) } } };
+    const r = await fetch(`http://127.0.0.1:${PORT}/inbox`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+    const j = await r.json();
+    const result = j.result || j;
+    return { content: [{ type: "text", text: result?.parts?.[0]?.text || JSON.stringify(result).slice(0, 800) }], meta: { contextId: result?.contextId, task: result?.task, verified: result?.verified } };
+  }
+  if (name === "defigent_network_list") {
+    const db = loadNetwork();
+    const lim = Math.min(Number(args?.limit) || 20, 100);
+    const agents = [...db.agents].sort((a, b) => (b.agentId || 0) - (a.agentId || 0)).slice(0, lim)
+      .map(a => ({ agentId: a.agentId, name: a.name || null, hasInbox: !!a.inbox, x402: !!a.x402 }));
+    return { content: [{ type: "text", text: JSON.stringify({ total: db.agents.length, agents }, null, 1) }] };
+  }
+  if (name === "defigent_status") {
+    const t0 = Date.now();
+    const b = await rpc("eth_blockNumber", []);
+    return { content: [{ type: "text", text: JSON.stringify({ uptime_s: Math.floor((Date.now() - START_TS) / 1000), rpc_latency_ms: Date.now() - t0, head_block: BigInt(b).toString(), inbox_messages: (function(){ try { return fs.readFileSync(INBOX_FILE, "utf8").split("\n").filter(Boolean).length; } catch { return 0; } })() }) }] };
+  }
+  return { isError: true, content: [{ type: "text", text: `Unknown tool: ${name}. Available: ${MCP_TOOLS.map(t => t.name).join(", ")}` }] };
+}
+
+app.get("/mcp", (_req, res) => {
+  res.json({ server: { name: "defigent", version: "1.4.0", description: "Defigent A2A inbox + network directory as stateless MCP server (spec 2026-07-28: header routing + standard JSON-RPC body methods)" }, protocolVersion: "2026-07-28", transport: "streamable-http", tools: MCP_TOOLS, x402_note: "Paid x402 services (GET /digest) remain on the HTTP storefront; MCP surface exposes the free messaging/discovery/hash tools." });
+});
+
+// standard MCP JSON-RPC body methods (initialize/tools/list/tools/call/ping) — registry-compatible
+app.post("/mcp", async (req, res) => {
+  const body = req.body || {};
+  const headerMethod = String(req.headers["mcp-method"] || "");
+  const rpcId = body?.id ?? null;
+  const bodyMethod = typeof body?.method === "string" ? body.method : null;
+
+  // header routing (2026-07-28 header-based, back-compat)
+  if (headerMethod && !bodyMethod) {
+    if (headerMethod === "server/discover") return res.json({ protocolVersion: "2026-07-28", server: { name: "defigent", version: "1.4.0" }, capabilities: { tools: {} }, tools: MCP_TOOLS });
+    if (headerMethod === "tools/list") return res.json({ tools: MCP_TOOLS });
+    if (headerMethod === "tools/call") {
+      const out = await mcpToolCall(body?.name || body?.params?.name, body?.arguments || body?.params?.arguments || {});
+      return res.json(out);
+    }
+    return res.status(400).json({ error: `Unsupported Mcp-Method: ${headerMethod}` });
+  }
+
+  // standard JSON-RPC routing
+  if (bodyMethod === "initialize") {
+    return res.json({ jsonrpc: "2.0", id: rpcId, result: {
+      protocolVersion: "2026-07-28",
+      capabilities: { tools: { listChanged: false } },
+      serverInfo: { name: "defigent", version: "1.4.0", title: "Defigent — Monad A2A inbox + x402" },
+    }});
+  }
+  if (bodyMethod === "notifications/initialized" || bodyMethod === "notifications/initialized/") {
+    return res.status(202).end();
+  }
+  if (bodyMethod === "ping") return res.json({ jsonrpc: "2.0", id: rpcId, result: {} });
+  if (bodyMethod === "tools/list") return res.json({ jsonrpc: "2.0", id: rpcId, result: { tools: MCP_TOOLS } });
+  if (bodyMethod === "tools/call") {
+    const p = body?.params || {};
+    const out = await mcpToolCall(p.name, p.arguments || {});
+    return res.json({ jsonrpc: "2.0", id: rpcId, result: out });
+  }
+  if (bodyMethod) {
+    return res.json({ jsonrpc: "2.0", id: rpcId, error: { code: -32601, message: "MethodNotFound", data: { method: bodyMethod } } });
+  }
+  return res.status(400).json({ error: "Send Mcp-Method header or a JSON-RPC body (initialize/tools/list/tools/call)" });
 });
 
 // ---------- On-chain webhook (QuickNode Streams → detección <2s) ----------
@@ -861,6 +948,15 @@ app.post("/tasks/cancel", (req, res) => {
 });
 
 // ---------- Status heartbeat ----------
+const RPC_BASE_URL = process.env.RPC_BASE_URL || "https://base.drpc.org";
+async function baseHead() {
+  try {
+    const t = Date.now();
+    const r = await fetch(RPC_BASE_URL, { method: "POST", headers: { "Content-Type": "application/json", "User-Agent": "defigent/1.4" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_blockNumber", params: [] }) });
+    const j = await r.json();
+    return { latency_ms: Date.now() - t, head: j.result ? BigInt(j.result).toString() : null };
+  } catch { return { latency_ms: null, head: null }; }
+}
 app.get("/status", async (_req, res) => {
   const t0 = Date.now();
   let rpcMs = null, block = null;
@@ -869,20 +965,45 @@ app.get("/status", async (_req, res) => {
     rpcMs = Date.now() - t0;
     block = BigInt(b).toString();
   } catch {}
+  const base = await baseHead();
   res.json({
     service: "Defigent storefront",
     uptime_s: Math.floor((Date.now() - START_TS) / 1000),
     rpc_latency_ms: rpcMs,
     head_block: block,
+    chains: {
+      monad: { chainId: 143, head_block: block, rpc_latency_ms: rpcMs, registration: { agentId: 10331, registry: "0x8004A169FB4a3325136EB29fA0ceB6D2e539a432" } },
+      base: { chainId: 8453, head_block: base.head, rpc_latency_ms: base.latency_ms, registration: { agentId: 114426, registry: "0x8004A169FB4a3325136EB29fA0ceB6D2e539a432" } },
+    },
     inbox_messages: (function(){ try { return fs.readFileSync(INBOX_FILE, "utf8").split("\n").filter(Boolean).length; } catch { return 0; } })(),
     endpoints: ["/info", "/digest (x402 $0.001)", "/status", "/inbox (A2A 0.3.0+1.0.1, signed+tasks+SSE)", "/tasks/:contextId", "/tasks/cancel", "/mcp (MCP 2026-07-28 stateless)", "/network", "/integration", "/webhooks/onchain", "/.well-known/agent-card.json"],
     registration: { agentId: 10331, registry: "eip155:143:0x8004A169FB4a3325136EB29fA0ceB6D2e539a432" },
+    registrationBase: { agentId: 114426, registry: "eip155:8453:0x8004A169FB4a3325136EB29fA0ceB6D2e539a432" },
   });
 });
 
 // ---------- Network directory ----------
+// Source of truth is the on-chain ERC-8004 registry: this server rebuilds the directory itself (startup, every 2h,
+// /network/refresh) into data/network.json, with a committed snapshot as last resort. The lead-monitor cache only
+// enriches it (welcomeTx, status), so a missing or corrupt cache file can no longer empty /network.
+import { fileURLToPath } from "url";
+import { readDirectory, resolveDirectory, rebuildDirectory } from "./network_directory.mjs";
 const NETWORK_FILE = "/home/ubuntu/.hermes/cache/scratch/defigent_network.json";
-function loadNetwork() { try { return JSON.parse(fs.readFileSync(NETWORK_FILE, "utf8")); } catch { return { updated: 0, agents: [] }; } }
+const NETWORK_LOCAL = fileURLToPath(new URL("./data/network.json", import.meta.url));     // runtime rebuild (gitignored)
+const NETWORK_SEED = fileURLToPath(new URL("./data/network.seed.json", import.meta.url)); // committed snapshot
+const NETWORK_REBUILD_MS = 2 * 60 * 60 * 1000;
+function loadNetwork() { return resolveDirectory({ monitor: readDirectory(NETWORK_FILE), local: readDirectory(NETWORK_LOCAL), seed: readDirectory(NETWORK_SEED) }); }
+
+let networkRebuild = null, networkRebuildAt = 0, networkRefreshTimer = null;
+function rebuildNetwork() {
+  if (networkRebuild) return networkRebuild;
+  networkRebuildAt = Date.now();
+  networkRebuild = rebuildDirectory({ ethCall: (to, data) => rpc("eth_call", [{ to, data }, "latest"]), file: NETWORK_LOCAL, seedFile: NETWORK_SEED, selfId: 10331 })
+    .then(r => console.error(`[defigent-http] network directory rebuilt from the registry: ${r.agents} agents, ${r.fetched} registration files read${r.truncated ? " — scan cap reached, newest agents may be missing" : ""}`))
+    .catch(e => console.error(`[defigent-http] network rebuild failed, serving the last good directory: ${String(e?.message || e).slice(0, 200)}`))
+    .finally(() => { networkRebuild = null; });
+  return networkRebuild;
+}
 
 app.get("/network", async (_req, res) => {
   const db = loadNetwork();
@@ -906,8 +1027,11 @@ app.get("/network", async (_req, res) => {
 });
 
 app.get("/network/refresh", async (_req, res) => {
-  // Rebuilds the directory from the ERC-8004 registry (open — anyone can trigger; cheap RPC reads)
-  res.json({ queued: true, hint: "directory rebuild runs async via lead-monitor pipeline" });
+  // Rebuilds the directory from the ERC-8004 registry (open — anyone can trigger; at most one scan per 10 min:
+  // a request inside that window is queued for when it closes, so `queued` stays true as before)
+  const wait = Math.max(0, networkRebuildAt + 10 * 60 * 1000 - Date.now());
+  if (!networkRefreshTimer) networkRefreshTimer = setTimeout(() => { networkRefreshTimer = null; rebuildNetwork(); }, wait);
+  res.json({ queued: true, hint: wait ? `directory rebuild from the ERC-8004 registry queued, runs in ~${Math.ceil(wait / 60000)} min (one scan per 10 min)` : "directory rebuild from the ERC-8004 registry started" });
 });
 
 // ---------- Integration guide (adoption) ----------
@@ -1005,4 +1129,6 @@ app.use((err, _req, res, _next) => {
 
 app.listen(PORT, "0.0.0.0", () => {
   console.error(`[defigent-http] listening :${PORT} — /info free, /digest $0.001 x402 (${NETWORK})`);
+  rebuildNetwork();
+  setInterval(rebuildNetwork, NETWORK_REBUILD_MS);
 });

@@ -3,8 +3,8 @@
 // RUN:   node --test a2a_inbox.test.mjs
 //        (needs Node >= 22: better-sqlite3@13 declares engines.node ">=22" and segfaults on Node 20, e.g.
 //         PATH="$HOME/.nvm/versions/node/v22.17.0/bin:$PATH" node --test a2a_inbox.test.mjs)
-//        Prerequisites: `pnpm install`, and outbound network access to the x402 facilitator
-//        (http_server.mjs:32 awaits resourceServer.initialize() at start-up; the suite fails fast with a message if it is unreachable).
+//        Prerequisites: `pnpm install`, and outbound network access to the two x402 facilitators (Monad: molandak, Base: payai)
+//        (http_server.mjs awaits resourceServer.initialize() at start-up; the suite fails fast with a message if one is unreachable).
 //
 // WHAT IT IS: a regression net that describes what the server does TODAY, defects included. It starts the real server
 // (node http_server.mjs) as a child process per test group, with DEFIGENT_DATA_DIR pointing at a fresh temp directory and
@@ -16,7 +16,7 @@
 //  - `// NOTE(unreported): ...` marks a defect or surprise that is not in the gap report.
 //  - Nothing here talks to a production host and nothing pays: /digest is only asserted to answer 402 when unpaid.
 //    The card/replies contain the production base URL as TEXT (http_server.mjs:81); it is compared as a string, never fetched.
-//    RPC_URL is pointed at a closed local port (or a local stub in the trust group) so no Monad RPC call can leave this machine.
+//    RPC_URL and RPC_BASE_URL are pointed at a closed local port (or a local stub in the trust group) so no Monad or Base RPC call can leave this machine.
 //
 // OPERATOR OUTBOX: the operator agent answers queued messages by appending JSON lines to ${DATA_DIR}/defigent_outbox.jsonl; the
 // server ingests them on a 2 s timer. Those tests append to the file and poll the task (Harness.waitFor) instead of sleeping blindly.
@@ -97,15 +97,15 @@ function freePort() {
 }
 
 class Harness {
-  static async start({ rpcUrl = DEAD_RPC, budget = 10, env: extraEnv = {} } = {}) {
+  static async start({ rpcUrl = DEAD_RPC, baseRpcUrl = DEAD_RPC, budget = 10, env: extraEnv = {} } = {}) {
     const dir = mkdtempSync(join(tmpdir(), "defigent-a2a-test-"));
     const port = await freePort();
-    const env = { ...process.env, DEFIGENT_DATA_DIR: dir, PORT: String(port), RPC_URL: rpcUrl };
+    const env = { ...process.env, DEFIGENT_DATA_DIR: dir, PORT: String(port), RPC_URL: rpcUrl, RPC_BASE_URL: baseRpcUrl };
     delete env.WEBHOOK_SECRET; // make the webhook HMAC path deterministic (a test may set its own below)
     Object.assign(env, extraEnv);
     const h = new Harness({ dir, port, env, budget });
     LIVE.add(h);
-    // the x402 facilitator is occasionally unreachable for a moment and would cancel a whole group: retry the start up to 2 more times
+    // an x402 facilitator is occasionally unreachable for a moment and would cancel a whole group: retry the start up to 2 more times
     for (let attempt = 0; ; attempt++) {
       try { await h.spawnServer(); return h; } catch (e) {
         await h.killChild();
@@ -152,7 +152,7 @@ class Harness {
       if (this.exit) {
         const { code, signal } = this.exit;
         let hint = "";
-        if (/no supported payment kinds|Failed to fetch supported kinds/.test(this.log)) hint = "\nThe x402 facilitator (https://x402-facilitator.molandak.org) is unreachable from this machine. http_server.mjs:32 awaits resourceServer.initialize() at start-up, so the server cannot start offline. Re-run with network access.";
+        if (/no supported payment kinds|Failed to fetch supported kinds/.test(this.log)) hint = "\nAn x402 facilitator (https://x402-facilitator.molandak.org for Monad, https://facilitator.payai.network for Base) is unreachable from this machine. http_server.mjs awaits resourceServer.initialize() at start-up, so the server cannot start offline. Re-run with network access.";
         else if (signal === "SIGSEGV" || code === 139) hint = `\nSIGSEGV on start-up: better-sqlite3@13 needs Node >= 22 (running ${process.versions.node}).`;
         throw new Error(`http_server.mjs exited during start-up (code ${code}, signal ${signal}).${hint}\n--- server output ---\n${this.log}`);
       }
@@ -161,7 +161,7 @@ class Harness {
         if (r.ok) return;
       } catch {}
       if (Date.now() - t0 > timeoutMs) {
-        throw new Error(`http_server.mjs did not answer GET /.well-known/agent-card.json within ${timeoutMs} ms. It may be stuck contacting the x402 facilitator (http_server.mjs:32); check network access.\n--- server output ---\n${this.log}`);
+        throw new Error(`http_server.mjs did not answer GET /.well-known/agent-card.json within ${timeoutMs} ms. It may be stuck contacting an x402 facilitator (resourceServer.initialize()); check network access.\n--- server output ---\n${this.log}`);
       }
       await sleep(100);
     }
@@ -307,7 +307,7 @@ describe("probes: the nine production probes replayed locally", { timeout: 12000
     assert.match(r.headers["etag"], /^W\/"/);
     // GAP(G12): ETag only; no Cache-Control on the card
     assert.equal(r.headers["cache-control"], undefined);
-    assert.deepEqual(Object.keys(r.json), ["name", "description", "url", "version", "protocolVersion", "supportedInterfaces", "address", "agentWallet", "capabilities", "securitySchemes", "extensions", "documentationUrl", "defaultInputModes", "defaultOutputModes", "skills", "provider", "registration"]);
+    assert.deepEqual(Object.keys(r.json), ["name", "description", "url", "version", "protocolVersion", "supportedInterfaces", "address", "agentWallet", "capabilities", "securitySchemes", "extensions", "documentationUrl", "defaultInputModes", "defaultOutputModes", "skills", "provider", "registration", "registrations"]);
     assert.equal(r.json.name, "Defigent");
     assert.equal(r.json.version, "1.4.0");
     // GAP(G10): the card advertises a hard-coded tunnel hostname (HTTPS) plus the production IP over plain HTTP, also for a local instance
@@ -328,8 +328,13 @@ describe("probes: the nine production probes replayed locally", { timeout: 12000
     assert.deepEqual(r.json.securitySchemes, {});
     assert.deepEqual(r.json.extensions.map((e) => e.uri), ["defigent:identity-eip712@v1"]);
     assert.equal(r.json.capabilities.extensions, undefined);
-    assert.deepEqual(r.json.skills.map((s) => s.id), ["digest", "agent-lookup", "status"]);
+    // origin/main: the ERC-8183 escrow is a skill ("jobs") and the agent is also registered on Base (ERC-8004 agentId 114426)
+    assert.deepEqual(r.json.skills.map((s) => s.id), ["digest", "jobs", "agent-lookup", "status"]);
     assert.deepEqual(r.json.registration, { agentId: 10331, registry: "eip155:143:0x8004A169FB4a3325136EB29fA0ceB6D2e539a432" });
+    assert.deepEqual(r.json.registrations, [
+      { agentId: 10331, registry: "eip155:143:0x8004A169FB4a3325136EB29fA0ceB6D2e539a432" },
+      { agentId: 114426, registry: "eip155:8453:0x8004A169FB4a3325136EB29fA0ceB6D2e539a432" },
+    ]);
   });
 
   it("probe 1: v1.0 SendMessage (A2A-Version: 1.0, ROLE_USER, keyless part)", async () => {
@@ -1242,12 +1247,16 @@ describe("trust enrichment for signed senders that name an agentId (stub RPC)", 
     rpcServer = http.createServer((req, res) => {
       let body = ""; req.on("data", (d) => { body += d; });
       req.on("end", () => {
-        const j = JSON.parse(body); calls.push(j);
+        const j = JSON.parse(body);
+        // The server's own network-directory scan (tokenURI, at start-up) is not part of the trust flow:
+        // it always gets "no such agent" and is not counted, so these tests only see trust-related calls.
+        const scan = j.method === "eth_call" && String(j.params?.[0]?.data || "").startsWith("0xc87b56dd");
+        if (!scan) calls.push(j);
         let out;
         if (j.method === "eth_blockNumber") out = { result: "0x10" };
         else if (j.method === "eth_call") {
           const { to, data } = j.params[0]; const sel = data.slice(2, 10);
-          if (mode === "revert") out = { error: { code: 3, message: "execution reverted" } };
+          if (mode === "revert" || scan) out = { error: { code: 3, message: "execution reverted" } };
           else if (to.toLowerCase() === IDENTITY_REG.toLowerCase() && sel === "6352211e") out = { result: mode === "owner" ? pad(acct.address) : pad("0x" + "0".repeat(40)) };
           else if (to.toLowerCase() === IDENTITY_REG.toLowerCase() && sel === "00339509") out = { result: pad(acct.address) };
           else out = { result: "0x" }; // reputation registry: no feedback
@@ -1258,7 +1267,7 @@ describe("trust enrichment for signed senders that name an agentId (stub RPC)", 
     });
     await new Promise((r) => rpcServer.listen(0, "127.0.0.1", r));
     stub = `http://127.0.0.1:${rpcServer.address().port}`;
-    h = await Harness.start({ rpcUrl: stub });
+    h = await Harness.start({ rpcUrl: stub, baseRpcUrl: stub });
   });
   after(async () => { await h?.stop(); await new Promise((r) => rpcServer ? rpcServer.close(r) : r()); });
 
@@ -1313,10 +1322,18 @@ describe("trust enrichment for signed senders that name an agentId (stub RPC)", 
   it("GET /status reports the head block from the RPC and counts inbox log lines", async () => {
     const r = await h.get("/status");
     assert.equal(r.status, 200);
-    assert.deepEqual(Object.keys(r.json), ["service", "uptime_s", "rpc_latency_ms", "head_block", "inbox_messages", "endpoints", "registration"]);
+    assert.deepEqual(Object.keys(r.json), ["service", "uptime_s", "rpc_latency_ms", "head_block", "chains", "inbox_messages", "endpoints", "registration", "registrationBase"]);
     assert.equal(r.json.head_block, "16");
     assert.equal(typeof r.json.rpc_latency_ms, "number");
     assert.equal(r.json.inbox_messages, 5);
+    // origin/main: dual-chain status. The top-level fields stay Monad's; `chains` adds Base (here the same stub answers both RPCs)
+    assert.deepEqual(Object.keys(r.json.chains), ["monad", "base"]);
+    assert.equal(r.json.chains.monad.chainId, 143);
+    assert.equal(r.json.chains.monad.head_block, "16");
+    assert.equal(r.json.chains.base.chainId, 8453);
+    assert.equal(r.json.chains.base.head_block, "16");
+    assert.equal(typeof r.json.chains.base.rpc_latency_ms, "number");
+    assert.deepEqual(r.json.registrationBase, { agentId: 114426, registry: "eip155:8453:0x8004A169FB4a3325136EB29fA0ceB6D2e539a432" });
   });
 });
 

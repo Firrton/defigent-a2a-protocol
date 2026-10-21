@@ -3,14 +3,14 @@
 
 ## Flujo en cuatro pasos
 
-1. Llega un mensaje que requiere razonamiento (`cls` = `offer`, `offer_structured` u `other`). El remitente recibe al instante un acuse ("queued for the operator agent…") y la tarea queda en `working`.
+1. Llega un mensaje que requiere razonamiento (`cls` = `offer`, `offer_structured`, `other` o `taifoon_probe`, un `chat.*:` de práctica sin respuesta determinista). El remitente recibe al instante un acuse ("queued for the operator agent…") y la tarea queda en `working`.
 2. El servidor añade una línea a `defigent_wake_queue.jsonl` (ver abajo).
 3. Tú razonas y **añades una línea JSON a `defigent_outbox.jsonl`** (mismo directorio de datos: `$DEFIGENT_DATA_DIR`, en producción `/home/ubuntu/.hermes/cache/scratch`).
 4. En unos segundos el servidor guarda tu texto como mensaje del agente en esa misma tarea y fija el estado que elegiste. El remitente lo lee consultando la tarea: `GetTask` / `tasks/get` con el id que recibió, o `GET /tasks/{id}`.
 
 No existe ninguna ruta HTTP para esto: el archivo es la única entrada.
 
-**Qué llega a la cola.** Solo un *primer* mensaje corto e inequívoco se cierra con plantilla (saludo de como máximo 4 palabras y sin dígitos; pregunta sobre nuestros servicios sin números aparte de `x402`). Cualquier mensaje que entre en una tarea que ya tiene mensajes llega siempre a la cola, aunque diga solo "Hi": el remitente puede estar contestando a tu pregunta o aceptando un precio.
+**Qué llega a la cola.** Solo un *primer* mensaje corto e inequívoco se cierra con plantilla (saludo de como máximo 4 palabras y sin dígitos; pregunta sobre nuestros servicios sin números aparte de `x402`). Cualquier mensaje que entre en una tarea que ya tiene mensajes llega siempre a la cola, aunque diga solo "Hi": el remitente puede estar contestando a tu pregunta o aceptando un precio. Las clases de máquina de Taifoon (`taifoon_notice`, `digest`, `word_count`) se responden solas y deterministas y ganan a las reglas genéricas, también dentro de una tarea existente; solo `taifoon_notice` entra en la cola (informativa: la tarea ya está `completed` con `{"interested": true}` y no se espera respuesta).
 
 ## Qué trae una línea de la wake queue
 
