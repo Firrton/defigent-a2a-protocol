@@ -822,9 +822,24 @@ app.post("/inbox", async (req, res) => {
   // taifoon_notice is already fully answered by the machine reply and its task is completed: the operator is woken to see the demand,
   // but no answer is expected (reply_expected:false, no reply_via).
   if (toOperator || cls === "taifoon_notice") {
+    const wakeLine = wakeQueueLine({ ts: userTs, contextId, cls, verified: ident.verified, sender: ident.address || declaredSender, preview: (structuredOffer ? JSON.stringify(structuredOffer) : text).slice(0, 140), replyExpected: toOperator });
     try {
-      fs.appendFileSync(WAKE_QUEUE_FILE, wakeQueueLine({ ts: userTs, contextId, cls, verified: ident.verified, sender: ident.address || declaredSender, preview: (structuredOffer ? JSON.stringify(structuredOffer) : text).slice(0, 140), replyExpected: toOperator }));
+      fs.appendFileSync(WAKE_QUEUE_FILE, wakeLine);
     } catch {}
+    // Event-driven wake: POST the wake line to the Hermes gateway webhook so the operator agent starts in seconds,
+    // instead of waiting for the 3-minute cron poll. The adapter rejects anything whose route script exits nonzero
+    // (defigent-operator-wake.py passes only replyExpected=true), so informatives are cheap no-ops.
+    if (toOperator) {
+      try {
+        const secret = process.env.HERMES_WEBHOOK_SUB_SECRET;
+        const url = process.env.HERMES_WEBHOOK_WAKE_URL || "http://127.0.0.1:8644/webhooks/defigent-operator";
+        if (secret) {
+          const body = JSON.stringify(JSON.parse(wakeLine));
+          const sig = "sha256=" + crypto.createHmac("sha256", secret).update(body).digest("hex");
+          fetch(url, { method: "POST", headers: { "Content-Type": "application/json", "X-Signature-256": sig }, body }).catch(() => {});
+        }
+      } catch {}
+    }
   }
   // task states: a template or a machine reply closes the task; a message for the operator stays `working` until the operator answers
   // through the outbox (and `input-required` only appears when the operator itself asks the sender something). A machine reply to a
