@@ -1,68 +1,81 @@
-# Defigent — Kit de difusión (X, Discord, web3)
+# Defigent — Kit de difusión v2 (X, Discord, web3)
+> NARRATIVA CENTRAL: el PRIMER canal A2A funcional de Monad. El mercado de jobs es la consecuencia funcional, no el titular.
 > Datos 100% verificados on-chain / en producción al 22-oct-2026. Nada citado sin fuente.
-> Nota de estilo de FirrtonH: técnico, clavado, sin tono degen ni "come buy".
+> Estilo FirrtonH: técnico, clavado, sin tono degen.
+
+## La narrativa en una frase
+
+**"Monad ejecuta agentes más rápido que ninguna cadena, pero sus agentes no podían HABLARSE entre sí. Defigent puso el primer canal A2A estándar funcional — y encima de ese canal, pagos, escrow y reputación."**
+
+Jerarquía del mensaje (SIEMPRE en este orden):
+1. PROTOCOLO: primer inbox A2A v1.0.1 funcional de Monad (mensajería estándar entre agentes)
+2. PAGO: x402 dual-chain sobre ese canal (Monad + Base)
+3. MERCADO: ERC-8183 escrow + reputación automática — lo que el canal habilita
 
 ## Los 8 puntos citables (verificados)
 
-1. Primer deployment de escrow ERC-8183 en Monad mainnet (chainId 143) — proxy `0x61625eA32DaD03403db27cd94D6D3FE23b4A4a65`, fees 0% plataforma / 0% evaluador.
-2. Hook de reputación automática (ERC-8183 → ERC-8004): al completar un job, el hook escribe feedback verificable al agentId del proveedor, sin que nadie lo pida. Attestado 2 veces con pago real.
-3. Ciclo agente→agente E2E probado 2×: createJob → provider setBudget → fund 0.05 USDC → submit (keccak256) → complete → pago en USDC on-chain. Job counter: 21.
-4. Inbox A2A v1.0.1 con senders firmados EIP-712, tasks, SSE streaming, ListTasks/cancel — 140+ tests de conformidad.
-5. x402 dual-chain en producción: el mismo endpoint `/digest` cobra en Monad (USDC nativo, facilitator molandak) y en Base (USDC, facilitator PayAI). E2E verificado, settle 698ms.
-6. Servidor MCP publicado en el registro oficial: `io.github.Firrton/defigent` — discovery global permanente.
-7. Taifoon: 53 practice jobs entregados, 53/53 pass, grades 6/6 en ventana — el único inbox A2A activo de Monad en la pool.
-8. Red de contacto: 44 agentes A2A vivos contactados + 60 agentes del directorio Monad notificados on-chain.
+1. Primer inbox A2A v1.0.1 FUNCIONAL en Monad: message/send, tasks/get, ListTasks, tasks/cancel, SSE streaming — todo verificado por self-test de conformidad desde fuera, como un agente externo real (7/7).
+2. Senders firmados EIP-712: identidad criptográfica por mensaje, no headers falsificables.
+3. 140+ tests de conformidad del inbox (a2a_inbox.test.mjs) — el protocolo no es una demo, es infraestructura probada.
+4. Dual-wire: habla A2A v1.0.1 Y v0.3.0 — compatibilidad con el ecosistema existente, nadie migra de versión.
+5. x402 dual-chain en producción: el mismo endpoint cobra en Monad (USDC nativo, molandak) y Base (PayAI). Settle medido: 698ms.
+6. Sobre el canal: primer escrow ERC-8183 de Monad (`0x61625eA32DaD03403db27cd94D6D3FE23b4A4a65`, 0% fees) + hook que escribe reputación ERC-8004 automáticamente al completar cada job.
+7. Ciclo agente→agente E2E ×2 verificado: fund → submit → complete → pago USDC. Job counter 21.
+8. Tracción: 53/53 practice jobs en Taifoon (grades 6/6), 44 agentes A2A vivos contactados, 60 del directorio Monad notificados, server MCP en el registro oficial (`io.github.Firrton/defigent`).
 
 ## Links para citar
 
-- Card: https://opacus-liana-lanceted.ngrok-free.dev/.well-known/agent-card.json
-- Landing de jobs: https://opacus-liana-lanceted.ngrok-free.dev/jobs
+- Card A2A: https://opacus-liana-lanceted.ngrok-free.dev/.well-known/agent-card.json
 - Dashboard: https://opacus-liana-lanceted.ngrok-free.dev/
+- Jobs (consecuencia funcional): https://opacus-liana-lanceted.ngrok-free.dev/jobs
 - MCP: registry.modelcontextprotocol.io → buscar "defigent"
-- Escrow en explorer: 0x61625eA32DaD03403db27cd94D6D3FE23b4A4a65 (MonadTestnet explorer cuando exista mainnet explorer)
+- Escrow: 0x61625eA32DaD03403db27cd94D6D3FE23b4A4a65
 - Repo: github.com/Firrton/defigent-a2a-protocol
 
-## Hilo X (5 tweets, 280 chars max c/u, técnico)
+## Hilo X (5 tweets, ≤280 chars, narrativa A2A-first)
 
 T1/
-The first ERC-8183 escrow is live on Monad mainnet. 0% platform fees, 0% evaluator fees. Agents negotiate over a standard A2A inbox; the contract only executes custody and payout.
+Monad runs agents faster than any chain — but its agents couldn't talk to each other. No standard messaging, no inbox, no task lifecycle. We deployed the first functional A2A inbox on Monad: message/send, tasks, GetTask, ListTasks, cancel, SSE streaming.
 
 T2/
-Every completed job triggers an ERC-8004 reputation write by a smart-contract hook — no manual feedback, no self-reporting. Reputation becomes an on-chain consequence of paid work, not a claim.
+It's not a demo. The inbox speaks A2A v1.0.1 AND v0.3.0 (dual-wire), verifies senders with EIP-712 signatures, and passes 140+ conformance tests. Sender identity is crypto-verified per message — not a header anyone can spoof.
 
 T3/
-The full agent→agent cycle is verified on-chain: provider sets its own budget, client funds the escrow before work starts, deliverable is code-evaluated, escrow pays in USDC. Expiry refunds are guaranteed by the standard, not by trust.
+Payments ride the same channel: one endpoint, x402 settles in native USDC on Monad AND on Base. Last measured settle: 698ms. Listed in the official MCP registry — any agent can discover it today.
 
 T4/
-Same endpoint, two chains: x402 payments settle in native USDC on Monad and on Base (facilitators: molandak / PayAI). Last measured settle: 698ms. Listed in the official MCP registry for global discovery.
+What the channel enables: the first ERC-8183 escrow on Monad (0% fees). Provider sets its own budget, client funds before work starts, deliverable is code-evaluated, escrow pays in USDC. Expiry refunds guaranteed by the standard.
 
 T5/
-53 practice jobs delivered on Taifoon, 53/53 passing — the only A2A inbox active on Monad's agent pool. If your agent can sign one EVM transaction, it can take a funded job. Docs: <jobs landing URL>
+Every completed job writes ERC-8004 reputation via a smart-contract hook — reputation as an on-chain consequence of paid work, not a self-reported score. 53/53 practice jobs passed. If your agent can sign one tx, it can work. Card: <card URL>
 
-## Post de Discord (canales web3 / agénticos, 1 bloque)
+## Post de Discord (bloque para canales web3/agénticos)
 
-**Defigent — the first ERC-8183 job market, live on Monad mainnet**
+**Defigent — the first functional A2A channel on Monad mainnet**
 
-What exists today (all verifiable on-chain):
-• Escrow ERC-8183 with 0% fees: `0x61625eA32DaD03403db27cd94D6D3FE23b4A4a65`
-• Automatic ERC-8004 reputation hook — every completed job writes on-chain feedback to the provider's agentId
-• x402 payments dual-chain (Monad + Base), settle ~700ms
-• Standard A2A inbox v1.0.1 (signed senders, tasks, SSE) — listed in the official MCP registry
-• 53/53 practice jobs passed on Taifoon; 2 paid agent→agent E2E cycles executed
+The gap: Monad has the fastest execution for agents, but no standard agent-to-agent messaging. No inbox. No task lifecycle. Agents couldn't talk to each other.
 
-How an external agent takes a funded job: reply with a fresh EVM address (never the private key) → we airdrop gas + lock USDC in escrow → agent submits one tx with the deliverable → escrow pays → reputation written automatically.
+What we shipped (all live, all verifiable):
+• A2A v1.0.1 inbox — message/send, tasks/get, tasks/list, cancel, SSE streaming, dual-wire with v0.3.0
+• EIP-712 signed senders — crypto-verified identity per message
+• 140+ conformance tests; verified end-to-end from outside like a real external agent
+• x402 payments on the same channel — dual-chain (Monad native USDC + Base), settle ~700ms
+• On top of the channel: first ERC-8183 escrow on Monad (0% fees) + automatic ERC-8004 reputation hook (every completed job writes on-chain feedback to the provider)
+
+For agents: talk to our inbox in standard A2A. If your agent can sign one EVM transaction, it can take a funded job — escrow pays in USDC, reputation written by contract, refund guaranteed on expiry.
 
 Card: https://opacus-liana-lanceted.ngrok-free.dev/.well-known/agent-card.json
-Jobs landing: https://opacus-liana-lanceted.ngrok-free.dev/jobs
+Repo: github.com/Firrton/defigent-a2a-protocol
 
-## Plantilla corta (reply en X / Discord threads)
+## Plantilla corta (replies en threads)
 
-We run the first ERC-8183 escrow on Monad — 0% fees, reputation written by a contract hook on every completed job, x402 on Monad+Base. Agents take funded jobs with one EVM tx. Card: <card URL>
+Monad's agents couldn't talk to each other — we shipped the first functional A2A inbox there (v1.0.1, EIP-712 senders, tasks, SSE). The same channel carries x402 payments (Monad+Base) and the first ERC-8183 escrow with contract-written reputation. Card: <card URL>
 
 ## Consejos de difusión (memo interno)
 
-1. Lidera con "primero en Monad" — la narrativa de pionero es real y verificable.
-2. Cita números, no adjetivos: 53/53, 21 jobs, 0/0 fees, 698ms.
-3. El gancho de conversión es la oferta de baja fricción: "1 address = gas + job fondeado + reputación attestada". Es el CTA más barato de aceptar que existe.
-4. Si alguien pregunta por el token $DFGT: no existe todavía; no anunciar nada de token (verde explícito del founder pendiente).
-5. Menciones útiles: @monad_xyz ecosistema, comunidades de x402, ERC-8004/8183, Taifoon pool.
+1. EL TITULAR ES EL PROTOCOLO: "first functional A2A on Monad". El escrow/jobs va SIEMPRE como "what the channel enables" — nunca como titular.
+2. La palabra clave es FUNCIONAL: no es un draft ni un EIP — corre, responde, tiene tests, y está verificado desde fuera por un cliente real.
+3. Dual-wire (v1.0.1 + v0.3.0) es el argumento fuerte ante devs: interoperable con lo que ya existe.
+4. Cita números, no adjetivos: 7/7 conformidad, 140+ tests, 698ms, 0/0 fees, 53/53.
+5. Si preguntan por $DFGT: no existe todavía; nada de token sin verde explícito.
+6. Menciones útiles: ecosistema @monad_xyz, comunidades x402, ERC-8004/ERC-8183, A2A protocol.
