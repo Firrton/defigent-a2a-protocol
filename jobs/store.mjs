@@ -152,8 +152,9 @@ export function createJobsStore(db) {
       ORDER BY checked_at IS NOT NULL, checked_at, created_at, rowid LIMIT ?`),
     offersOpenForAgent: q(`SELECT COUNT(*) AS n FROM job_offers WHERE peer_agent_id=? AND state IN ('open','under_review')`),
 
-    actionInsert: q(`INSERT OR IGNORE INTO job_actions (action_key, action, payload_json, context_id, state, created_at, updated_at)
-      VALUES (?,?,?,?,'pending',?,?)`),
+    // ON CONFLICT (not OR IGNORE) so only a duplicate key is a no-op; NOT NULL/CHECK violations still throw.
+    actionInsert: q(`INSERT INTO job_actions (action_key, action, payload_json, context_id, state, created_at, updated_at)
+      VALUES (?,?,?,?,'pending',?,?) ON CONFLICT(action_key) DO NOTHING`),
     actionGet: q(`SELECT * FROM job_actions WHERE action_key=?`),
     actionsByState: q(`SELECT * FROM job_actions WHERE state=? ORDER BY created_at, rowid`),
     actionsUnwoken: q(`SELECT * FROM job_actions WHERE state='pending' AND woken_at IS NULL ORDER BY created_at, rowid LIMIT ?`),
@@ -161,8 +162,8 @@ export function createJobsStore(db) {
     actionsSince: q(`SELECT COUNT(*) AS n FROM job_actions WHERE action=? AND created_at > ?`),
     actionFinish: q(`UPDATE job_actions SET state=?, result_json=?, updated_at=? WHERE action_key=?`),
 
-    claimInsert: q(`INSERT OR IGNORE INTO job_claims (context_id, reply_id, name, body_json, state, created_at, updated_at)
-      VALUES (?,?,?,?,'pending',?,?)`),
+    claimInsert: q(`INSERT INTO job_claims (context_id, reply_id, name, body_json, state, created_at, updated_at)
+      VALUES (?,?,?,?,'pending',?,?) ON CONFLICT(context_id, reply_id) DO NOTHING`),
     claimsPending: q(`SELECT * FROM job_claims WHERE state='pending' ORDER BY id LIMIT ?`),
     claimResolve: q(`UPDATE job_claims SET state=?, reason=?, updated_at=? WHERE id=?`),
   };

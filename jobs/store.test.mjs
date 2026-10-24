@@ -126,6 +126,14 @@ test("enqueueAction dedupes by key and unwoken actions are listed until woken", 
   assert.equal(s.getAction("fund:42").wokenAt, 3);
 });
 
+test("constraint violations throw instead of looking like a dedupe", () => {
+  const s = fresh();
+  assert.throws(() => s.enqueueAction({ key: "fund:42", action: "fund", payload: {}, contextId: "c" }), /NOT NULL/);
+  assert.equal(s.getAction("fund:42"), null);
+  assert.throws(() => s.recordClaim({ replyId: "r1", name: "funded", body: {}, now: 1 }), /NOT NULL/);
+  assert.equal(s.pendingClaims(10).length, 0);
+});
+
 test("actions round-trip as ActionRow and finishAction moves them out of pending", () => {
   const s = fresh();
   s.enqueueAction({ key: "fund:42", action: "fund", payload: { jobId: "42", token: A, amount: "250000" }, contextId: "c", now: 1 });
