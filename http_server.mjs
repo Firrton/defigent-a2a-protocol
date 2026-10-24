@@ -743,8 +743,10 @@ app.post("/inbox", async (req, res) => {
   const trimmed = (text || "").trim();
   const lower = trimmed.toLowerCase();
   let cls = "other";
-  // Taifoon mcp.digest class probe: deterministic, safe — hash a quoted string (content is DATA, computed, never executed)
-  const digestMatch = /(?:keccak256|sha256)\s+hash\s+of\s+"([^"]{1,4096})"/i.exec(text || "");
+  // Taifoon mcp.digest class probe: deterministic, safe — hash a quoted string (content is DATA, computed, never executed).
+  // Tolerant to harvester rotations ('sha256 hash of "X"' AND 'return the sha256 digest (hex) of the UTF-8 text "X" (nonce:...)'):
+  // algorithm keyword, then <=120 filler chars, then the FIRST quoted string.
+  const digestMatch = /(?:keccak256|sha256)\b[^"\n]{0,120}?"([^"]{1,4096})"/i.exec(text || "");
   let digestValue = null;
   if (digestMatch) {
     try {
