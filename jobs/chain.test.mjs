@@ -98,6 +98,27 @@ test("a transport error raises ChainUnavailable", async () => {
   await assert.rejects(r.simulate({ account: PEER, to: cfg.escrow, data: "0x" }), ChainUnavailable);
 });
 
+test("a -32603 node error is a chain failure, not a revert", async () => {
+  // viem wraps any -32603 with a message as ContractFunctionRevertedError; without code 3, revert data or
+  // "execution reverted" it is still a failing node, so binding checks must not answer false.
+  const internal = (message, data) => Object.assign(new Error(message), { code: -32603, ...(data === undefined ? {} : { data }) });
+  const failing = (fnName, err) => reader(node({ onCall: ({ data }) => (decodeFunctionData({ abi: ABI, data }).functionName === fnName ? (() => { throw err; })() : undefined) }));
+  for (const fnName of ["ownerOf", "getAgentWallet"]) {
+    const r = failing(fnName, internal("header not found"));
+    await assert.rejects(r.isBoundToAgent(PEER, 10270n), (e) => e instanceof ChainUnavailable && /header not found/.test(e.message));
+    assert.equal(await failing(fnName, internal("header not found", "0x")).isBoundToAgent(PEER, 10270n).catch((e) => e.name), "ChainUnavailable");
+  }
+  const down = reader(custom({ request: async () => { throw internal("header not found"); } }, { retryCount: 0 }));
+  await assert.rejects(down.isBoundToAgent(OWNER, 10270n), ChainUnavailable);
+  await assert.rejects(down.getJob(7n), ChainUnavailable);
+  await assert.rejects(down.simulate({ account: PEER, to: cfg.escrow, data: "0x" }), ChainUnavailable);
+
+  // A -32603 that does carry the node's revert proof is still a revert.
+  const nonexistent = encodeErrorResult({ abi: ERRORS, errorName: "ERC721NonexistentToken", args: [10270n] });
+  assert.equal(await failing("ownerOf", internal("execution reverted")).isBoundToAgent(OWNER, 10270n), false);
+  assert.equal(await failing("ownerOf", internal("reverted", nonexistent)).isBoundToAgent(OWNER, 10270n), false);
+});
+
 test("simulate returns the revert reason", async () => {
   const setBudget = encodeFunctionData({ abi: ESCROW_ABI, functionName: "setBudget", args: [42n, USDC, 250000n, "0x"] });
   const calls = [];

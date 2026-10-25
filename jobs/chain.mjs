@@ -33,17 +33,22 @@ const monad = (rpcUrl) => defineChain({
 
 const isBaseError = (e) => typeof e?.walk === "function";
 
-// The innermost error that says the EVM reverted, or null for a node, network or timeout failure.
+// Revert data a node attached to its error: hex with at least a 4-byte selector.
+const hexOf = (e) => [e?.raw, e?.data?.data, e?.data].find((d) => typeof d === "string" && /^0x[0-9a-f]{8}/i.test(d)) ?? null;
+
+// The error that says the EVM reverted, or null for a node, network or timeout failure. Only the node's own answer
+// counts as proof: code 3, revert data, or "execution reverted" in its details. viem also wraps any -32603 node error
+// ("header not found") as ContractFunctionRevertedError, so that class alone proves nothing.
 function revertOf(err) {
   if (!isBaseError(err)) return null;
-  return err.walk((e) => e instanceof ContractFunctionRevertedError || e instanceof ExecutionRevertedError || e?.code === ExecutionRevertedError.code
-    || /execution reverted/i.test(e?.details ?? "")) ?? null;
+  const proof = err.walk((e) => e?.code === ExecutionRevertedError.code || hexOf(e) !== null || /execution reverted/i.test(e?.details ?? ""));
+  if (!proof) return null;
+  return err.walk((e) => e instanceof ContractFunctionRevertedError || e instanceof ExecutionRevertedError) ?? proof;
 }
 
 function revertData(err) {
-  const withData = err.walk((e) => typeof e?.data === "string" || typeof e?.data?.data === "string" || typeof e?.raw === "string");
-  const data = withData?.raw ?? withData?.data?.data ?? withData?.data;
-  return typeof data === "string" && data.startsWith("0x") && data.length >= 10 ? data : null;
+  const withData = err.walk((e) => hexOf(e) !== null);
+  return withData ? hexOf(withData) : null;
 }
 
 function revertReason(err) {
