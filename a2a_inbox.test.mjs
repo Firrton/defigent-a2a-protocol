@@ -35,8 +35,12 @@ import { fileURLToPath } from "node:url";
 import net from "node:net";
 import { createHmac } from "node:crypto";
 import http from "node:http";
-import { toFunctionSelector } from "viem";
+import { decodeFunctionData, encodeAbiParameters, encodeEventTopics, encodeFunctionResult, toFunctionSelector, zeroAddress, zeroHash } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
+import { ESCROW_ABI, IDENTITY_ABI } from "./jobs/abi.mjs";
+import { loadJobsConfig } from "./jobs/config.mjs";
+import { EXT_URI, termsHash } from "./jobs/protocol.mjs";
+import { createJobsStore } from "./jobs/store.mjs";
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const NODE_MAJOR = Number(process.versions.node.split(".")[0]);
@@ -719,7 +723,8 @@ describe("tasks/list extras: filters that are ignored, token quirks", { timeout:
 // ---------------------------------------------------------------------------------------------------------------------
 // 4. Classifier: which class, which reply, which state, which messages reach the wake queue
 // ---------------------------------------------------------------------------------------------------------------------
-const OFFER = { intent: "offer", service: "price-feed", price: "1.00", asset: "USDC", expiry: 1792000000000, terms: "t" };
+// typed jobs protocol (R17): a valid offer_schema_v1 offer is answered by the jobs runtime, so it needs an expiry in the future (2100-01-01)
+const OFFER = { intent: "offer", service: "price-feed", price: "1.00", asset: "USDC", expiry: 4102444800000, terms: "t" };
 const CLASSIFIER_CASES = [
   // { id, text|parts, cls, reply, state, queued, artifact }
   { id: "cl-1", text: "onboarding probe ready", cls: "handshake", reply: TXT.handshake, state: "completed", queued: false },
@@ -734,25 +739,37 @@ const CLASSIFIER_CASES = [
   { id: "cl-7", text: "What does the digest cost?", cls: "question", reply: TXT.question, state: "completed", queued: false, artifact: "defigent-services-catalog" },
   // G1: messages for the operator end `working` (never input-required) and are answered later through the outbox
   { id: "cl-8", text: "We offer price feeds at 1 USDC", cls: "offer", reply: TXT.offer, state: "working", queued: true },
-  { id: "cl-9", parts: [{ text: "service proposal" }, { data: OFFER }], cls: "offer_structured", state: "working", queued: true, artifact: "received-offer", reply: TXT.structured },
+  // typed jobs protocol (R17): a valid structured offer is answered typed (the inbound offer is under review) and wakes the operator with review_offer
+  { id: "cl-9", parts: [{ text: "service proposal" }, { data: OFFER }], cls: "typed_offer", state: "working", queued: true, artifact: "received-offer", reply: "Defigent is reviewing the offer.", typed: true },
   { id: "cl-10", text: "Please send me a quote", cls: "other", reply: TXT.other, state: "working", queued: true },
 ];
 
 describe("classifier: class, reply, state and wake queue per message class", { timeout: 120000 }, () => {
-  let h;
-  before(async () => { h = await Harness.start(); });
-  after(async () => { await h?.stop(); });
+  let h, stub;
+  // typed jobs protocol (R17): the structured offer (cl-9) is checked against the escrow's allowed tokens, so this group talks to a local chain stub
+  before(async () => { stub = await startChainStub({ allowed: [USDC] }); h = await Harness.start({ rpcUrl: stub.url }); });
+  after(async () => { await h?.stop(); await stub?.close(); });
 
   for (const c of CLASSIFIER_CASES) {
     it(`${c.cls}: ${JSON.stringify(c.text ?? "text + structured offer DataPart")}`, async () => {
       const r = await h.post(msgReq(c.id, c.parts ?? textParts(c.text)));
       assertRpcResult(r, c.id);
-      assertHybridReply(r.json.result, { contextId: `t-${c.id}`, state: c.state, text: c.reply });
+      if (c.typed) {
+        // typed jobs protocol (R17): an A2A 0.3 task whose message carries the typed status and its note
+        assert.equal(r.json.result.kind, "task");
+        assert.equal(r.json.result.contextId, `t-${c.id}`);
+        assert.equal(r.json.result.status.state, c.state);
+        const [data, note] = r.json.result.status.message.parts;
+        assert.equal(data.data["defigent.job.status"].offer.state, "under_review");
+        assert.deepEqual(note, { kind: "text", text: c.reply });
+      } else {
+        assertHybridReply(r.json.result, { contextId: `t-${c.id}`, state: c.state, text: c.reply });
+      }
       const t = (await h.get(`/tasks/t-${c.id}`)).json;
       assert.equal(t.task.state, c.state);
       assert.deepEqual(rolesOf(t.history), ["agent", "user"]);
       assert.deepEqual(t.artifacts.map((a) => a.name), c.artifact ? [c.artifact] : []);
-      if (c.state === "working") {
+      if (c.state === "working" && !c.typed) {
         // B: an honest interim acknowledgement - queued for the operator agent, answer will appear in this same task, read by polling
         const text = r.json.result.parts[0].text;
         assert.match(text, /queued for the operator agent/);
@@ -787,28 +804,36 @@ describe("classifier: class, reply, state and wake queue per message class", { t
     const queue = h.readJsonl("defigent_wake_queue.jsonl");
     const queued = CLASSIFIER_CASES.filter((c) => c.queued);
     // greeting/question/handshake are closed by a template; everything else reaches the operator
-    assert.deepEqual(queue.map((e) => [e.contextId, e.cls]), queued.map((c) => [`t-${c.id}`, c.cls]));
+    // typed jobs protocol (R17): the structured offer wakes the operator with the runtime's review_offer action instead
+    assert.deepEqual(queue.map((e) => [e.contextId, e.cls]), queued.map((c) => [`t-${c.id}`, c.typed ? "typed_action" : c.cls]));
     for (const e of queue) {
-      assert.deepEqual(Object.keys(e), WAKE_KEYS);
+      const typed = e.cls === "typed_action";
+      assert.deepEqual(Object.keys(e), typed ? [...WAKE_KEYS, "action"] : WAKE_KEYS);
       assert.equal(typeof e.ts, "number");
-      assert.equal(e.verified, false);
+      assert.equal(e.verified, typed); // a typed action line is written by the server itself
       assert.equal(e.sender, null);
     }
     const preview = (id) => queue.find((e) => e.contextId === `t-${id}`).preview;
     assert.equal(preview("cl-8"), "We offer price feeds at 1 USDC");
-    assert.equal(preview("cl-9"), JSON.stringify(OFFER)); // the structured offer, not the text
+    const review = queue.find((e) => e.contextId === "t-cl-9").action;
+    assert.equal(review.action, "review_offer");
+    assert.deepEqual([review.payload.service, review.payload.price.amount, review.payload.side], ["price-feed", "1000000", "provider"]);
     assert.equal(preview("cl-10"), "Please send me a quote");
   });
 
+  // typed jobs protocol (R17): the next two tests describe the lines of messages queued for the operator; a typed action line
+  // (cl-9's review_offer) is written by the jobs runtime before the sender's message is stored, so it is left out here
+  const operatorLines = () => h.readJsonl("defigent_wake_queue.jsonl").filter((e) => e.cls !== "typed_action");
+
   it("wake queue: ts is the stored timestamp of the sender's message (it is what inReplyTo refers to)", async () => {
-    for (const e of h.readJsonl("defigent_wake_queue.jsonl")) {
+    for (const e of operatorLines()) {
       const stored = (await h.get(`/tasks/${e.contextId}`)).json.history.find((m) => m.role === "user");
       assert.equal(e.ts, stored.ts, e.contextId);
     }
   });
 
   it("wake queue: each entry carries the thread so far and how to answer it (reply_via)", () => {
-    const queue = h.readJsonl("defigent_wake_queue.jsonl");
+    const queue = operatorLines();
     for (const e of queue) {
       assert.ok(JSON.stringify(e).length < 4000);
       assert.deepEqual(Object.keys(e.reply_via), ["file", "line", "states", "note"]);
@@ -2526,5 +2551,262 @@ describe("operator outbox: bounded work per tick, read boundaries, special files
     await h.waitFor(async () => h.readJsonl(OUTBOX_REJECTS).length === rejectsBefore + 1, { what: "the reject" });
     assert.ok(!SEPARATORS.test(h.readText(OUTBOX_REJECTS)));
     assert.equal(h.readJsonl(OUTBOX_REJECTS).at(-1).line, bad);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Typed jobs protocol (defigent.job.* DataParts): the inbox diverts them to the jobs runtime, against a local chain stub
+// ---------------------------------------------------------------------------------------------------------------------
+const JOBS_CONFIG = loadJobsConfig();
+const USDC = JOBS_CONFIG.tokens.USDC.address;
+const PROVIDER = "0x1111111111111111111111111111111111111111";
+const SET_BUDGET = "setBudget(uint256,address,uint256,bytes)";
+const nowSeconds = () => Math.floor(Date.now() / 1000);
+const typedData = (r) => r.json.result.task?.status.message.parts[0].data ?? r.json.result.status.message.parts[0].data;
+
+// A local JSON-RPC node for the jobs chain reader. `jobs` maps a jobId to partial Job struct fields, `bindings` lists the
+// {address, agentId} pairs the identity registry knows (as owner), `allowed` the escrow's payment tokens, `now` the block
+// time and `deliverables` the JobSubmitted hash per jobId. Anything it does not know (the server's own network-directory scan
+// included) reverts. `calls` records every request.
+async function startChainStub({ jobs = {}, bindings = [], allowed = [], now = nowSeconds(), deliverables = {} } = {}) {
+  const calls = [];
+  const same = (a, b) => String(a).toLowerCase() === String(b).toLowerCase();
+  const revert = { error: { code: 3, message: "execution reverted", data: "0x" } };
+  const job = (id) => ({
+    client: zeroAddress, status: 0, provider: zeroAddress, expiredAt: 0, evaluator: zeroAddress, submittedAt: 0, budget: 0n, hook: zeroAddress,
+    paymentToken: zeroAddress, providerAgentId: 0n, description: "", settledAmount: 0n, payoutReceiver: zeroAddress, ...(jobs[String(id)] ?? {}),
+  });
+  const [submittedTopic] = encodeEventTopics({ abi: ESCROW_ABI, eventName: "JobSubmitted" });
+
+  function ethCall({ to, data }) {
+    const abi = same(to, JOBS_CONFIG.escrow) ? ESCROW_ABI : same(to, JOBS_CONFIG.identityRegistry) ? IDENTITY_ABI : null;
+    if (!abi) return revert;
+    let call;
+    try { call = decodeFunctionData({ abi, data }); } catch { return revert; }
+    const answer = (result) => ({ result: encodeFunctionResult({ abi, functionName: call.functionName, result }) });
+    switch (call.functionName) {
+      case "getJob": return answer(job(call.args[0]));
+      case "allowedPaymentTokens": return answer(allowed.some((a) => same(a, call.args[0])));
+      case "pendingClaimHash": return answer(zeroHash);
+      case "ownerOf": {
+        const b = bindings.find((x) => BigInt(x.agentId) === call.args[0]);
+        return b ? answer(b.address) : revert;
+      }
+      case "getAgentWallet": return answer(zeroAddress);
+      case "setBudget": return { result: "0x" }; // the simulation of the provider's setBudget succeeds
+      default: return revert;
+    }
+  }
+
+  function getLogs({ topics = [] }) {
+    const id = topics[1] ? BigInt(topics[1]).toString() : null;
+    const hash = id ? deliverables[id] : null;
+    if (!hash) return { result: [] };
+    return { result: [{
+      address: JOBS_CONFIG.escrow, blockHash: "0x" + "ab".repeat(32), blockNumber: "0xff", logIndex: "0x0", transactionHash: "0x" + "cd".repeat(32),
+      transactionIndex: "0x0", removed: false, topics: [submittedTopic, topics[1], "0x" + PROVIDER.slice(2).toLowerCase().padStart(64, "0")],
+      data: encodeAbiParameters([{ type: "bytes32" }], [hash]),
+    }] };
+  }
+
+  const server = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (d) => { body += d; });
+    req.on("end", () => {
+      const j = JSON.parse(body);
+      calls.push(j);
+      let out;
+      if (j.method === "eth_call") out = ethCall(j.params[0]);
+      else if (j.method === "eth_blockNumber") out = { result: "0x100" };
+      else if (j.method === "eth_getBlockByNumber") out = { result: {
+        number: "0x100", hash: "0x" + "ef".repeat(32), parentHash: "0x" + "00".repeat(32), timestamp: "0x" + now.toString(16), nonce: "0x0000000000000000",
+        difficulty: "0x0", gasLimit: "0x1c9c380", gasUsed: "0x0", miner: zeroAddress, extraData: "0x", baseFeePerGas: "0x0", size: "0x0",
+        logsBloom: "0x" + "00".repeat(256), transactions: [], uncles: [],
+      } };
+      else if (j.method === "eth_getLogs") out = getLogs(j.params[0]);
+      else if (j.method === "eth_chainId") out = { result: "0x8f" };
+      else out = { error: { code: -32601, message: "no such method" } };
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ jsonrpc: "2.0", id: j.id, ...out }));
+    });
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  return { url: `http://127.0.0.1:${server.address().port}`, calls, close: () => new Promise((r) => server.close(r)) };
+}
+
+// Writes to the server's own ledger (the same file h.db() reads), through the jobs store.
+async function seedJobs(h, fn) {
+  const { default: Database } = await import("better-sqlite3");
+  const db = new Database(join(h.dir, "defigent_a2a.db"), { fileMustExist: true });
+  try { return fn(createJobsStore(db)); } finally { db.close(); }
+}
+
+// A full defigent.job.offer body (ours: Defigent is the client).
+const ourOffer = (offerId, { expiresAt = nowSeconds() + 2 * 86400, amount = "250000" } = {}) => ({
+  offerId, side: "client", service: "price-feed", description: "a daily price feed",
+  price: { amount, token: USDC, decimals: 6, symbol: "USDC" },
+  settlement: { chainId: 143, escrow: JOBS_CONFIG.escrow },
+  deliverable: { mediaType: "application/json", acceptance: "operator" },
+  from: { address: JOBS_CONFIG.client, agentId: 10331 }, to: { agentId: 777 },
+  expiresAt,
+});
+
+describe("typed jobs protocol: inbox divert", { timeout: 240000 }, () => {
+  let h, stub;
+  const query = (messageId, jobId = "42") => msgReq(messageId, [{ data: { "defigent.job.query": { jobId } } }]);
+  before(async () => {
+    stub = await startChainStub({
+      jobs: { 42: { client: JOBS_CONFIG.client, provider: PROVIDER, evaluator: JOBS_CONFIG.evaluator, expiredAt: nowSeconds() + 7 * 86400, hook: JOBS_CONFIG.hook } },
+      bindings: [{ address: PROVIDER, agentId: 777 }],
+      allowed: [USDC],
+    });
+    h = await Harness.start({ rpcUrl: stub.url, env: { DEFIGENT_JOBS_SWEEP_MS: "200" } });
+  });
+  after(async () => { await h?.stop(); await stub?.close(); });
+
+  describe("typed jobs protocol: queries", () => {
+    it("a typed query with A2A-Version 1.0 returns a 1.0 task with the next step", async () => {
+      const r = await h.post(query("tj-1"), { headers: { "A2A-Version": "1.0" } });
+      assertRpcResult(r, "tj-1");
+      assert.equal(r.json.result.task.id, "t-tj-1");
+      assert.equal(r.json.result.task.status.state, "TASK_STATE_INPUT_REQUIRED");
+      const next = r.json.result.task.status.message.parts[0].data["defigent.job.status"].next;
+      assert.equal(next.function, SET_BUDGET);
+      // no offer is linked to job 42: the provider sets a budget nobody agreed on here, so there is no calldata
+      assert.deepEqual([next.actor, next.ours, next.args, next.data], ["provider", false, ["42", null, null, "0x"], undefined]);
+      assert.equal(r.headers["a2a-extensions"], undefined); // not echoed: the client did not list the extension
+      const t = (await h.get("/tasks/t-tj-1")).json;
+      assert.equal(t.task.state, "input-required");
+      assert.deepEqual(t.history.map((m) => [m.role, m.text]).sort(), [["agent", next.note], ["user", "(typed defigent.job.query)"]]);
+      assert.deepEqual(t.history.find((m) => m.role === "user").data, { data: [{ "defigent.job.query": { jobId: "42" } }], files: [] });
+      assert.equal(t.history.find((m) => m.role === "agent").data.data[0]["defigent.job.status"].next.function, SET_BUDGET);
+      assert.equal(h.readJsonl("defigent_inbox.jsonl").find((e) => e.messageId === "tj-1").cls, "typed_query");
+    });
+
+    it("the same query without a version header returns the 0.3 shape", async () => {
+      const r = await h.post(query("tj-2"));
+      assertRpcResult(r, "tj-2");
+      assert.equal(r.json.result.kind, "task");
+      assert.equal(r.json.result.status.state, "input-required");
+      assert.equal(r.json.result.status.message.parts[0].kind, "data");
+      assert.equal(r.json.result.status.message.parts[0].data["defigent.job.status"].job.chainStatus, "Open");
+    });
+
+    it("an invalid typed body gets -32602 with BadRequest and creates no task", async () => {
+      const r = await h.post(query("tj-3", "0042"));
+      assert.equal(r.json.error.code, -32602);
+      assert.equal(r.json.error.data[0]["@type"], "type.googleapis.com/google.rpc.BadRequest");
+      assert.equal(r.json.error.data[0].fieldViolations[0].field, "jobId");
+      assert.equal((await h.get("/tasks/t-tj-3")).status, 404);
+    });
+
+    it("a typed part wins over a digest phrase in the text", async () => {
+      const r = await h.post(msgReq("tj-4", [{ text: 'sha256 hash of "abc"' }, { data: { "defigent.job.query": { jobId: "42" } } }]));
+      assert.ok(typedData(r)["defigent.job.status"], "a typed status reply");
+      const t = (await h.get("/tasks/t-tj-4")).json;
+      assert.deepEqual(t.artifacts, []); // no digest-result artifact
+      assert.equal(t.task.state, "input-required"); // the digest class would have closed it as completed
+      assert.ok(!t.history.some((m) => m.text.includes("ba7816bf")), "the sha256 of abc is never the answer");
+    });
+
+    it("the A2A-Extensions header is echoed when the client lists the URI", async () => {
+      const r = await h.post(query("tj-5"), { headers: { "A2A-Version": "1.0", "A2A-Extensions": `https://example.invalid/other, ${EXT_URI}` } });
+      assert.equal(r.headers["a2a-extensions"], EXT_URI);
+      assert.deepEqual(r.json.result.task.status.message.extensions, [EXT_URI]);
+    });
+
+    it("a typed query over message/stream gets one SSE frame with the typed task", async () => {
+      const r = await h.post(msgReq("tj-6", [{ data: { "defigent.job.query": { jobId: "42" } } }], { method: "message/stream" }));
+      assert.match(r.headers["content-type"], /^text\/event-stream/);
+      const frames = r.text.split("\n\n").filter(Boolean);
+      assert.equal(frames.length, 1);
+      assert.ok(frames[0].startsWith("data: "));
+      const rpc = JSON.parse(frames[0].slice(6));
+      assert.equal(rpc.id, "tj-6");
+      assert.equal(rpc.result.status.state, "input-required");
+    });
+  });
+
+  describe("typed jobs protocol: offers and accepts", () => {
+    before(async () => { await h.restart(); }); // a fresh rate-limit bucket on the same data directory
+
+    it("with our offer linked to job 42 the status carries the agreed setBudget call and its simulation", async () => {
+      const linked = ourOffer("of_Linked4200");
+      await seedJobs(h, (store) => store.insertOffer({
+        offerId: linked.offerId, direction: "out", peerAgentId: 777, contextId: linked.offerId, terms: linked, termsHash: termsHash(linked),
+        state: "accepted", expiresAt: linked.expiresAt, acceptedAddress: PROVIDER, acceptedAgentId: 777, jobId: "42",
+      }));
+      const r = await h.post(query("tj-7"));
+      const body = typedData(r)["defigent.job.status"];
+      assert.equal(body.next.function, SET_BUDGET);
+      assert.deepEqual(body.next.args, ["42", USDC, "250000", "0x"]);
+      assert.match(body.next.data, /^0x[0-9a-f]+$/);
+      assert.deepEqual(body.next.simulation, { ok: true });
+      assert.deepEqual(body.offer, { offerId: "of_Linked4200", state: "accepted" });
+    });
+
+    it("legacy offer_schema_v1 is answered typed, keeps the received-offer artifact and queues review_offer", async () => {
+      const legacy = { intent: "offer", service: "price-feed", price: "1.00", asset: "USDC", expiry: (nowSeconds() + 3 * 86400) * 1000, terms: "t" };
+      const r = await h.post(msgReq("tj-8", [{ text: "service proposal" }, { data: legacy }]));
+      assertRpcResult(r, "tj-8");
+      assert.equal(r.json.result.status.state, "working");
+      const body = typedData(r)["defigent.job.status"];
+      assert.equal(body.offer.state, "under_review");
+      assert.match(body.offer.offerId, /^of_[A-Za-z0-9]{10}$/);
+      const t = (await h.get("/tasks/t-tj-8")).json;
+      assert.equal(t.task.state, "working");
+      assert.deepEqual(t.artifacts.map((a) => [a.name, a.parts]), [["received-offer", [{ data: legacy }]]]);
+      const wake = h.readJsonl("defigent_wake_queue.jsonl").filter((e) => e.cls === "typed_action");
+      assert.equal(wake.length, 1);
+      assert.deepEqual(Object.keys(wake[0]), [...WAKE_KEYS, "action"]);
+      assert.equal(wake[0].contextId, "t-tj-8");
+      assert.equal(wake[0].verified, true);
+      assert.deepEqual(wake[0].action, {
+        key: `review_offer:${body.offer.offerId}`, action: "review_offer",
+        payload: { offerId: body.offer.offerId, side: "provider", service: "price-feed", price: { amount: "1000000", token: USDC, decimals: 6, symbol: "USDC" }, from: null },
+      });
+      assert.equal(h.readJsonl("defigent_inbox.jsonl").find((e) => e.messageId === "tj-8").cls, "typed_offer");
+    });
+
+    it("a text reply 'of_… 0x…' to our open offer is handled as an accept", async () => {
+      const offer = ourOffer("of_OpenOffer1");
+      await seedJobs(h, (store) => store.insertOffer({
+        offerId: offer.offerId, direction: "out", peerAgentId: 777, contextId: offer.offerId, terms: offer, termsHash: termsHash(offer),
+        state: "open", expiresAt: offer.expiresAt,
+      }));
+      const r = await h.post(msgReq("tj-9", textParts(`ok, accepting of_OpenOffer1, my wallet is ${PROVIDER}`)));
+      assert.equal(r.json.result.status.state, "working");
+      const body = typedData(r)["defigent.job.status"];
+      assert.deepEqual(body.offer, { offerId: "of_OpenOffer1", state: "accepted" });
+      assert.deepEqual([body.next.actor, body.next.ours, body.next.action], ["client", true, "create_job"]);
+      const wake = h.readJsonl("defigent_wake_queue.jsonl").find((e) => e.action?.key === "create_job:of_OpenOffer1");
+      assert.ok(wake, "a create_job wake line");
+      assert.equal(wake.contextId, "t-tj-9");
+      assert.deepEqual([wake.action.payload.provider, wake.action.payload.agentId, wake.action.payload.amount], [PROVIDER, 777, "250000"]);
+      const db = await h.db();
+      try {
+        const row = db.prepare("SELECT state, accepted_address, context_id FROM job_offers WHERE offer_id=?").get("of_OpenOffer1");
+        assert.deepEqual(row, { state: "accepted", accepted_address: PROVIDER, context_id: "t-tj-9" });
+        assert.notEqual(db.prepare("SELECT woken_at FROM job_actions WHERE action_key=?").get("create_job:of_OpenOffer1").woken_at, null);
+      } finally { db.close(); }
+      assert.equal(h.readJsonl("defigent_inbox.jsonl").find((e) => e.messageId === "tj-9").cls, "typed_accept");
+    });
+  });
+});
+
+describe("typed jobs protocol: chain unavailable", { timeout: 120000 }, () => {
+  let h;
+  before(async () => { h = await Harness.start({ rpcUrl: DEAD_RPC }); });
+  after(async () => { await h?.stop(); });
+
+  it("with the RPC down the typed request gets -32603 CHAIN_UNAVAILABLE", async () => {
+    const t0 = Date.now();
+    const r = await h.post(msgReq("tu-1", [{ data: { "defigent.job.query": { jobId: "42" } } }]));
+    assert.ok(Date.now() - t0 < JOBS_CONFIG.rpcTimeoutMs + 2000, "answered within rpcTimeoutMs");
+    assert.deepEqual(r.json, { jsonrpc: "2.0", id: "tu-1", error: { code: -32603, message: "Chain unavailable", data: [
+      { "@type": "type.googleapis.com/google.rpc.ErrorInfo", reason: "CHAIN_UNAVAILABLE", domain: EXT_URI, metadata: { retryable: "true" } },
+    ] } });
+    assert.equal((await h.get("/tasks/t-tu-1")).status, 404); // nothing persisted
+    assert.equal(h.readJsonl("defigent_wake_queue.jsonl").length, 0);
   });
 });

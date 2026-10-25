@@ -152,6 +152,11 @@ app.get("/.well-known/agent-card.json", (_req, res) => {
 import Database from "better-sqlite3";
 import crypto from "crypto";
 import { verifyTypedData, keccak256, toHex } from "viem";
+import { loadJobsConfig } from "./jobs/config.mjs";
+import { createChainReader } from "./jobs/chain.mjs";
+import { createJobsRuntime } from "./jobs/runtime.mjs";
+import { NAMES as JOB_NAMES, fullKey as jobKey } from "./jobs/protocol.mjs";
+import { chainUnavailable, extensionsEcho, invalidParams, negotiateVersion, sseFrame, typedResult } from "./jobs/wire.mjs";
 
 const A2A_DB = `${DATA_DIR}/defigent_a2a.db`;
 const a2a = new Database(A2A_DB);
@@ -249,6 +254,31 @@ CREATE TABLE IF NOT EXISTS operator_bound (context_id TEXT NOT NULL, ts INTEGER 
 try { a2a.exec(`ALTER TABLE operator_bound ADD COLUMN resolved INTEGER NOT NULL DEFAULT 0`); } catch {} // a table made before the column existed
 a2a.exec(`CREATE INDEX IF NOT EXISTS idx_operator_bound_open ON operator_bound(ts) WHERE resolved = 0;  -- the sweeper's queue
 CREATE INDEX IF NOT EXISTS idx_tasks_state_updated ON tasks(state, updated_at);                        -- tasks stuck in working`);
+
+// ---------- Typed jobs protocol (defigent.job.* DataParts, docs/jobs-protocol-v1-design.md) ----------
+// The runtime keeps its ledger in this same database. Its actions wake the operator through the wake queue (wakeTypedAction);
+// task changes found by its sweep land in the task the peer polls (applyTypedTaskUpdate).
+const JOBS_CONFIG = loadJobsConfig();
+const jobs = createJobsRuntime({ db: a2a, config: JOBS_CONFIG, reader: createChainReader({ config: JOBS_CONFIG, rpcUrl: RPC }), onAction: wakeTypedAction, onTaskUpdate: applyTypedTaskUpdate });
+
+// The stored meta of an agent message that carries a typed reply: the same {data, files} shape as the sender's parts.
+const typedMeta = (name, body) => (name ? JSON.stringify({ data: [{ [jobKey(name)]: body }], files: [] }) : null);
+
+// An operator action of the jobs runtime (review_offer, create_job, fund...). It throws when the line cannot be written,
+// so the runtime leaves the action unwoken and its sweep tries again.
+function wakeTypedAction(row) {
+  const preview = `${row.action}: ${JSON.stringify(row.payload)}`.slice(0, 140);
+  const line = wakeQueueLine({ ts: Date.now(), contextId: row.contextId, cls: "typed_action", verified: true, sender: null, preview, replyExpected: true, action: { key: row.key, action: row.action, payload: row.payload } });
+  fs.appendFileSync(WAKE_QUEUE_FILE, line);
+  notifyHermes(line);
+}
+
+function applyTypedTaskUpdate({ contextId, state, name, body, text }) {
+  a2a.transaction(() => {
+    upsertTask(contextId, state);
+    addMessage(contextId, "agent", text, true, null, typedMeta(name, body));
+  })();
+}
 
 const getOutboxState = () => a2a.prepare(`SELECT byte_offset, ino FROM outbox_state WHERE id=1`).get() || { byte_offset: 0, ino: null };
 function setOutboxState(offset, ino) {
@@ -578,10 +608,25 @@ function wakeQueueLine(entry) {
   for (const [cut, keep] of [[300, 6], [150, 6], [75, 6], [40, 6], [40, 3], [40, 1], [0, 1]]) {
     line = jsonl({ ts: entry.ts, contextId: entry.contextId, cls: entry.cls, verified: entry.verified, sender: entry.sender, preview: entry.preview, priority,
       thread: thread.slice(-keep).map(m => ({ role: m.role, text: m.text.slice(0, cut), verified: !!m.verified, sender: m.sender ? m.sender.slice(0, 42) : null })),
-      ...(entry.replyExpected === false ? { reply_expected: false } : { reply_via }) });
+      ...(entry.replyExpected === false ? { reply_expected: false } : { reply_via }), ...(entry.action ? { action: entry.action } : {}) });
     if (Buffer.byteLength(line) - 1 <= WAKE_MAX_BYTES) break;
   }
   return line;
+}
+
+// Event-driven wake: POST the wake line to the Hermes gateway webhook so the operator agent starts in seconds,
+// instead of waiting for the 3-minute cron poll. The adapter rejects anything whose route script exits nonzero
+// (defigent-operator-wake.py passes only replyExpected=true), so informatives are cheap no-ops.
+function notifyHermes(wakeLine) {
+  try {
+    const secret = process.env.HERMES_WEBHOOK_SUB_SECRET;
+    const url = process.env.HERMES_WEBHOOK_WAKE_URL || "http://127.0.0.1:8644/webhooks/defigent-operator";
+    if (secret) {
+      const body = JSON.stringify(JSON.parse(wakeLine));
+      const sig = "sha256=" + crypto.createHmac("sha256", secret).update(body).digest("hex");
+      fetch(url, { method: "POST", headers: { "Content-Type": "application/json", "X-Signature-256": sig }, body }).catch(() => {});
+    }
+  } catch {}
 }
 app.post("/inbox", async (req, res) => {
   const ip = req.ip || "unknown";
@@ -705,6 +750,50 @@ app.post("/inbox", async (req, res) => {
   const id = body?.id ?? null;
   const isStream = rpcMethod === "message/stream" || rpcMethod === "SendStreamingMessage";
   const messageId = msg?.messageId || `anon-${now}`;
+
+  // ---- typed jobs protocol: a defigent.job.* DataPart (or a valid legacy offer_schema_v1 offer, or a plain-text reply to one of our
+  // open offers) is answered by the jobs runtime, before the text classifier and its dedupe (the runtime dedupes by sender + messageId).
+  let detection = jobs.detect(dataParts);
+  if (detection.kind === "none" && text) {
+    const adapted = jobs.adaptText(text);
+    if (adapted) detection = { kind: "typed", ...adapted };
+  }
+  if (detection.kind !== "none") {
+    const contextId = msg?.contextId || msg?.taskId || `t-${messageId}`;
+    const auth = body?.params?.auth || msg?.auth || null;
+    const declaredSenderRaw = msg?.sender || msg?.from || null;
+    const declaredSender = typeof declaredSenderRaw === "string" ? declaredSenderRaw.slice(0, MAX_SENDER) : null;
+    const ident = await verifyAuth(auth, declaredSender);
+    const version = negotiateVersion(verHeader);
+    const r = await jobs.process({ detection, contextId, sender: ident.address || declaredSender, messageId });
+    // A legacy offer that does not normalize keeps the old offer_structured path below, unchanged.
+    if (r.kind === "invalid" && detection.kind !== "legacy") return res.json(invalidParams({ id, field: r.field, detail: r.detail }));
+    if (r.kind === "chain_unavailable") return res.json(chainUnavailable({ id }));
+    if (r.kind === "ok") {
+      // the request's name, never a sender-chosen key outside the protocol (r.name is the reply's: status, error or null)
+      const requestName = detection.kind === "legacy" ? "offer" : JOB_NAMES.includes(detection.name) ? detection.name : "unsupported";
+      a2a.transaction(() => {
+        upsertTask(contextId, r.taskState); // first: messages and artifacts reference the task (foreign keys are enforced)
+        addMessage(contextId, "user", text || `(typed ${jobKey(requestName)})`, ident.verified, ident.address || declaredSender, JSON.stringify({ data: dataParts, files: fileParts }));
+        if (detection.kind === "legacy") {
+          a2a.prepare(`INSERT INTO artifacts (task_id, artifact_id, name, parts_json, ts) VALUES (?,?,?,?,?)`)
+            .run(contextId, `art-offer-${now}`, "received-offer", JSON.stringify([{ data: detection.body }]), Date.now());
+        }
+        addMessage(contextId, "agent", r.text, true, null, typedMeta(r.name, r.body));
+      })();
+      logInbox({ ts: now, ip, messageId, cls: `typed_${requestName}`, from: msg?.role || "unknown", declaredAgent: /agentId[ ]?\d+/i.exec(text)?.[0] || null, verified: ident.verified, sender: ident.address || null, contextId, hasData: dataParts.length > 0, hasFiles: fileParts.length > 0, text: (text || "").slice(0, 2000) });
+      const echo = extensionsEcho(req.headers);
+      if (echo) res.setHeader(echo.name, echo.value);
+      const rpcResponse = { jsonrpc: "2.0", id, result: typedResult({ version, contextId, state: r.taskState, name: r.name, body: r.body, text: r.text, messageId: `defigent-re-${now}` }) };
+      if (isStream) {
+        res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
+        res.write(sseFrame(rpcResponse));
+        return res.end();
+      }
+      return res.json(rpcResponse);
+    }
+  }
+
   // dedupe
   if (global.__seenMsg && global.__seenMsg.has(messageId)) {
     return res.json({ jsonrpc: "2.0", id, result: { duplicate: true } });
@@ -826,20 +915,7 @@ app.post("/inbox", async (req, res) => {
     try {
       fs.appendFileSync(WAKE_QUEUE_FILE, wakeLine);
     } catch {}
-    // Event-driven wake: POST the wake line to the Hermes gateway webhook so the operator agent starts in seconds,
-    // instead of waiting for the 3-minute cron poll. The adapter rejects anything whose route script exits nonzero
-    // (defigent-operator-wake.py passes only replyExpected=true), so informatives are cheap no-ops.
-    if (toOperator) {
-      try {
-        const secret = process.env.HERMES_WEBHOOK_SUB_SECRET;
-        const url = process.env.HERMES_WEBHOOK_WAKE_URL || "http://127.0.0.1:8644/webhooks/defigent-operator";
-        if (secret) {
-          const body = JSON.stringify(JSON.parse(wakeLine));
-          const sig = "sha256=" + crypto.createHmac("sha256", secret).update(body).digest("hex");
-          fetch(url, { method: "POST", headers: { "Content-Type": "application/json", "X-Signature-256": sig }, body }).catch(() => {});
-        }
-      } catch {}
-    }
+    if (toOperator) notifyHermes(wakeLine);
   }
   // task states: a template or a machine reply closes the task; a message for the operator stays `working` until the operator answers
   // through the outbox (and `input-required` only appears when the operator itself asks the sender something). A machine reply to a
