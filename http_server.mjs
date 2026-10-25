@@ -836,9 +836,11 @@ app.post("/inbox", async (req, res) => {
         const secret = process.env.HERMES_WEBHOOK_SUB_SECRET;
         const url = process.env.HERMES_WEBHOOK_WAKE_URL || "http://127.0.0.1:8644/webhooks/defigent-operator";
         if (secret) {
-          const body = JSON.stringify(JSON.parse(wakeLine));
+          const payload = JSON.parse(wakeLine);
+          payload.event_type = "defigent-wake";   // the adapter reads event_type (or X-GitHub-Event), NOT .event
+          const body = JSON.stringify(payload);
           const sig = "sha256=" + crypto.createHmac("sha256", secret).update(body).digest("hex");
-          fetch(url, { method: "POST", headers: { "Content-Type": "application/json", "X-Signature-256": sig }, body }).catch(() => {});
+          fetch(url, { method: "POST", headers: { "Content-Type": "application/json", "X-Hub-Signature-256": sig, "X-Signature-256": sig }, body }).catch(() => {});
         }
       } catch {}
     }
