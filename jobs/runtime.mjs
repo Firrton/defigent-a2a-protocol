@@ -5,6 +5,7 @@ import { ChainUnavailable } from "./chain.mjs";
 import { handleAccept, handleDecline, handleJobMessage, handleOffer } from "./handlers.mjs";
 import { canonicalJson, detectTyped, fullKey, jobsJsonSchema, normalizeLegacyOffer, parseTyped } from "./protocol.mjs";
 import { createJobsStore, migrateJobsStore } from "./store.mjs";
+import { sweepJobs } from "./sweep.mjs";
 import { adaptTextReply } from "./text_adapter.mjs";
 
 const DAY_SECONDS = 86400;
@@ -61,7 +62,7 @@ function withDeadline(promise, ms) {
   return Promise.race([promise, deadline]).finally(() => clearTimeout(timer));
 }
 
-// onTaskUpdate is part of the interface for the sweep (Task 9), which reports changes nobody messaged us about.
+// onTaskUpdate is for the sweep, which reports changes nobody messaged us about.
 export function createJobsRuntime({
   db, config, reader, clock = () => Math.floor(Date.now() / 1000), onAction, onTaskUpdate = () => {}, log = () => {},
 }) {
@@ -247,6 +248,7 @@ export function createJobsRuntime({
     adaptText: (text) => adaptTextReply(text, { findOffer: (id) => store.getOffer(id) }),
     process,
     recordOperatorClaim,
+    sweep: () => sweepJobs({ store, reader, config, now: clock(), onAction, onTaskUpdate, log }),
     jsonSchema: jobsJsonSchema,
   };
 }

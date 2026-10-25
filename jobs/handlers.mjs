@@ -118,10 +118,12 @@ export function handleOffer({ msg, now, config, counts: { openOffersForAgent }, 
   });
 }
 
-export function handleAccept({ msg, offer, bound, now, config, counts: { createJobsToday } }) {
+// A peer accepts or declines one of our offers. With `verdict`, the operator answers an inbound offer's review_offer
+// instead (the sweep, from an outbox claim): the offer is inbound, its `to` names us, and the party is its sender.
+export function handleAccept({ msg, offer, bound, now, config, counts: { createJobsToday }, verdict = false }) {
   const id = msg.offerId;
   const { address, agentId } = msg.party;
-  if (!offer || offer.direction !== "out") return fail("unknown_offer", `Unknown offer ${id}.`, "offerId");
+  if (!offer || offer.direction !== (verdict ? "in" : "out")) return fail("unknown_offer", `Unknown offer ${id}.`, "offerId");
   if (offer.state === "accepted") {
     if (same(offer.acceptedAddress, address) && offer.acceptedAgentId === agentId) return status({ offer, next: offerNext(offer, now) });
     return fail("offer_taken", `Offer ${id} was already accepted by another party.`, "offerId");
@@ -131,7 +133,10 @@ export function handleAccept({ msg, offer, bound, now, config, counts: { createJ
   if (offer.expiresAt - now < config.minWorkWindowSeconds)
     return fail("offer_expired", `Offer ${id} expires at ${offer.expiresAt}, less than ${config.minWorkWindowSeconds} s from now.`, "offerId");
   const to = offer.terms.to?.agentId;
-  if (to !== undefined && to !== agentId) return fail("identity_mismatch", `Offer ${id} is addressed to agent ${to}, not ${agentId}.`, "party.agentId");
+  if (!verdict && to !== undefined && to !== agentId) return fail("identity_mismatch", `Offer ${id} is addressed to agent ${to}, not ${agentId}.`, "party.agentId");
+  // Plan decision 1: the verdict supplies the provider's identity only when the offer did not bring one.
+  const from = offer.terms.from?.agentId;
+  if (verdict && from !== undefined && from !== agentId) return fail("identity_mismatch", `Offer ${id} came from agent ${from}, not ${agentId}.`, "party.agentId");
   if (!bound) return fail("identity_mismatch", `${address} is neither the owner nor the agent wallet of agent ${agentId}.`, "party.address");
 
   const accepted = { ...offer, state: "accepted", acceptedAddress: address, acceptedAgentId: agentId };
@@ -142,9 +147,9 @@ export function handleAccept({ msg, offer, bound, now, config, counts: { createJ
   return status({ offer: accepted, next, actions, ops: [{ op: "accept", offerId: id, address, agentId }] });
 }
 
-export function handleDecline({ msg, offer, now }) {
+export function handleDecline({ msg, offer, now, verdict = false }) {
   const id = msg.offerId;
-  if (!offer || offer.direction !== "out") return fail("unknown_offer", `Unknown offer ${id}.`, "offerId");
+  if (!offer || offer.direction !== (verdict ? "in" : "out")) return fail("unknown_offer", `Unknown offer ${id}.`, "offerId");
   if (offer.state === "accepted") return fail("state_mismatch", `Offer ${id} was already accepted and cannot be declined.`, "offerId");
   if (offer.state === "expired") return fail("offer_expired", `Offer ${id} expired at ${offer.expiresAt}.`, "offerId");
   if (offer.state === "declined") return status({ offer, next: offerNext(offer, now) });
