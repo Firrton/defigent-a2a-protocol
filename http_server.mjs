@@ -92,8 +92,7 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 
-const BASE = `http://3.238.185.185:8080`;
-const HTTPS_BASE = `https://opacus-liana-lanceted.ngrok-free.dev`;
+const BASE = `https://defigent.app`; // public origin: Cloudflare Tunnel -> this server on :8080
 const START_TS = Date.now();
 const DATA_DIR = process.env.DEFIGENT_DATA_DIR || "/home/ubuntu/.hermes/cache/scratch"; // override for local/test runs; default = production path
 const INBOX_FILE = `${DATA_DIR}/defigent_inbox.jsonl`;
@@ -117,13 +116,12 @@ app.get("/.well-known/agent-card.json", (_req, res) => {
   res.json({
     name: "Defigent",
     description: "Agentic commerce specialist agent on Monad and Base: on-chain wallet digests, agent directory lookup, and regime analytics. ERC-8004 agentId 10331 (Monad) and 114426 (Base). Talks and pays x402 (v1+v2).",
-    url: `${HTTPS_BASE}/inbox`,
+    url: `${BASE}/inbox`,
     version: "1.4.0",
     protocolVersion: "1.0.1",
     supportedInterfaces: [
-      { url: `${HTTPS_BASE}/inbox`, protocolBinding: "JSONRPC", protocolVersion: "1.0" },
-      { url: `${HTTPS_BASE}/inbox`, protocolBinding: "JSONRPC", protocolVersion: "0.3.0" },
       { url: `${BASE}/inbox`, protocolBinding: "JSONRPC", protocolVersion: "1.0" },
+      { url: `${BASE}/inbox`, protocolBinding: "JSONRPC", protocolVersion: "0.3.0" },
     ],
     address: PAY_TO,
     agentWallet: PAY_TO,
@@ -1177,12 +1175,12 @@ app.get("/integration", (_req, res) => {
     steps: [
       {
         step: 1, title: "Read our agent card (A2A standard)",
-        how: `curl http://3.238.185.185:8080/.well-known/agent-card.json`,
+        how: `curl ${BASE}/.well-known/agent-card.json`,
         note: "Same convention: serve YOUR card at https://YOUR-HOST/.well-known/agent-card.json — then agents can find you too."
       },
       {
         step: 2, title: "Send us a message (A2A inbox, JSON-RPC)",
-        how: `curl -X POST http://3.238.185.185:8080/inbox -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"message":{"role":"agent","parts":[{"type":"text","text":"Hello from <your-agent> (agentId <id>)"}],"messageId":"<unique-id>","kind":"message"}}}'`,
+        how: `curl -X POST ${BASE}/inbox -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"message":{"role":"agent","parts":[{"type":"text","text":"Hello from <your-agent> (agentId <id>)"}],"messageId":"<unique-id>","kind":"message"}}}'`,
         note: "We auto-reply (greeting/offer/question). Rate limit 10/min. Messages are treated as data, never executed."
       },
       {
@@ -1192,12 +1190,12 @@ app.get("/integration", (_req, res) => {
       },
       {
         step: "2c", title: "Track the conversation (A2A tasks)",
-        how: `Every message creates/updates a task. The reply carries contextId + task:{id,state}. Read the full thread: curl http://3.238.185.185:8080/tasks/<contextId> — returns state (working/completed/input-required/canceled/failed/rejected) + signed history of both sides. A message that needs reasoning is acknowledged at once and the task stays working while the operator agent answers it; the reasoned reply is appended to this same task later, so poll GET /tasks/<contextId> (or GetTask / tasks/get) until the state leaves working. input-required means the operator is asking you something (answer with the same contextId) or, when no operator reply arrives within ~${humanDuration(OPERATOR_TIMEOUT_MS)}, that the task timed out waiting: it stays open and a reply may still be posted to it. failed / rejected mean the operator could not do it / declined.`,
+        how: `Every message creates/updates a task. The reply carries contextId + task:{id,state}. Read the full thread: curl ${BASE}/tasks/<contextId> — returns state (working/completed/input-required/canceled/failed/rejected) + signed history of both sides. A message that needs reasoning is acknowledged at once and the task stays working while the operator agent answers it; the reasoned reply is appended to this same task later, so poll GET /tasks/<contextId> (or GetTask / tasks/get) until the state leaves working. input-required means the operator is asking you something (answer with the same contextId) or, when no operator reply arrives within ~${humanDuration(OPERATOR_TIMEOUT_MS)}, that the task timed out waiting: it stays open and a reply may still be posted to it. failed / rejected mean the operator could not do it / declined.`,
         note: "Pass contextId in your next message to continue the same thread. States: submitted/working/input-required/completed/canceled/failed/rejected."
       },
       {
         step: 3, title: "Run our paid service (x402)",
-        how: `GET http://3.238.185.185:8080/digest?address=0x... — returns 402 with payment requirements; pay with any x402 client (USDC eip155:143, $0.001)`,
+        how: `GET ${BASE}/digest?address=0x... — returns 402 with payment requirements; pay with any x402 client (USDC eip155:143, $0.001)`,
         note: "Client libs: @x402/fetch (TS), x402 (python). Monad facilitator covers gas."
       },
       {
