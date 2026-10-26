@@ -190,6 +190,11 @@ function upsertTask(contextId, state) {
     .run(contextId, state, now, now);
 }
 
+// Messages received by the inbox, counted in the task store: the inbox log file can be rotated or missing.
+function countInboxMessages() {
+  return a2a.prepare(`SELECT COUNT(*) AS n FROM messages WHERE role='user'`).get().n;
+}
+
 // Returns the stored timestamp. A sender message gets a ts strictly greater than the task's previous sender message, so "newer than ts"
 // (outbox inReplyTo) is unambiguous even when two messages land in the same millisecond.
 function addMessage(contextId, role, text, verified, sender, meta = null) {
@@ -976,7 +981,7 @@ async function mcpToolCall(name, args) {
   if (name === "defigent_status") {
     const t0 = Date.now();
     const b = await rpc("eth_blockNumber", []);
-    return { content: [{ type: "text", text: JSON.stringify({ uptime_s: Math.floor((Date.now() - START_TS) / 1000), rpc_latency_ms: Date.now() - t0, head_block: BigInt(b).toString(), inbox_messages: (function(){ try { return fs.readFileSync(INBOX_FILE, "utf8").split("\n").filter(Boolean).length; } catch { return 0; } })() }) }] };
+    return { content: [{ type: "text", text: JSON.stringify({ uptime_s: Math.floor((Date.now() - START_TS) / 1000), rpc_latency_ms: Date.now() - t0, head_block: BigInt(b).toString(), inbox_messages: countInboxMessages() }) }] };
   }
   return { isError: true, content: [{ type: "text", text: `Unknown tool: ${name}. Available: ${MCP_TOOLS.map(t => t.name).join(", ")}` }] };
 }
@@ -1101,7 +1106,7 @@ app.get("/status", async (_req, res) => {
       monad: { chainId: 143, head_block: block, rpc_latency_ms: rpcMs, registration: { agentId: 10331, registry: "0x8004A169FB4a3325136EB29fA0ceB6D2e539a432" } },
       base: { chainId: 8453, head_block: base.head, rpc_latency_ms: base.latency_ms, registration: { agentId: 114426, registry: "0x8004A169FB4a3325136EB29fA0ceB6D2e539a432" } },
     },
-    inbox_messages: (function(){ try { return fs.readFileSync(INBOX_FILE, "utf8").split("\n").filter(Boolean).length; } catch { return 0; } })(),
+    inbox_messages: countInboxMessages(),
     endpoints: ["/info", "/digest (x402 $0.001)", "/status", "/inbox (A2A 0.3.0+1.0.1, signed+tasks+SSE)", "/tasks/:contextId", "/tasks/cancel", "/mcp (MCP 2026-07-28 stateless)", "/network", "/integration", "/webhooks/onchain", "/.well-known/agent-card.json"],
     registration: { agentId: 10331, registry: "eip155:143:0x8004A169FB4a3325136EB29fA0ceB6D2e539a432" },
     registrationBase: { agentId: 114426, registry: "eip155:8453:0x8004A169FB4a3325136EB29fA0ceB6D2e539a432" },
