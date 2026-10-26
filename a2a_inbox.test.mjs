@@ -2979,6 +2979,50 @@ describe("typed jobs protocol: outbox claims and the sweep", { timeout: 240000 }
     assert.equal(t.task.state, "working");
     assert.ok(!t.history.some((m) => m.text === "Working on it."), "the rejected text line is not in the thread");
   });
+
+  it("state working needs a valid claim: an invalid accept body, a misspelled name or a status line is rejected and nothing goes working", async () => {
+    // a text task that waits for the operator: its operator_bound row is what the operator-timeout sweeper watches
+    const offer = { offerId: "of_Verdict002" };
+    await h.post(msgReq("oc-6", textParts("Please send me a quote")));
+    const taskState = async () => (await h.get("/tasks/t-oc-6")).json.task.state;
+    const openBound = async () => (await query("SELECT COUNT(*) AS n FROM operator_bound WHERE context_id=? AND resolved=0", "t-oc-6")).n;
+    const [stateBefore, boundBefore] = [await taskState(), await openBound()];
+    const mine = ourOffer("of_StatusOnly1");
+    await seedJobs(h, (store) => store.insertOffer(acceptedOffer(mine)));
+    const rejectsBefore = h.readJsonl(OUTBOX_REJECTS).length;
+    const party = { address: PROVIDER, agentId: 777 };
+    h.operatorSays(
+      { contextId: "t-oc-6", text: "Accepted.", state: "working", replyId: "bad-accept", data: { "defigent.job.accept": { offerId: offer.offerId } } },
+      { contextId: "t-oc-6", text: "Accepted!", state: "working", replyId: "typo-accept", data: { "defigent.job.acept": { offerId: offer.offerId, party } } },
+      // R19 creates a task for an offer context only for a valid claim, whatever the state
+      { contextId: mine.offerId, text: "Status.", state: "working", replyId: "status-1", data: { "defigent.job.status": { offer: { offerId: mine.offerId } } } },
+      { contextId: mine.offerId, text: "Status.", state: "input-required", replyId: "status-2", data: { "defigent.job.status": { offer: { offerId: mine.offerId } } } },
+    );
+    const rejects = await h.waitFor(() => {
+      const r = h.readJsonl(OUTBOX_REJECTS).slice(rejectsBefore);
+      return r.length === 4 ? r : null;
+    }, { what: "the four rejected lines" });
+    assert.deepEqual(rejects.map((x) => [x.reason, JSON.parse(x.line).replyId]), [
+      ["state working needs a valid operator claim: invalid defigent.job.accept claim: party Invalid input: expected object, received undefined", "bad-accept"],
+      ["state working needs a valid operator claim: defigent.job.acept is not an operator claim", "typo-accept"],
+      ["state working needs a valid operator claim: defigent.job.status is not an operator claim", "status-1"],
+      ["unknown task: no task with that contextId", "status-2"],
+    ]);
+    // the rejected lines changed nothing: the task and its pending operator_bound row are as they were
+    assert.deepEqual([stateBefore, boundBefore], ["working", 1]);
+    assert.deepEqual([await taskState(), await openBound()], [stateBefore, boundBefore]);
+    assert.equal((await h.get(`/tasks/${mine.offerId}`)).status, 404);
+
+    // on another state an invalid claim still applies the text; the runtime logs why no claim was recorded
+    h.operatorSays({ contextId: "t-oc-6", text: "Job created.", state: "input-required", replyId: "bad-created", data: { "defigent.job.created": { offerId: offer.offerId } } });
+    const logged = await h.waitFor(() => h.readJsonl("defigent_inbox.jsonl").find((x) => x.cls === "jobs_log" && x.msg.includes("t-oc-6")), { what: "the jobs_log line" });
+    assert.equal(logged.msg, "jobs: no claim recorded in t-oc-6: invalid defigent.job.created claim: jobId Invalid input: expected string, received undefined");
+    const t = (await h.get("/tasks/t-oc-6")).json;
+    assert.equal(t.task.state, "input-required");
+    assert.deepEqual(t.history.filter((m) => m.role === "agent" && ["Accepted.", "Accepted!", "Job created."].includes(m.text)).map((m) => m.text), ["Job created."]);
+    assert.equal(await claimOf("t-oc-6"), undefined);
+    assert.equal(await openBound(), 0); // the accepted line answered it
+  });
 });
 
 describe("typed jobs protocol: chain unavailable", { timeout: 120000 }, () => {

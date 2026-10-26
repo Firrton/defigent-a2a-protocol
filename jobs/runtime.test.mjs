@@ -5,7 +5,7 @@ import { getAddress, zeroAddress } from "viem";
 import { loadJobsConfig } from "./config.mjs";
 import { createFakeChain } from "./fake_chain.mjs";
 import { jobDescription, parseTyped, termsHash } from "./protocol.mjs";
-import { createJobsRuntime } from "./runtime.mjs";
+import { createJobsRuntime, parseClaim } from "./runtime.mjs";
 
 const cfg = loadJobsConfig({ env: {} });
 const USDC = cfg.tokens.USDC.address;
@@ -391,6 +391,32 @@ test("invalid bodies and unsupported names", async () => {
   assert.equal(r.body.retryable, false);
   assert.equal(r.taskState, "rejected");
   assert.deepEqual(rt.store.seenResponse("0xpeer", "m3"), r);
+});
+
+test("parseClaim: null for an untyped line, a reason for a non-claim name or an invalid body, the parsed body for a valid claim", () => {
+  for (const data of [undefined, null, {}, { note: "no typed key" }, { "defigent.job.funded": { jobId: "1" }, "defigent.job.created": { jobId: "1" } }]) {
+    assert.equal(parseClaim(data), null, JSON.stringify(data));
+  }
+  assert.deepEqual(parseClaim({ "defigent.job.status": {} }), { ok: false, name: "status", reason: "defigent.job.status is not an operator claim" });
+  assert.deepEqual(parseClaim({ "defigent.job.acept": { offerId: OFFER_ID } }), { ok: false, name: "acept", reason: "defigent.job.acept is not an operator claim" });
+  assert.deepEqual(parseClaim({ "defigent.job.accept": { offerId: OFFER_ID } }), {
+    ok: false, name: "accept", reason: "invalid defigent.job.accept claim: party Invalid input: expected object, received undefined",
+  });
+  assert.deepEqual(parseClaim({ "defigent.job.created": "x" }), {
+    ok: false, name: "created", reason: "invalid defigent.job.created claim: body Invalid input: expected object, received string",
+  });
+  assert.deepEqual(parseClaim({ "defigent.job.accept": { offerId: OFFER_ID, party: { address: A.toLowerCase(), agentId: 7 } } }), {
+    ok: true, name: "accept", body: { offerId: OFFER_ID, party: { address: A, agentId: 7 } },
+  });
+});
+
+test("recordOperatorClaim logs why an invalid or non-claim typed line records nothing", () => {
+  const logs = [];
+  const rt = createJobsRuntime({ db: new Database(":memory:"), config: cfg, reader: chain(), clock, log: (m) => logs.push(m) });
+  assert.equal(rt.recordOperatorClaim({ contextId: "ctx-1", replyId: "r1", data: { "defigent.job.accept": { offerId: OFFER_ID } } }), false);
+  assert.equal(rt.recordOperatorClaim({ contextId: "ctx-1", replyId: "r2", data: { note: "untyped" } }), false);
+  assert.deepEqual(logs, ["jobs: no claim recorded in ctx-1: invalid defigent.job.accept claim: party Invalid input: expected object, received undefined"]);
+  assert.equal(rt.store.pendingClaims(10).length, 0);
 });
 
 test("recordOperatorClaim takes only claim names and dedupes by replyId", () => {

@@ -15,6 +15,18 @@ const CLAIM_NAMES = new Set(["created", "funded", "completed", "rejected", "expi
 
 const hashOf = (value) => keccak256(toBytes(canonicalJson(value)));
 
+// Pure: the operator claim an outbox line's `data` carries. null when data carries no single defigent.job.* key (not a typed line);
+// otherwise { ok: true, name, body } for a valid claim, or { ok: false, name, reason } for a non-claim name or an invalid body.
+export function parseClaim(data) {
+  const detection = detectTyped([data]);
+  if (detection.kind !== "typed") return null;
+  const { name } = detection;
+  if (!CLAIM_NAMES.has(name)) return { ok: false, name, reason: `${fullKey(name)} is not an operator claim` };
+  const r = parseTyped(name, detection.body);
+  if (!r.ok) return { ok: false, name, reason: `invalid ${fullKey(name)} claim: ${r.field || "body"} ${r.detail}` };
+  return { ok: true, name, body: r.value };
+}
+
 // R12: a legacy offer has no offerId, so it gets one derived from its body; resending the same body hits the same natural key.
 export function legacyOfferId(body) {
   let n = BigInt(hashOf(body));
@@ -232,20 +244,20 @@ export function createJobsRuntime({
 
   // Synchronous: it runs inside the outbox transaction. True when `data` is one valid claim (recorded once per replyId).
   function recordOperatorClaim({ contextId, replyId, data }) {
-    const detection = detectTyped([data]);
-    if (detection.kind !== "typed" || !CLAIM_NAMES.has(detection.name)) return false;
-    const r = parseTyped(detection.name, detection.body);
-    if (!r.ok) {
-      log(`jobs: invalid ${fullKey(detection.name)} claim in ${contextId}: ${r.field} ${r.detail}`);
+    const claim = parseClaim(data);
+    if (!claim) return false;
+    if (!claim.ok) {
+      log(`jobs: no claim recorded in ${contextId}: ${claim.reason}`);
       return false;
     }
-    store.recordClaim({ contextId, replyId, name: detection.name, body: r.value, now: clock() });
+    store.recordClaim({ contextId, replyId, name: claim.name, body: claim.body, now: clock() });
     return true;
   }
 
   return {
     store,
     detect: detectTyped,
+    parseClaim,
     adaptText: (text) => adaptTextReply(text, { findOffer: (id) => store.getOffer(id) }),
     process,
     recordOperatorClaim,

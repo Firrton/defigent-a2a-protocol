@@ -229,7 +229,8 @@ const historyItemNoData = ({ role, text, verified, sender, ts }) => ({ role, tex
 //   {"contextId": "<task id>", "text": "<reply>", "state": "completed|input-required|failed|rejected", "data": {…}, "replyId": "<idempotency key>", "inReplyTo": <ts of the wake-queue entry>}
 // A timer ingests new complete lines every 2 s, a bounded amount of work per tick. No HTTP route: the file is the only way in. Docs: docs/operator-outbox.md
 // A typed line (data carries exactly one defigent.job.* key) is also an operator claim: the jobs runtime records it and its sweep verifies
-// it on chain. Only a typed line may say "working" (the operator's accept verdict: the next step is ours again).
+// it on chain. Only a line that carries a valid claim may say "working" (the operator's accept verdict: the next step is ours again);
+// anything else would leave the task working with nothing to verify and no operator answer pending.
 const OUTBOX_STATES = ["completed", "input-required", "failed", "rejected"];
 const OUTBOX_MAX_TEXT = 4000, OUTBOX_MAX_DATA = 16 * 1024, OUTBOX_MAX_REPLY_ID = 200;
 const OUTBOX_WINDOW = 1 << 20; // bytes read per step; a line longer than this can never be valid
@@ -261,7 +262,9 @@ CREATE INDEX IF NOT EXISTS idx_tasks_state_updated ON tasks(state, updated_at); 
 // The runtime keeps its ledger in this same database. Its actions wake the operator through the wake queue (wakeTypedAction);
 // task changes found by its sweep land in the task the peer polls (applyTypedTaskUpdate).
 const JOBS_CONFIG = loadJobsConfig();
-const jobs = createJobsRuntime({ db: a2a, config: JOBS_CONFIG, reader: createChainReader({ config: JOBS_CONFIG, rpcUrl: RPC }), onAction: wakeTypedAction, onTaskUpdate: applyTypedTaskUpdate });
+// The runtime's and its sweep's log lines (invalid claims, rejected claims, failed wakes) go to the inbox log; a body that comes with one is not logged.
+const logJobs = (msg) => logInbox({ ts: Date.now(), cls: "jobs_log", msg: String(msg).slice(0, 200) });
+const jobs = createJobsRuntime({ db: a2a, config: JOBS_CONFIG, reader: createChainReader({ config: JOBS_CONFIG, rpcUrl: RPC }), onAction: wakeTypedAction, onTaskUpdate: applyTypedTaskUpdate, log: logJobs });
 
 // The stored meta of an agent message that carries a typed reply: the same {data, files} shape as the sender's parts.
 const typedMeta = (name, body) => (name ? JSON.stringify({ data: [{ [jobKey(name)]: body }], files: [] }) : null);
@@ -303,14 +306,17 @@ function applyOutboxLine(line, endOffset, ino) {
   if (!text) return "text must be a non-empty string";
   if (text.length > OUTBOX_MAX_TEXT) return `text is longer than ${OUTBOX_MAX_TEXT} characters`;
   const state = o.state === undefined ? "completed" : o.state;
-  const typed = jobs.detect([o.data]).kind === "typed";
-  if (!OUTBOX_STATES.includes(state) && !(typed && state === "working")) return `state must be one of ${OUTBOX_STATES.join(", ")}`;
+  const claim = jobs.parseClaim(o.data); // null: not a typed line
+  if (!OUTBOX_STATES.includes(state)) {
+    if (state !== "working" || !claim) return `state must be one of ${OUTBOX_STATES.join(", ")}`;
+    if (!claim.ok) return `state working needs a valid operator claim: ${claim.reason}`;
+  }
   if (o.data !== undefined && (!o.data || typeof o.data !== "object" || Array.isArray(o.data) || Buffer.byteLength(JSON.stringify(o.data)) > OUTBOX_MAX_DATA)) return "data must be a plain object of at most 16 kB";
   if (o.replyId !== undefined && (typeof o.replyId !== "string" || !o.replyId || o.replyId.length > OUTBOX_MAX_REPLY_ID)) return `replyId must be a non-empty string of at most ${OUTBOX_MAX_REPLY_ID} characters`;
   if (o.inReplyTo !== undefined && (typeof o.inReplyTo !== "number" || !Number.isFinite(o.inReplyTo))) return "inReplyTo must be a number (the ts of the wake-queue entry being answered)";
   const task = a2a.prepare(`SELECT state FROM tasks WHERE context_id=?`).get(o.contextId);
-  // a typed claim about an offer accepted in a synchronous reply names the offer's context, which has no task yet: it gets one
-  const offerTask = !task && typed && !!a2a.prepare(`SELECT 1 FROM job_offers WHERE context_id=? LIMIT 1`).get(o.contextId);
+  // a valid claim about an offer accepted in a synchronous reply names the offer's context, which has no task yet: it gets one (R19)
+  const offerTask = !task && !!claim?.ok && !!a2a.prepare(`SELECT 1 FROM job_offers WHERE context_id=? LIMIT 1`).get(o.contextId);
   if (!task && !offerTask) return "unknown task: no task with that contextId";
   if (task?.state === "canceled") return "task is canceled";
   // idempotency, scoped to the task: replyId when given; otherwise a hash of the line plus the task's latest sender message, so the
