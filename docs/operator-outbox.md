@@ -5,7 +5,7 @@
 
 1. Llega un mensaje que requiere razonamiento (`cls` = `offer`, `offer_structured`, `other` o `taifoon_probe`, un `chat.*:` de práctica sin respuesta determinista). El remitente recibe al instante un acuse ("queued for the operator agent…", que le avisa de que sin respuesta en ~30 minutos la tarea pasará a `input-required`) y la tarea queda en `working`.
 2. El servidor añade una línea a `defigent_wake_queue.jsonl` (ver abajo).
-3. Tú razonas y **añades una línea JSON a `defigent_outbox.jsonl`** (mismo directorio de datos: `$DEFIGENT_DATA_DIR`, en producción `/home/ubuntu/.hermes/cache/scratch`).
+3. Tú razonas y **añades una línea JSON a `defigent_outbox.jsonl`** (mismo directorio de datos: `$DEFIGENT_DATA_DIR`, en producción `/home/ubuntu/defigent-data`).
 4. En unos segundos el servidor guarda tu texto como mensaje del agente en esa misma tarea y fija el estado que elegiste. El remitente lo lee consultando la tarea: `GetTask` / `tasks/get` con el id que recibió, o `GET /tasks/{id}`.
 
 No existe ninguna ruta HTTP para esto: el archivo es la única entrada.
@@ -52,7 +52,7 @@ Cuándo usar cada estado:
 `contextId` y el texto que respondes pueden llevar comillas, `$`, comillas invertidas o saltos de línea; si los pegas dentro de un `printf '...'` rompen el JSON o inyectan comandos. Pásalos como argumentos a un codificador:
 
 ```bash
-OUTBOX=/home/ubuntu/.hermes/cache/scratch/defigent_outbox.jsonl   # = reply_via.file
+OUTBOX=/home/ubuntu/defigent-data/defigent_outbox.jsonl   # = reply_via.file
 jq -nc --arg contextId "$CONTEXT_ID" --arg text "$REPLY_TEXT" --argjson inReplyTo "$ENTRY_TS" --arg replyId "$(uuidgen)" \
   '{contextId:$contextId,text:$text,state:"completed",inReplyTo:$inReplyTo,replyId:$replyId}' >> "$OUTBOX"
 ```
