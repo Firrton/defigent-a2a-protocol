@@ -92,8 +92,7 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 
-const BASE = `http://3.238.185.185:8080`;
-const HTTPS_BASE = `https://opacus-liana-lanceted.ngrok-free.dev`;
+const BASE = `https://defigent.app`; // public origin: Cloudflare Tunnel -> this server on :8080
 const START_TS = Date.now();
 const DATA_DIR = process.env.DEFIGENT_DATA_DIR || "/home/ubuntu/.hermes/cache/scratch"; // override for local/test runs; default = production path
 const INBOX_FILE = `${DATA_DIR}/defigent_inbox.jsonl`;
@@ -117,13 +116,12 @@ app.get("/.well-known/agent-card.json", (_req, res) => {
   res.json({
     name: "Defigent",
     description: "Agentic commerce specialist agent on Monad and Base: on-chain wallet digests, agent directory lookup, and regime analytics. ERC-8004 agentId 10331 (Monad) and 114426 (Base). Talks and pays x402 (v1+v2).",
-    url: `${HTTPS_BASE}/inbox`,
+    url: `${BASE}/inbox`,
     version: "1.4.0",
     protocolVersion: "1.0.1",
     supportedInterfaces: [
-      { url: `${HTTPS_BASE}/inbox`, protocolBinding: "JSONRPC", protocolVersion: "1.0" },
-      { url: `${HTTPS_BASE}/inbox`, protocolBinding: "JSONRPC", protocolVersion: "0.3.0" },
       { url: `${BASE}/inbox`, protocolBinding: "JSONRPC", protocolVersion: "1.0" },
+      { url: `${BASE}/inbox`, protocolBinding: "JSONRPC", protocolVersion: "0.3.0" },
     ],
     address: PAY_TO,
     agentWallet: PAY_TO,
@@ -195,6 +193,11 @@ function upsertTask(contextId, state) {
   a2a.prepare(`INSERT INTO tasks (context_id, state, created_at, updated_at) VALUES (?,?,?,?)
     ON CONFLICT(context_id) DO UPDATE SET state=excluded.state, updated_at=excluded.updated_at`)
     .run(contextId, state, now, now);
+}
+
+// Messages received by the inbox, counted in the task store: the inbox log file can be rotated or missing.
+function countInboxMessages() {
+  return a2a.prepare(`SELECT COUNT(*) AS n FROM messages WHERE role='user'`).get().n;
 }
 
 // Returns the stored timestamp. A sender message gets a ts strictly greater than the task's previous sender message, so "newer than ts"
@@ -655,9 +658,11 @@ function notifyHermes(wakeLine) {
     const secret = process.env.HERMES_WEBHOOK_SUB_SECRET;
     const url = process.env.HERMES_WEBHOOK_WAKE_URL || "http://127.0.0.1:8644/webhooks/defigent-operator";
     if (secret) {
-      const body = JSON.stringify(JSON.parse(wakeLine));
+      const payload = JSON.parse(wakeLine);
+      payload.event_type = "defigent-wake";   // the adapter reads event_type (or X-GitHub-Event), NOT .event
+      const body = JSON.stringify(payload);
       const sig = "sha256=" + crypto.createHmac("sha256", secret).update(body).digest("hex");
-      fetch(url, { method: "POST", headers: { "Content-Type": "application/json", "X-Signature-256": sig }, body }).catch(() => {});
+      fetch(url, { method: "POST", headers: { "Content-Type": "application/json", "X-Hub-Signature-256": sig, "X-Signature-256": sig }, body }).catch(() => {});
     }
   } catch {}
 }
@@ -869,8 +874,10 @@ app.post("/inbox", async (req, res) => {
   const trimmed = (text || "").trim();
   const lower = trimmed.toLowerCase();
   let cls = "other";
-  // Taifoon mcp.digest class probe: deterministic, safe — hash a quoted string (content is DATA, computed, never executed)
-  const digestMatch = /(?:keccak256|sha256)\s+hash\s+of\s+"([^"]{1,4096})"/i.exec(text || "");
+  // Taifoon mcp.digest class probe: deterministic, safe — hash a quoted string (content is DATA, computed, never executed).
+  // Tolerant to harvester rotations ('sha256 hash of "X"' AND 'return the sha256 digest (hex) of the UTF-8 text "X" (nonce:...)'):
+  // algorithm keyword, then <=120 filler chars, then the FIRST quoted string.
+  const digestMatch = /(?:keccak256|sha256)\b[^"\n]{0,120}?"([^"]{1,4096})"/i.exec(text || "");
   let digestValue = null;
   if (digestMatch) {
     try {
@@ -1087,7 +1094,7 @@ async function mcpToolCall(name, args) {
   if (name === "defigent_status") {
     const t0 = Date.now();
     const b = await rpc("eth_blockNumber", []);
-    return { content: [{ type: "text", text: JSON.stringify({ uptime_s: Math.floor((Date.now() - START_TS) / 1000), rpc_latency_ms: Date.now() - t0, head_block: BigInt(b).toString(), inbox_messages: (function(){ try { return fs.readFileSync(INBOX_FILE, "utf8").split("\n").filter(Boolean).length; } catch { return 0; } })() }) }] };
+    return { content: [{ type: "text", text: JSON.stringify({ uptime_s: Math.floor((Date.now() - START_TS) / 1000), rpc_latency_ms: Date.now() - t0, head_block: BigInt(b).toString(), inbox_messages: countInboxMessages() }) }] };
   }
   return { isError: true, content: [{ type: "text", text: `Unknown tool: ${name}. Available: ${MCP_TOOLS.map(t => t.name).join(", ")}` }] };
 }
@@ -1212,7 +1219,7 @@ app.get("/status", async (_req, res) => {
       monad: { chainId: 143, head_block: block, rpc_latency_ms: rpcMs, registration: { agentId: 10331, registry: "0x8004A169FB4a3325136EB29fA0ceB6D2e539a432" } },
       base: { chainId: 8453, head_block: base.head, rpc_latency_ms: base.latency_ms, registration: { agentId: 114426, registry: "0x8004A169FB4a3325136EB29fA0ceB6D2e539a432" } },
     },
-    inbox_messages: (function(){ try { return fs.readFileSync(INBOX_FILE, "utf8").split("\n").filter(Boolean).length; } catch { return 0; } })(),
+    inbox_messages: countInboxMessages(),
     endpoints: ["/info", "/digest (x402 $0.001)", "/status", "/inbox (A2A 0.3.0+1.0.1, signed+tasks+SSE)", "/tasks/:contextId", "/tasks/cancel", "/mcp (MCP 2026-07-28 stateless)", "/network", "/integration", "/webhooks/onchain", "/.well-known/agent-card.json"],
     registration: { agentId: 10331, registry: "eip155:143:0x8004A169FB4a3325136EB29fA0ceB6D2e539a432" },
     registrationBase: { agentId: 114426, registry: "eip155:8453:0x8004A169FB4a3325136EB29fA0ceB6D2e539a432" },
@@ -1286,12 +1293,12 @@ app.get("/integration", (_req, res) => {
     steps: [
       {
         step: 1, title: "Read our agent card (A2A standard)",
-        how: `curl http://3.238.185.185:8080/.well-known/agent-card.json`,
+        how: `curl ${BASE}/.well-known/agent-card.json`,
         note: "Same convention: serve YOUR card at https://YOUR-HOST/.well-known/agent-card.json — then agents can find you too."
       },
       {
         step: 2, title: "Send us a message (A2A inbox, JSON-RPC)",
-        how: `curl -X POST http://3.238.185.185:8080/inbox -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"message":{"role":"agent","parts":[{"type":"text","text":"Hello from <your-agent> (agentId <id>)"}],"messageId":"<unique-id>","kind":"message"}}}'`,
+        how: `curl -X POST ${BASE}/inbox -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"message":{"role":"agent","parts":[{"type":"text","text":"Hello from <your-agent> (agentId <id>)"}],"messageId":"<unique-id>","kind":"message"}}}'`,
         note: "We auto-reply (greeting/offer/question). Rate limit 10/min. Messages are treated as data, never executed."
       },
       {
@@ -1301,12 +1308,12 @@ app.get("/integration", (_req, res) => {
       },
       {
         step: "2c", title: "Track the conversation (A2A tasks)",
-        how: `Every message creates/updates a task. The reply carries contextId + task:{id,state}. Read the full thread: curl http://3.238.185.185:8080/tasks/<contextId> — returns state (working/completed/input-required/canceled/failed/rejected) + signed history of both sides. A message that needs reasoning is acknowledged at once and the task stays working while the operator agent answers it; the reasoned reply is appended to this same task later, so poll GET /tasks/<contextId> (or GetTask / tasks/get) until the state leaves working. input-required means the operator is asking you something (answer with the same contextId) or, when no operator reply arrives within ~${humanDuration(OPERATOR_TIMEOUT_MS)}, that the task timed out waiting: it stays open and a reply may still be posted to it. failed / rejected mean the operator could not do it / declined.`,
+        how: `Every message creates/updates a task. The reply carries contextId + task:{id,state}. Read the full thread: curl ${BASE}/tasks/<contextId> — returns state (working/completed/input-required/canceled/failed/rejected) + signed history of both sides. A message that needs reasoning is acknowledged at once and the task stays working while the operator agent answers it; the reasoned reply is appended to this same task later, so poll GET /tasks/<contextId> (or GetTask / tasks/get) until the state leaves working. input-required means the operator is asking you something (answer with the same contextId) or, when no operator reply arrives within ~${humanDuration(OPERATOR_TIMEOUT_MS)}, that the task timed out waiting: it stays open and a reply may still be posted to it. failed / rejected mean the operator could not do it / declined.`,
         note: "Pass contextId in your next message to continue the same thread. States: submitted/working/input-required/completed/canceled/failed/rejected."
       },
       {
         step: 3, title: "Run our paid service (x402)",
-        how: `GET http://3.238.185.185:8080/digest?address=0x... — returns 402 with payment requirements; pay with any x402 client (USDC eip155:143, $0.001)`,
+        how: `GET ${BASE}/digest?address=0x... — returns 402 with payment requirements; pay with any x402 client (USDC eip155:143, $0.001)`,
         note: "Client libs: @x402/fetch (TS), x402 (python). Monad facilitator covers gas."
       },
       {

@@ -52,8 +52,7 @@ if (NODE_MAJOR < 22) {
 // ---------------------------------------------------------------------------------------------------------------------
 // Constants copied from the server's observable output (strings are compared, never fetched)
 // ---------------------------------------------------------------------------------------------------------------------
-const BASE = "http://3.238.185.185:8080"; // GAP(G10): hard-coded production IP over plain HTTP, even when the server runs locally
-const HTTPS_BASE = "https://opacus-liana-lanceted.ngrok-free.dev"; // the card's primary endpoint: a tunnel hostname hard-coded in the server (http_server.mjs:82)
+const BASE = "https://defigent.app"; // GAP(G10): the public origin is hard-coded in the server (http_server.mjs:95), even when the server runs locally
 const CARD_URL = `${BASE}/.well-known/agent-card.json`;
 // Interim acknowledgement for messages that go to the operator agent: honest about what happens next, no sender text, no task id.
 const POLL_HINT = `poll GetTask / tasks/get with the task id from this response (or GET ${BASE}/tasks/{id})`;
@@ -318,14 +317,13 @@ describe("probes: the nine production probes replayed locally", { timeout: 12000
     assert.deepEqual(Object.keys(r.json), ["name", "description", "url", "version", "protocolVersion", "supportedInterfaces", "address", "agentWallet", "capabilities", "securitySchemes", "extensions", "documentationUrl", "defaultInputModes", "defaultOutputModes", "skills", "provider", "registration", "registrations"]);
     assert.equal(r.json.name, "Defigent");
     assert.equal(r.json.version, "1.4.0");
-    // GAP(G10): the card advertises a hard-coded tunnel hostname (HTTPS) plus the production IP over plain HTTP, also for a local instance
-    assert.equal(r.json.url, `${HTTPS_BASE}/inbox`);
+    // GAP(G10): the card advertises the hard-coded public origin, also for a local instance
+    assert.equal(r.json.url, `${BASE}/inbox`);
     // GAP(G12): protocolVersion carries a patch ("1.0.1") and the second interface says "0.3.0" instead of "0.3"; all interfaces share one hybrid wire format (G3)
     assert.equal(r.json.protocolVersion, "1.0.1");
     assert.deepEqual(r.json.supportedInterfaces, [
-      { url: `${HTTPS_BASE}/inbox`, protocolBinding: "JSONRPC", protocolVersion: "1.0" },
-      { url: `${HTTPS_BASE}/inbox`, protocolBinding: "JSONRPC", protocolVersion: "0.3.0" },
       { url: `${BASE}/inbox`, protocolBinding: "JSONRPC", protocolVersion: "1.0" },
+      { url: `${BASE}/inbox`, protocolBinding: "JSONRPC", protocolVersion: "0.3.0" },
     ]);
     // the card binds the agent to its payment wallet (added for marketplace registration)
     assert.equal(r.json.address, "0x940ecB27d8f4F7009c8BC12969496E9639717638");
@@ -775,7 +773,7 @@ describe("classifier: class, reply, state and wake queue per message class", { t
         assert.match(text, /queued for the operator agent/);
         assert.match(text, /posted to this same task/);
         assert.match(text, /GetTask \/ tasks\/get/);
-        assert.match(text, /GET http:\/\/3\.238\.185\.185:8080\/tasks\/\{id\}/);
+        assert.match(text, /GET https:\/\/defigent\.app\/tasks\/\{id\}/);
         assert.match(text, /If no reply arrives within ~30 minutes this task will be marked input-required; a reply can still be posted later\./);
         assert.doesNotMatch(text, /logged for operator review|Telegram/);
         assert.equal(/structured offers as DataPart/.test(text), c.cls === "offer"); // the free-text offer reply keeps its tip
@@ -1757,7 +1755,7 @@ describe("trust enrichment for signed senders that name an agentId (stub RPC)", 
     assert.deepEqual(calls.slice(start).map((c) => c.params[0].data.slice(2, 10)), ["6352211e", "00339509", "75c10178"]);
   });
 
-  it("GET /status reports the head block from the RPC and counts inbox log lines", async () => {
+  it("GET /status reports the head block from the RPC and counts inbox messages", async () => {
     const r = await h.get("/status");
     assert.equal(r.status, 200);
     assert.deepEqual(Object.keys(r.json), ["service", "uptime_s", "rpc_latency_ms", "head_block", "chains", "inbox_messages", "endpoints", "registration", "registrationBase"]);
@@ -1772,6 +1770,14 @@ describe("trust enrichment for signed senders that name an agentId (stub RPC)", 
     assert.equal(r.json.chains.base.head_block, "16");
     assert.equal(typeof r.json.chains.base.rpc_latency_ms, "number");
     assert.deepEqual(r.json.registrationBase, { agentId: 114426, registry: "eip155:8453:0x8004A169FB4a3325136EB29fA0ceB6D2e539a432" });
+  });
+
+  // production showed 0 while the task store held hundreds of conversations: the count must not depend on the inbox log file
+  it("GET /status still counts the five messages (tr-1..tr-5) after the inbox log file is gone", async () => {
+    rmSync(join(h.dir, "defigent_inbox.jsonl"), { force: true });
+    const r = await h.get("/status");
+    assert.equal(r.status, 200);
+    assert.equal(r.json.inbox_messages, 5);
   });
 });
 
