@@ -228,6 +228,8 @@ const historyItemNoData = ({ role, text, verified, sender, ts }) => ({ role, tex
 // The operator agent (outside this repo) appends one JSON object per line to OUTBOX_FILE:
 //   {"contextId": "<task id>", "text": "<reply>", "state": "completed|input-required|failed|rejected", "data": {…}, "replyId": "<idempotency key>", "inReplyTo": <ts of the wake-queue entry>}
 // A timer ingests new complete lines every 2 s, a bounded amount of work per tick. No HTTP route: the file is the only way in. Docs: docs/operator-outbox.md
+// A typed line (data carries exactly one defigent.job.* key) is also an operator claim: the jobs runtime records it and its sweep verifies
+// it on chain. Only a typed line may say "working" (the operator's accept verdict: the next step is ours again).
 const OUTBOX_STATES = ["completed", "input-required", "failed", "rejected"];
 const OUTBOX_MAX_TEXT = 4000, OUTBOX_MAX_DATA = 16 * 1024, OUTBOX_MAX_REPLY_ID = 200;
 const OUTBOX_WINDOW = 1 << 20; // bytes read per step; a line longer than this can never be valid
@@ -301,13 +303,16 @@ function applyOutboxLine(line, endOffset, ino) {
   if (!text) return "text must be a non-empty string";
   if (text.length > OUTBOX_MAX_TEXT) return `text is longer than ${OUTBOX_MAX_TEXT} characters`;
   const state = o.state === undefined ? "completed" : o.state;
-  if (!OUTBOX_STATES.includes(state)) return `state must be one of ${OUTBOX_STATES.join(", ")}`;
+  const typed = jobs.detect([o.data]).kind === "typed";
+  if (!OUTBOX_STATES.includes(state) && !(typed && state === "working")) return `state must be one of ${OUTBOX_STATES.join(", ")}`;
   if (o.data !== undefined && (!o.data || typeof o.data !== "object" || Array.isArray(o.data) || Buffer.byteLength(JSON.stringify(o.data)) > OUTBOX_MAX_DATA)) return "data must be a plain object of at most 16 kB";
   if (o.replyId !== undefined && (typeof o.replyId !== "string" || !o.replyId || o.replyId.length > OUTBOX_MAX_REPLY_ID)) return `replyId must be a non-empty string of at most ${OUTBOX_MAX_REPLY_ID} characters`;
   if (o.inReplyTo !== undefined && (typeof o.inReplyTo !== "number" || !Number.isFinite(o.inReplyTo))) return "inReplyTo must be a number (the ts of the wake-queue entry being answered)";
   const task = a2a.prepare(`SELECT state FROM tasks WHERE context_id=?`).get(o.contextId);
-  if (!task) return "unknown task: no task with that contextId";
-  if (task.state === "canceled") return "task is canceled";
+  // a typed claim about an offer accepted in a synchronous reply names the offer's context, which has no task yet: it gets one
+  const offerTask = !task && typed && !!a2a.prepare(`SELECT 1 FROM job_offers WHERE context_id=? LIMIT 1`).get(o.contextId);
+  if (!task && !offerTask) return "unknown task: no task with that contextId";
+  if (task?.state === "canceled") return "task is canceled";
   // idempotency, scoped to the task: replyId when given; otherwise a hash of the line plus the task's latest sender message, so the
   // same answer to a newer sender message is applied again while a replay of old lines (same latest message) is ignored
   const lastUser = a2a.prepare(`SELECT MAX(id) AS id FROM messages WHERE context_id=? AND role='user'`).get(o.contextId)?.id ?? 0;
@@ -317,11 +322,14 @@ function applyOutboxLine(line, endOffset, ino) {
   // input-required once it timed out): a newer message for the operator exists that this reply does not answer
   const stale = o.inReplyTo !== undefined && !!a2a.prepare(`SELECT 1 FROM operator_bound WHERE context_id=? AND ts > ? LIMIT 1`).get(o.contextId, o.inReplyTo);
   a2a.transaction(() => {
+    if (offerTask) upsertTask(o.contextId, state);
     a2a.prepare(`INSERT INTO outbox_applied (reply_key, ts) VALUES (?,?)`).run(key, Date.now());
     addMessage(o.contextId, "agent", text, true, null, o.data ? JSON.stringify({ data: [o.data], files: [] }) : null);
-    upsertTask(o.contextId, stale ? task.state : state);
+    upsertTask(o.contextId, stale ? (task?.state ?? state) : state);
     // the operator has answered every sender message up to inReplyTo (all of them without it): none of them times out any more
     a2a.prepare(`UPDATE operator_bound SET resolved=? WHERE context_id=? AND ts <= ? AND resolved != ?`).run(OB_DONE, o.contextId, o.inReplyTo ?? Number.MAX_SAFE_INTEGER, OB_DONE);
+    // a claim (created, funded..., or an accept/decline verdict) is only recorded here; the jobs sweep verifies it on chain
+    if (o.data) jobs.recordOperatorClaim({ contextId: o.contextId, replyId: o.replyId ?? null, data: o.data });
     setOutboxState(endOffset, ino);
   })();
   return null;
@@ -452,6 +460,19 @@ function sweepTick(fromChain = false) {
 }
 setInterval(sweepTick, OPERATOR_SWEEP_MS).unref();
 setTimeout(sweepTick, Math.min(OPERATOR_SWEEP_MS, 1000)).unref();
+
+// ---------- Typed jobs sweep ----------
+// Every JOBS_CONFIG.sweepMs the jobs runtime verifies the operator's outbox claims on chain, follows the open jobs nobody messages us
+// about, and wakes the actions nobody has woken yet (those a script enqueued). One round at a time: a slow chain never stacks rounds.
+let sweeping = false;
+async function runJobsSweep() {
+  if (sweeping) return;
+  sweeping = true;
+  try { await jobs.sweep(); } catch (e) {
+    logInbox({ ts: Date.now(), cls: "jobs_sweep_error", error: String(e?.message || e).slice(0, 200) });
+  } finally { sweeping = false; }
+}
+setInterval(runJobsSweep, JOBS_CONFIG.sweepMs).unref();
 
 // ---------- Trust pipeline: on-chain owner check + reputation (all VERIFIED vs Monad live) ----------
 const IDENTITY_REG = "0x8004A169FB4a3325136EB29fA0ceB6D2e539a432";

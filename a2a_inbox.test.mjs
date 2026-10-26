@@ -39,7 +39,7 @@ import { decodeFunctionData, encodeAbiParameters, encodeEventTopics, encodeFunct
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { ESCROW_ABI, IDENTITY_ABI } from "./jobs/abi.mjs";
 import { loadJobsConfig } from "./jobs/config.mjs";
-import { EXT_URI, termsHash } from "./jobs/protocol.mjs";
+import { EXT_URI, jobDescription, termsHash } from "./jobs/protocol.mjs";
 import { createJobsStore } from "./jobs/store.mjs";
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
@@ -2845,6 +2845,139 @@ describe("typed jobs protocol: inbox divert", { timeout: 240000 }, () => {
       assert.equal(h.readJsonl("defigent_inbox.jsonl").filter((e) => e.messageId === "tj-11").length, 1);
       assert.equal(h.readJsonl("defigent_wake_queue.jsonl").filter((e) => e.contextId === "t-tj-11").length, 1);
     });
+  });
+});
+
+describe("typed jobs protocol: outbox claims and the sweep", { timeout: 240000 }, () => {
+  const OTHER = "0x3333333333333333333333333333333333333333";
+  const WAKE = "defigent_wake_queue.jsonl";
+  const created = ourOffer("of_ClaimOk001");
+  const wrong = ourOffer("of_ClaimBad01");
+  // the job our create_job made for `offer`, as the escrow returns it
+  const jobFor = (offer, provider) => ({
+    client: JOBS_CONFIG.client, provider, providerAgentId: 777n, evaluator: JOBS_CONFIG.evaluator, hook: JOBS_CONFIG.hook,
+    expiredAt: offer.expiresAt, description: jobDescription(offer),
+  });
+  // our offer, accepted by PROVIDER in a synchronous reply: its context is the offerId and the inbox has no task for it yet (R19)
+  const acceptedOffer = (offer) => ({
+    offerId: offer.offerId, direction: "out", peerAgentId: 777, contextId: offer.offerId, terms: offer, termsHash: termsHash(offer),
+    state: "accepted", expiresAt: offer.expiresAt, acceptedAddress: PROVIDER, acceptedAgentId: 777,
+  });
+  const inboundOffer = (offerId) => ({
+    offerId, side: "provider", service: "hash-text", description: "keccak256 of a text",
+    price: { amount: "250000", token: USDC, decimals: 6, symbol: "USDC" }, settlement: { chainId: 143, escrow: JOBS_CONFIG.escrow },
+    deliverable: { mediaType: "text/plain", acceptance: "operator" }, from: { address: PROVIDER, agentId: 777 }, expiresAt: nowSeconds() + 2 * 86400,
+  });
+  const query = async (sql, ...args) => { const db = await h.db(); try { return db.prepare(sql).get(...args); } finally { db.close(); } };
+  const claimOf = (contextId) => query("SELECT id, name, state, reason FROM job_claims WHERE context_id=?", contextId);
+  // the typed status the sweep posted to a task (the operator's own outbox line carries the claim, not a status)
+  const sweptStatus = async (contextId) => {
+    const r = await h.get(`/tasks/${contextId}`);
+    if (r.status !== 200) return null; // no task yet
+    return r.json.history.filter((m) => m.role === "agent").map((m) => m.data?.data?.[0]?.["defigent.job.status"]).filter(Boolean).at(-1);
+  };
+  let h, stub;
+  before(async () => {
+    stub = await startChainStub({
+      jobs: { 50: jobFor(created, PROVIDER), 51: jobFor(wrong, OTHER) },
+      bindings: [{ address: PROVIDER, agentId: 777 }],
+      allowed: [USDC],
+    });
+    h = await Harness.start({ rpcUrl: stub.url, env: { DEFIGENT_JOBS_SWEEP_MS: "200" } });
+  });
+  after(async () => { await h?.stop(); await stub?.close(); });
+
+  it("an operator 'created' claim is verified on-chain and moves the offer task to setBudget", async () => {
+    await seedJobs(h, (store) => store.insertOffer(acceptedOffer(created)));
+    h.operatorSays({
+      contextId: created.offerId, text: "Job 50 created for offer of_ClaimOk001.", state: "input-required", replyId: `create_job:${created.offerId}`,
+      data: { "defigent.job.created": { jobId: "50", offerId: created.offerId } },
+    });
+    const body = await h.waitFor(() => sweptStatus(created.offerId), { what: "the status the sweep posts once the claim is verified" });
+    assert.deepEqual(await claimOf(created.offerId), { id: 1, name: "created", state: "verified", reason: null });
+    assert.deepEqual(await query("SELECT job_id, chain_status FROM job_offers WHERE offer_id=?", created.offerId), { job_id: "50", chain_status: "Open" });
+    assert.deepEqual(body.offer, { offerId: created.offerId, state: "accepted" });
+    assert.equal(body.job.jobId, "50");
+    assert.deepEqual([body.next.actor, body.next.ours, body.next.function], ["provider", false, SET_BUDGET]);
+    assert.deepEqual(body.next.args, ["50", USDC, "250000", "0x"]);
+    const t = (await h.get(`/tasks/${created.offerId}`)).json;
+    assert.equal(t.task.state, "input-required");
+    assert.ok(t.history.some((m) => m.role === "agent" && m.text === "Job 50 created for offer of_ClaimOk001."), "the operator's line is in the thread");
+  });
+
+  it("a claim with the wrong provider is rejected and raises a review_claim wake line", async () => {
+    await seedJobs(h, (store) => store.insertOffer(acceptedOffer(wrong)));
+    h.operatorSays({
+      contextId: wrong.offerId, text: "Job 51 created for offer of_ClaimBad01.", state: "input-required", replyId: `create_job:${wrong.offerId}`,
+      data: { "defigent.job.created": { jobId: "51", offerId: wrong.offerId } },
+    });
+    const e = await h.waitFor(() => h.readJsonl(WAKE).find((x) => x.action?.action === "review_claim"), { what: "the review_claim wake line" });
+    const reason = `job 51 provider ${OTHER} is not the accepted address ${PROVIDER}`;
+    const claim = await claimOf(wrong.offerId);
+    assert.deepEqual(claim, { id: 2, name: "created", state: "rejected", reason });
+    assert.equal(e.cls, "typed_action");
+    assert.equal(e.contextId, wrong.offerId);
+    assert.deepEqual(e.action, {
+      key: "review_claim:2", action: "review_claim",
+      payload: { claimId: 2, name: "created", body: { jobId: "51", offerId: wrong.offerId }, reason },
+    });
+    assert.equal(e.reply_via.command, "node scripts/jobs_actions.mjs apply review_claim:2");
+    assert.deepEqual(await query("SELECT job_id, chain_status FROM job_offers WHERE offer_id=?", wrong.offerId), { job_id: null, chain_status: null });
+  });
+
+  it("a create_job action enqueued directly in the DB is woken by the sweep", async () => {
+    const key = "create_job:of_Direct0001";
+    const payload = { offerId: "of_Direct0001", provider: PROVIDER, agentId: 777, token: USDC, amount: "250000" };
+    await seedJobs(h, (store) => store.enqueueAction({ key, action: "create_job", payload, contextId: "of_Direct0001", now: nowSeconds() }));
+    const e = await h.waitFor(() => h.readJsonl(WAKE).find((x) => x.action?.key === key), { what: "the create_job wake line" });
+    assert.equal(e.cls, "typed_action");
+    assert.equal(e.contextId, "of_Direct0001");
+    assert.deepEqual(e.action, { key, action: "create_job", payload });
+    assert.equal(e.reply_via.command, `node scripts/jobs_actions.mjs apply ${key}`);
+    assert.notEqual((await query("SELECT woken_at FROM job_actions WHERE action_key=?", key)).woken_at, null);
+    await sleep(1000); // several more sweeps: a woken action is not woken again
+    assert.equal(h.readJsonl(WAKE).filter((x) => x.action?.key === key).length, 1);
+  });
+
+  it("an operator decline verdict on an inbound offer closes its review", async () => {
+    const offer = inboundOffer("of_Inbound001");
+    const r = await h.post(msgReq("oc-4", [{ data: { "defigent.job.offer": offer } }]));
+    assert.deepEqual(typedData(r)["defigent.job.status"].offer, { offerId: offer.offerId, state: "under_review" });
+    h.operatorSays({
+      contextId: "t-oc-4", text: "Declined: the price does not fit.", state: "rejected", replyId: `review_offer:${offer.offerId}`,
+      data: { "defigent.job.decline": { offerId: offer.offerId, reason: "price" } },
+    });
+    const body = await h.waitFor(async () => {
+      const s = await sweptStatus("t-oc-4");
+      return s?.offer.state === "declined" ? s : null;
+    }, { what: "the declined status the sweep posts" });
+    assert.deepEqual(body.offer, { offerId: offer.offerId, state: "declined" });
+    assert.deepEqual(body.next, { actor: null, ours: false, note: "The offer was declined." });
+    assert.equal((await query("SELECT state FROM job_offers WHERE offer_id=?", offer.offerId)).state, "declined");
+    assert.deepEqual(await claimOf("t-oc-4"), { id: 3, name: "decline", state: "verified", reason: null });
+    assert.equal((await h.get("/tasks/t-oc-4")).json.task.state, "rejected");
+  });
+
+  it("state working is accepted only on a typed line: the operator's accept verdict wakes create_job, a text line is rejected", async () => {
+    const offer = inboundOffer("of_Verdict001");
+    await h.post(msgReq("oc-5", [{ data: { "defigent.job.offer": offer } }]));
+    const rejectsBefore = h.readJsonl(OUTBOX_REJECTS).length;
+    h.operatorSays(
+      { contextId: "t-oc-5", text: "Working on it.", state: "working" },
+      { contextId: "t-oc-5", text: "Accepted: creating the job.", state: "working", replyId: `review_offer:${offer.offerId}`,
+        data: { "defigent.job.accept": { offerId: offer.offerId, party: { address: PROVIDER, agentId: 777 } } } },
+    );
+    const e = await h.waitFor(() => h.readJsonl(WAKE).find((x) => x.action?.key === `create_job:${offer.offerId}`), { what: "the create_job wake line" });
+    assert.deepEqual(h.readJsonl(OUTBOX_REJECTS).slice(rejectsBefore).map((x) => [x.reason, JSON.parse(x.line).text]),
+      [[`state must be one of ${OUTBOX_STATES.join(", ")}`, "Working on it."]]);
+    assert.equal(e.contextId, "t-oc-5");
+    assert.deepEqual([e.action.payload.offerId, e.action.payload.provider, e.action.payload.agentId, e.action.payload.amount], [offer.offerId, PROVIDER, 777, "250000"]);
+    assert.deepEqual(await query("SELECT state, accepted_address, accepted_agent_id FROM job_offers WHERE offer_id=?", offer.offerId),
+      { state: "accepted", accepted_address: PROVIDER, accepted_agent_id: 777 });
+    assert.deepEqual(await claimOf("t-oc-5"), { id: 4, name: "accept", state: "verified", reason: null });
+    const t = (await h.get("/tasks/t-oc-5")).json;
+    assert.equal(t.task.state, "working");
+    assert.ok(!t.history.some((m) => m.text === "Working on it."), "the rejected text line is not in the thread");
   });
 });
 
