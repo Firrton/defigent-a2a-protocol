@@ -196,7 +196,8 @@ export function createJobsRuntime({
       return { kind: "invalid", field: detection?.field ?? "data", detail: detection?.detail ?? "no typed message" };
     const who = sender ?? "anon";
     const seen = messageId == null ? null : store.seenResponse(who, messageId);
-    if (seen) return seen;
+    // The same (sender, messageId) again is a retry: the caller answers it but stores nothing new.
+    if (seen) return { ...seen, replay: true };
 
     const now = clock();
     const parsed = parse(detection, now);

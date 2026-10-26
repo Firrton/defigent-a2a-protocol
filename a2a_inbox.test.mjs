@@ -815,14 +815,21 @@ describe("classifier: class, reply, state and wake queue per message class", { t
     }
     const preview = (id) => queue.find((e) => e.contextId === `t-${id}`).preview;
     assert.equal(preview("cl-8"), "We offer price feeds at 1 USDC");
-    const review = queue.find((e) => e.contextId === "t-cl-9").action;
+    const typedLine = queue.find((e) => e.contextId === "t-cl-9");
+    const review = typedLine.action;
     assert.equal(review.action, "review_offer");
     assert.deepEqual([review.payload.service, review.payload.price.amount, review.payload.side], ["price-feed", "1000000", "provider"]);
+    // a typed action is answered through scripts/jobs_actions.mjs, never with a free-text outbox line
+    assert.deepEqual(Object.keys(typedLine.reply_via), ["script", "command", "note"]);
+    assert.equal(typedLine.reply_via.command, `node scripts/jobs_actions.mjs apply ${typedLine.action.key}`);
+    assert.match(typedLine.reply_via.note, /jobs_actions/);
+    assert.equal(typedLine.reply_via.line, undefined);
     assert.equal(preview("cl-10"), "Please send me a quote");
   });
 
   // typed jobs protocol (R17): the next two tests describe the lines of messages queued for the operator; a typed action line
-  // (cl-9's review_offer) is written by the jobs runtime before the sender's message is stored, so it is left out here
+  // (cl-9's review_offer) is written by the jobs runtime before the sender's message is stored, so it is left out here: its ts is
+  // the wake time and its reply_via points at scripts/jobs_actions.mjs (asserted in the test above)
   const operatorLines = () => h.readJsonl("defigent_wake_queue.jsonl").filter((e) => e.cls !== "typed_action");
 
   it("wake queue: ts is the stored timestamp of the sender's message (it is what inReplyTo refers to)", async () => {
@@ -2725,6 +2732,20 @@ describe("typed jobs protocol: inbox divert", { timeout: 240000 }, () => {
       assert.equal(rpc.id, "tj-6");
       assert.equal(rpc.result.status.state, "input-required");
     });
+
+    it("an unsigned declared sender gets its own replay namespace: the retry is answered from it, keyed 'unverified:<sender>'", async () => {
+      const X = "0x2222222222222222222222222222222222222222";
+      const r1 = await h.post(msgReq("tj-10", [{ data: { "defigent.job.query": { jobId: "42" } } }], { message: { sender: X } }));
+      const r2 = await h.post(msgReq("tj-10", [{ data: { "defigent.job.query": { jobId: "43" } } }], { message: { sender: X } }));
+      assertRpcResult(r2, "tj-10");
+      assert.equal(typedData(r1)["defigent.job.status"].job.jobId, "42");
+      assert.deepEqual(typedData(r2), typedData(r1)); // the cached reply, not an answer about job 43
+      assert.equal(r2.json.result.status.state, r1.json.result.status.state);
+      const db = await h.db();
+      try {
+        assert.deepEqual(db.prepare("SELECT sender FROM job_seen WHERE message_id=?").all("tj-10"), [{ sender: `unverified:${X}` }]);
+      } finally { db.close(); }
+    });
   });
 
   describe("typed jobs protocol: offers and accepts", () => {
@@ -2790,6 +2811,39 @@ describe("typed jobs protocol: inbox divert", { timeout: 240000 }, () => {
         assert.notEqual(db.prepare("SELECT woken_at FROM job_actions WHERE action_key=?").get("create_job:of_OpenOffer1").woken_at, null);
       } finally { db.close(); }
       assert.equal(h.readJsonl("defigent_inbox.jsonl").find((e) => e.messageId === "tj-9").cls, "typed_accept");
+    });
+
+    it("a typed defigent.job.offer queues review_offer with a reply_via that points at scripts/jobs_actions.mjs", async () => {
+      const offer = {
+        offerId: "of_InTyped012", side: "provider", service: "hash-text", description: "keccak256 of a text",
+        price: { amount: "250000", token: USDC, decimals: 6, symbol: "USDC" }, settlement: { chainId: 143, escrow: JOBS_CONFIG.escrow },
+        deliverable: { mediaType: "text/plain", acceptance: "operator" }, from: { address: PROVIDER, agentId: 777 }, expiresAt: nowSeconds() + 2 * 86400,
+      };
+      const r = await h.post(msgReq("tj-12", [{ data: { "defigent.job.offer": offer } }]));
+      assert.deepEqual(typedData(r)["defigent.job.status"].offer, { offerId: "of_InTyped012", state: "under_review" });
+      const e = h.readJsonl("defigent_wake_queue.jsonl").find((x) => x.action?.key === "review_offer:of_InTyped012");
+      assert.ok(e, "a review_offer wake line");
+      assert.equal(e.cls, "typed_action");
+      assert.deepEqual(Object.keys(e.reply_via), ["script", "command", "note"]);
+      assert.equal(e.reply_via.command, `node scripts/jobs_actions.mjs apply ${e.action.key}`);
+      assert.match(e.reply_via.note, /jobs_actions/);
+      assert.equal(e.reply_via.line, undefined);
+    });
+
+    it("a retried messageId gets the same answer and stores no second exchange, artifact, log line or wake line", async () => {
+      const legacy = { intent: "offer", service: "weather-feed", price: "0.50", asset: "USDC", expiry: (nowSeconds() + 3 * 86400) * 1000, terms: "t" };
+      const req = msgReq("tj-11", [{ text: "service proposal" }, { data: legacy }]);
+      const r1 = await h.post(req);
+      const r2 = await h.post(req);
+      assertRpcResult(r2, "tj-11");
+      assert.equal(typedData(r1)["defigent.job.status"].offer.state, "under_review");
+      assert.deepEqual(typedData(r2), typedData(r1));
+      assert.equal(r2.json.result.status.state, r1.json.result.status.state);
+      const t = (await h.get("/tasks/t-tj-11")).json;
+      assert.deepEqual(t.history.map((m) => m.role).sort(), ["agent", "user"]);
+      assert.equal(t.artifacts.length, 1);
+      assert.equal(h.readJsonl("defigent_inbox.jsonl").filter((e) => e.messageId === "tj-11").length, 1);
+      assert.equal(h.readJsonl("defigent_wake_queue.jsonl").filter((e) => e.contextId === "t-tj-11").length, 1);
     });
   });
 });

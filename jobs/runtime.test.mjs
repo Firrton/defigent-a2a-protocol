@@ -367,7 +367,8 @@ test("a duplicate messageId returns the remembered response", async () => {
   const first = await rt.process(queryReq("m1"));
   const calls = reader.calls;
   reader.setFail(true);
-  assert.deepEqual(await rt.process(queryReq("m1")), first);
+  assert.deepEqual(await rt.process(queryReq("m1")), { ...first, replay: true }); // flagged, so the inbox stores nothing new
+  assert.equal(first.replay, undefined);
   assert.equal(reader.calls, calls);
   // A null sender is remembered as "anon" (R11).
   assert.deepEqual(rt.store.seenResponse("anon", "m1"), first);

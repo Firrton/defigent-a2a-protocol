@@ -591,13 +591,19 @@ const MAX_SENDER = 120; // declared (unverified) sender, cut at intake
 
 // One wake-queue line: the original fields plus the priority, the thread so far and how to answer (reply_via), so the entry is self-describing.
 // Informational entries (replyExpected false: a Taifoon notice, already answered by machine) carry `reply_expected: false` instead of reply_via.
-// `ts` is the stored timestamp of the sender's message: the operator copies it into `inReplyTo`. The line is kept within 4000 BYTES: thread
+// `ts` is the stored timestamp of the sender's message: the operator copies it into `inReplyTo`. On a typed_action line (entry.action set)
+// `ts` is the wake time, not a stored message ts, and reply_via points at scripts/jobs_actions.mjs instead of a free-text outbox line.
+// The line is kept within 4000 BYTES: thread
 // text is cut to 300 characters per message, and if escaping or multi-byte text still pushes it over, the cut is tightened and then the
 // oldest thread entries are dropped (ids and sender are already capped at intake, so the fixed part is small).
 const WAKE_MAX_BYTES = 4000;
 function wakeQueueLine(entry) {
   const thread = getHistory(entry.contextId, 6, false);
-  const reply_via = {
+  const reply_via = entry.action ? {
+    script: "scripts/jobs_actions.mjs",
+    command: `node scripts/jobs_actions.mjs apply ${entry.action.key}`,
+    note: "Typed action: run it with scripts/jobs_actions.mjs, which simulates, sends and writes the outbox line itself. Do not write a free-text outbox line for this task."
+  } : {
     file: path.resolve(OUTBOX_FILE),
     line: { contextId: entry.contextId, text: "<your reply>", state: "completed", inReplyTo: entry.ts },
     states: OUTBOX_STATES,
@@ -765,14 +771,18 @@ app.post("/inbox", async (req, res) => {
     const declaredSender = typeof declaredSenderRaw === "string" ? declaredSenderRaw.slice(0, MAX_SENDER) : null;
     const ident = await verifyAuth(auth, declaredSender);
     const version = negotiateVersion(verHeader);
-    const r = await jobs.process({ detection, contextId, sender: ident.address || declaredSender, messageId });
+    // The replay cache is keyed by sender: only a verified address speaks for itself; a declared one gets its own namespace,
+    // so an unsigned peer can neither read nor pre-empt the cached reply of the address it names.
+    const replySender = ident.verified ? ident.address : (declaredSender ? `unverified:${declaredSender}` : null);
+    const r = await jobs.process({ detection, contextId, sender: replySender, messageId });
     // A legacy offer that does not normalize keeps the old offer_structured path below, unchanged.
     if (r.kind === "invalid" && detection.kind !== "legacy") return res.json(invalidParams({ id, field: r.field, detail: r.detail }));
     if (r.kind === "chain_unavailable") return res.json(chainUnavailable({ id }));
     if (r.kind === "ok") {
       // the request's name, never a sender-chosen key outside the protocol (r.name is the reply's: status, error or null)
       const requestName = detection.kind === "legacy" ? "offer" : JOB_NAMES.includes(detection.name) ? detection.name : "unsupported";
-      a2a.transaction(() => {
+      // A retry of the same (sender, messageId) gets the same answer, but its exchange, artifact and log line are already stored.
+      if (!r.replay) a2a.transaction(() => {
         upsertTask(contextId, r.taskState); // first: messages and artifacts reference the task (foreign keys are enforced)
         addMessage(contextId, "user", text || `(typed ${jobKey(requestName)})`, ident.verified, ident.address || declaredSender, JSON.stringify({ data: dataParts, files: fileParts }));
         if (detection.kind === "legacy") {
@@ -781,7 +791,7 @@ app.post("/inbox", async (req, res) => {
         }
         addMessage(contextId, "agent", r.text, true, null, typedMeta(r.name, r.body));
       })();
-      logInbox({ ts: now, ip, messageId, cls: `typed_${requestName}`, from: msg?.role || "unknown", declaredAgent: /agentId[ ]?\d+/i.exec(text)?.[0] || null, verified: ident.verified, sender: ident.address || null, contextId, hasData: dataParts.length > 0, hasFiles: fileParts.length > 0, text: (text || "").slice(0, 2000) });
+      if (!r.replay) logInbox({ ts: now, ip, messageId, cls: `typed_${requestName}`, from: msg?.role || "unknown", declaredAgent: /agentId[ ]?\d+/i.exec(text)?.[0] || null, verified: ident.verified, sender: ident.address || null, contextId, hasData: dataParts.length > 0, hasFiles: fileParts.length > 0, text: (text || "").slice(0, 2000) });
       const echo = extensionsEcho(req.headers);
       if (echo) res.setHeader(echo.name, echo.value);
       const rpcResponse = { jsonrpc: "2.0", id, result: typedResult({ version, contextId, state: r.taskState, name: r.name, body: r.body, text: r.text, messageId: `defigent-re-${now}` }) };
