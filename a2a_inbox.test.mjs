@@ -1723,7 +1723,7 @@ describe("trust enrichment for signed senders that name an agentId (stub RPC)", 
     assert.deepEqual(calls.slice(start).map((c) => c.params[0].data.slice(2, 10)), ["6352211e", "00339509", "75c10178"]);
   });
 
-  it("GET /status reports the head block from the RPC and counts inbox log lines", async () => {
+  it("GET /status reports the head block from the RPC and counts inbox messages", async () => {
     const r = await h.get("/status");
     assert.equal(r.status, 200);
     assert.deepEqual(Object.keys(r.json), ["service", "uptime_s", "rpc_latency_ms", "head_block", "chains", "inbox_messages", "endpoints", "registration", "registrationBase"]);
@@ -1738,6 +1738,14 @@ describe("trust enrichment for signed senders that name an agentId (stub RPC)", 
     assert.equal(r.json.chains.base.head_block, "16");
     assert.equal(typeof r.json.chains.base.rpc_latency_ms, "number");
     assert.deepEqual(r.json.registrationBase, { agentId: 114426, registry: "eip155:8453:0x8004A169FB4a3325136EB29fA0ceB6D2e539a432" });
+  });
+
+  // production showed 0 while the task store held hundreds of conversations: the count must not depend on the inbox log file
+  it("GET /status still counts the five messages (tr-1..tr-5) after the inbox log file is gone", async () => {
+    rmSync(join(h.dir, "defigent_inbox.jsonl"), { force: true });
+    const r = await h.get("/status");
+    assert.equal(r.status, 200);
+    assert.equal(r.json.inbox_messages, 5);
   });
 });
 
