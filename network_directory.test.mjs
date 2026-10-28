@@ -7,7 +7,7 @@ import path from "node:path";
 import http from "node:http";
 import {
   readDirectory, resolveDirectory, isPublicAddress, parseRegistration, fetchRegistration,
-  httpsGetText, decodeAbiString, scanRegistry, rebuildDirectory, pacer, RPC_PER_SEC,
+  httpsGetText, decodeAbiString, scanRegistry, rebuildDirectory, pacer, RPC_PER_SEC, publicErrorText, rebuildTracker,
 } from "./network_directory.mjs";
 
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), "defigent-net-"));
@@ -286,6 +286,53 @@ test("rebuildDirectory never replaces a good directory with an empty or collapse
   await assert.rejects(rebuildDirectory({ ethCall: registry({ 1: "", 2: "", 3: "", 4: "" }), file, firstId: 1, fetchReg: async () => null }), /scan returned 4 agents \(had 5\) up to id 4/);
   await assert.rejects(rebuildDirectory({ ethCall: async () => { throw new Error("ECONNRESET"); }, file, firstId: 1, fetchReg: async () => null, sleep: instant }), /registry read failed/);
   assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), good);
+});
+
+test("publicErrorText keeps the reason but masks URLs and file paths, and clips it", () => {
+  const rateLimit = 'registry read failed at agentId 10381: {"code":-32007,"message":"50/second request limit reached"}';
+  assert.equal(publicErrorText(new Error(rateLimit)), rateLimit);
+  // an RPC URL can carry an API key in its path
+  assert.equal(publicErrorText(new Error("request to https://x.quiknode.pro/SECRETKEY/ failed")), "request to <url> failed");
+  assert.equal(publicErrorText(new Error("EACCES: permission denied, open '/home/ubuntu/defigent-mcp/data/network.json.1.tmp'")), "EACCES: permission denied, open '<path>'");
+  assert.equal(publicErrorText("x".repeat(500)).length, 200);
+});
+
+test("publicErrorText masks the RPC key literally, whatever shape the provider echoes it in", () => {
+  const secrets = ["https://x.quiknode.pro/SECRETKEY123/", "https://rpc.example/?apikey=QUERYKEY456"];
+  assert.equal(publicErrorText(new Error('{"message":"bad endpoint x.quiknode.pro/SECRETKEY123/"}'), { secrets }), '{"message":"bad endpoint x.quiknode.pro/<secret>/"}');
+  assert.equal(publicErrorText(new Error("denied for key QUERYKEY456"), { secrets }), "denied for key <secret>");
+});
+
+test("publicErrorText leaves the rest of the message intact", () => {
+  assert.equal(publicErrorText(new Error('{"message":"bad endpoint https://x/KEY/","code":1}')), '{"message":"bad endpoint <url>","code":1}');
+  assert.equal(publicErrorText(new Error("limit is 50/second/endpoint")), "limit is 50/second/endpoint");
+});
+
+test("rebuildTracker reports the latest outcome and keeps the last failure after a success", () => {
+  let t = Date.parse("2026-10-28T10:00:00Z");
+  const r = rebuildTracker({ now: () => t });
+  const db = { updated: Date.parse("2026-10-27T12:34:48.101Z"), agents: [agent(1), agent(2)] };
+  assert.deepEqual(r.status(db), { updated_at: "2026-10-27T12:34:48.101Z", agents: 2, last_rebuild_ok: null, last_rebuild_ok_at: null, last_rebuild_error: null });
+  r.fail(rateLimited());
+  assert.deepEqual(r.status(db), { updated_at: "2026-10-27T12:34:48.101Z", agents: 2, last_rebuild_ok: false, last_rebuild_ok_at: null,
+    last_rebuild_error: { at: "2026-10-28T10:00:00.000Z", message: '{"code":-32007,"message":"50/second request limit reached"}' } });
+  t += 3600e3;
+  r.ok();
+  const s = r.status(db);
+  assert.deepEqual([s.last_rebuild_ok, s.last_rebuild_ok_at, s.last_rebuild_error.at], [true, "2026-10-28T11:00:00.000Z", "2026-10-28T10:00:00.000Z"]);
+});
+
+test("rebuildTracker masks the RPC key in a failure it reports", () => {
+  const r = rebuildTracker({ secrets: ["https://x.quiknode.pro/SECRETKEY123/"] });
+  r.fail(new Error("bad endpoint x.quiknode.pro/SECRETKEY123/"));
+  assert.equal(r.status(null).last_rebuild_error.message, "bad endpoint x.quiknode.pro/<secret>/");
+});
+
+test("rebuildTracker never fails /status over an unreadable or out-of-range directory", () => {
+  const r = rebuildTracker();
+  assert.deepEqual([r.status(null).updated_at, r.status(null).agents], [null, null]);
+  assert.equal(r.status({ updated: 1e16, agents: [] }).updated_at, null);
+  assert.equal(r.status({ updated: Infinity, agents: [] }).updated_at, null);
 });
 
 test("rebuildDirectory starts from the committed seed when there is no runtime file yet", async () => {

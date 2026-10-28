@@ -239,6 +239,43 @@ export async function rebuildDirectory({ ethCall, file, seedFile = null, selfId 
   return { agents: next.agents.length, fetched: next.fetched, truncated: next.truncated };
 }
 
+// The key-bearing parts of an RPC URL (credentials, path segments, query values), masked wherever they show up.
+const secretParts = (url) => {
+  try {
+    const u = new URL(url);
+    return [u.username, u.password, ...u.pathname.split("/"), ...u.searchParams.values()].filter((p) => p.length >= 8);
+  } catch { return []; }
+};
+
+// A rebuild failure as /status may show it, publicly: the RPC keys in `secrets`, any other URL and file paths are masked.
+export const publicErrorText = (e, { secrets = [] } = {}) => {
+  let text = String((e && e.message) || e);
+  for (const part of secrets.flatMap(secretParts)) text = text.split(part).join("<secret>");
+  return text.replace(/https?:\/\/[^\s"'<>]+/g, "<url>").replace(/(?<![\w.])(\/[\w.-]+){2,}/g, "<path>").slice(0, 200);
+};
+
+// How this process's rebuilds went, for /status. A failed rebuild keeps serving the last good directory, so without
+// this only the journal shows that the directory stopped moving. The last failure is kept after a success: compare times.
+export function rebuildTracker({ secrets = [], now = Date.now } = {}) {
+  let lastOk = null, okAt = null, error = null;
+  const iso = () => new Date(now()).toISOString();
+  return {
+    ok() { lastOk = true; okAt = iso(); },
+    fail(e) { lastOk = false; error = { at: iso(), message: publicErrorText(e, { secrets }) }; },
+    // `db` is the directory being served; a missing one or a bad `updated` reads as unknown instead of failing /status
+    status(db) {
+      const updated = new Date((db && db.updated) || NaN);
+      return {
+        updated_at: isNaN(updated) ? null : updated.toISOString(),
+        agents: db && Array.isArray(db.agents) ? db.agents.length : null,
+        last_rebuild_ok: lastOk,
+        last_rebuild_ok_at: okAt,
+        last_rebuild_error: error,
+      };
+    },
+  };
+}
+
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const out = process.argv[2] || "data/network.seed.json", RPC = process.env.RPC_URL || "https://rpc.monad.xyz";
   const ethCall = async (to, data) => {
