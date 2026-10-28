@@ -19,11 +19,28 @@ const REFETCH_MS = 24 * 3600_000;      // a registration file is re-read at most
 const MAX_BYTES = 128 * 1024;
 const TIMEOUT_MS = 8000;
 const REBUILD_DEADLINE_MS = 15 * 60_000;
+export const RPC_PER_SEC = 20;         // registry reads per second: QuickNode refuses past 50/s (-32007), shared with the rest of the server
+const READ_ATTEMPTS = 5;               // tries per registry read before the rebuild is aborted
+const BACKOFF_MS = 500;                // wait after a failed read, doubled on every further try (0.5 + 1 + 2 + 4 s)
 
 const withTimeout = (p, ms) => new Promise((resolve, reject) => {
   const timer = setTimeout(() => reject(new Error("timeout")), ms);
   p.then((v) => { clearTimeout(timer); resolve(v); }, (e) => { clearTimeout(timer); reject(e); });
 });
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Hands out start times 1000/perSec ms apart, in the order callers ask, so concurrent reads never burst. Idle time earns
+// no credit: a caller after a quiet spell starts at once, and the one right behind it still waits a full gap.
+// Monotonic clock: a wall-clock step backwards must not turn into a long sleep.
+export function pacer(perSec, { now = () => performance.now(), sleep = delay } = {}) {
+  const gap = 1000 / perSec;
+  let next = 0;
+  return async () => {
+    const t = now(), at = Math.max(t, next);
+    next = at + gap;
+    if (at > t) await sleep(at - t);
+  };
+}
 
 // ---------- what /network serves ----------
 // A directory file that is missing, corrupt, half-written or empty counts as absent. Parsed once per change (mtime).
@@ -151,31 +168,35 @@ export function decodeAbiString(hex) {
   return 64 + len > raw.length ? null : raw.subarray(64, 64 + len).toString("utf8");
 }
 
-// tokenURI(id), or null when the id does not exist (the call reverts). Any other failure is retried and then
-// aborts the rebuild: an RPC hiccup must never be mistaken for the end of the registry.
-async function tokenUri(ethCall, id) {
+// tokenURI(id), or null when the id does not exist (the call reverts). Any other failure (a rate limit, an RPC hiccup)
+// is retried with exponential backoff and then aborts the rebuild: it must never be mistaken for the end of the registry.
+async function tokenUri(ethCall, id, { pace, sleep }) {
   for (let attempt = 0; ; attempt++) {
     try {
+      await pace();
       const uri = decodeAbiString(await withTimeout(ethCall(IDENTITY_REG, "0xc87b56dd" + word(id)), TIMEOUT_MS));
       if (uri == null) throw new Error("malformed tokenURI response");
       return uri;
     } catch (e) {
       const msg = String((e && e.message) || e);
       if (/revert/i.test(msg)) return null;
-      if (attempt >= 2) throw new Error(`registry read failed at agentId ${id}: ${msg.slice(0, 120)}`);
+      if (attempt >= READ_ATTEMPTS - 1) throw new Error(`registry read failed at agentId ${id}: ${msg.slice(0, 120)}`);
+      await sleep(BACKOFF_MS * 2 ** attempt);
     }
   }
 }
 
 // Every agent from firstId to the newest id. `previous` (the last directory) avoids re-reading registration files
-// that have not changed and keeps the last good data for agents whose host is down.
-export async function scanRegistry({ ethCall, firstId = FIRST_ID, previous = null, selfId = null, now = Date.now(), fetchReg = fetchRegistration }) {
+// that have not changed and keeps the last good data for agents whose host is down. Registry reads are paced to
+// RPC_PER_SEC: unpaced, a scan fires them as fast as the RPC answers and the provider starts refusing them.
+export async function scanRegistry({ ethCall, firstId = FIRST_ID, previous = null, selfId = null, now = Date.now(), fetchReg = fetchRegistration,
+  sleep = delay, pace = pacer(RPC_PER_SEC, { sleep }) }) {
   const prev = new Map(((previous && previous.agents) || []).map((a) => [Number(a.agentId), a]));
   const agents = [];
   let misses = 0, fetched = 0, ended = false;
   scan: for (let start = firstId; start < firstId + MAX_SCAN; start += BATCH) {
     const ids = Array.from({ length: BATCH }, (_, i) => start + i);
-    const uris = await Promise.all(ids.map((id) => tokenUri(ethCall, id)));
+    const uris = await Promise.all(ids.map((id) => tokenUri(ethCall, id, { pace, sleep })));
     const entries = await Promise.all(ids.map(async (id, i) => {
       const uri = uris[i];
       if (uri == null) return null;
@@ -205,9 +226,9 @@ const maxId = (d) => d.agents.reduce((m, a) => Math.max(m, Number(a.agentId) || 
 // Scan and persist. Agent ids never go away, so a scan that comes back empty, far smaller, or ending below the
 // newest id we already had (an RPC node that lags) is a failed scan, never a reason to drop agents. The write is
 // atomic so readers never see a half-written directory.
-export async function rebuildDirectory({ ethCall, file, seedFile = null, selfId = null, firstId = FIRST_ID, fetchReg = fetchRegistration, pretty = false }) {
+export async function rebuildDirectory({ ethCall, file, seedFile = null, selfId = null, firstId = FIRST_ID, fetchReg = fetchRegistration, pretty = false, sleep, pace }) {
   const previous = readDirectory(file) || (seedFile && readDirectory(seedFile)) || null;
-  const next = await withTimeout(scanRegistry({ ethCall, firstId, previous, selfId, fetchReg }), REBUILD_DEADLINE_MS);
+  const next = await withTimeout(scanRegistry({ ethCall, firstId, previous, selfId, fetchReg, sleep, pace }), REBUILD_DEADLINE_MS);
   if (!next.agents.length || (previous && (next.agents.length < previous.agents.length / 2 || maxId(next) < maxId(previous)))) {
     throw new Error(`scan returned ${next.agents.length} agents (had ${previous ? previous.agents.length : 0}) up to id ${maxId(next)}, keeping the previous directory`);
   }
