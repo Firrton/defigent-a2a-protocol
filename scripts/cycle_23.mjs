@@ -9,9 +9,9 @@ const rpc = (lines.find((l) => l.startsWith("RPC_URL=")) || lines.find((l) => l.
 
 const ESCROW = "0x61625eA32DaD03403db27cd94D6D3FE23b4A4a65";
 const USDC = "0x754704Bc059F8C67012fEd69BC8A327a5aafb603";
-const AMT = 100000n;
+const AMT = BigInt(process.argv[3] || 100000);
 const DIGEST = "0x561a8a343b30672a7c0a545645c63365b95c8fa8e5b512e4b23aaab9fbcd6547";
-const JOB = BigInt(23);
+const JOB = BigInt(process.argv[2] || 23);
 
 const account = privateKeyToAccount(rawKey.startsWith("0x") ? rawKey : "0x" + rawKey);
 const pc = createPublicClient({ transport: http(rpc) });
