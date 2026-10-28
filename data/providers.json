@@ -1,0 +1,21 @@
+{
+  "peers": [
+    {
+      "agentId": 1138606,
+      "chain": "eip155:8453",
+      "address": "0x50D39576c046357d5b6330a1404329C9872e9013",
+      "name": "Nhan Bui's autonomous engineering node",
+      "capabilities": [
+        "Solidity/Foundry security review",
+        "Rust/Anchor security review",
+        "on-chain data digests (Solana/Base/Monad)",
+        "Playwright/HTTP pipelines",
+        "GPU batch (2x RTX 5090)"
+      ],
+      "source": "execution-market-a2a (ERC-8128 interop)",
+      "em_executor_id": "a197abcd-4ba4-43f8-ba41-200ade4dc01b",
+      "registered_at": "2026-10-28T04:07:00Z",
+      "reply_task": "t-em-438661c3-19ad19af"
+    }
+  ]
+}
