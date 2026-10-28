@@ -13,11 +13,12 @@ const NETWORK = "eip155:143";
 const NETWORK_BASE = "eip155:8453";
 const PORT = process.env.PORT || 8080;
 
-async function rpc(method, params) {
+async function rpc(method, params, { timeoutMs } = {}) {
   const res = await fetch(RPC, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+    signal: timeoutMs ? AbortSignal.timeout(timeoutMs) : undefined,
   });
   const j = await res.json();
   if (!j.result) throw new Error(JSON.stringify(j.error || j));
@@ -1206,23 +1207,25 @@ app.post("/tasks/cancel", (req, res) => {
 
 // ---------- Status heartbeat ----------
 const RPC_BASE_URL = process.env.RPC_BASE_URL || "https://base.drpc.org";
+const STATUS_RPC_TIMEOUT_MS = 3000; // per head lookup: an RPC that never answers must not hold the health endpoint
 async function baseHead() {
   try {
     const t = Date.now();
-    const r = await fetch(RPC_BASE_URL, { method: "POST", headers: { "Content-Type": "application/json", "User-Agent": "defigent/1.4" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_blockNumber", params: [] }) });
+    const r = await fetch(RPC_BASE_URL, { method: "POST", headers: { "Content-Type": "application/json", "User-Agent": "defigent/1.4" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_blockNumber", params: [] }), signal: AbortSignal.timeout(STATUS_RPC_TIMEOUT_MS) });
     const j = await r.json();
     return { latency_ms: Date.now() - t, head: j.result ? BigInt(j.result).toString() : null };
   } catch { return { latency_ms: null, head: null }; }
 }
-app.get("/status", async (_req, res) => {
-  const t0 = Date.now();
-  let rpcMs = null, block = null;
+async function monadHead() {
   try {
-    const b = await rpc("eth_blockNumber", []);
-    rpcMs = Date.now() - t0;
-    block = BigInt(b).toString();
-  } catch {}
-  const base = await baseHead();
+    const t = Date.now();
+    const b = await rpc("eth_blockNumber", [], { timeoutMs: STATUS_RPC_TIMEOUT_MS });
+    return { latency_ms: Date.now() - t, head: BigInt(b).toString() };
+  } catch { return { latency_ms: null, head: null }; }
+}
+app.get("/status", async (_req, res) => {
+  const [monad, base] = await Promise.all([monadHead(), baseHead()]); // at once: the slower one bounds the reply
+  const rpcMs = monad.latency_ms, block = monad.head;
   res.json({
     service: "Defigent storefront",
     uptime_s: Math.floor((Date.now() - START_TS) / 1000),
@@ -1233,6 +1236,7 @@ app.get("/status", async (_req, res) => {
       base: { chainId: 8453, head_block: base.head, rpc_latency_ms: base.latency_ms, registration: { agentId: 114426, registry: "0x8004A169FB4a3325136EB29fA0ceB6D2e539a432" } },
     },
     inbox_messages: countInboxMessages(),
+    network_directory: networkDirectoryStatus(),
     endpoints: ["/info", "/digest (x402 $0.001)", "/status", "/inbox (A2A 0.3.0+1.0.1, signed+tasks+SSE)", "/tasks/:contextId", "/tasks/cancel", "/mcp (MCP 2026-07-28 stateless)", "/network", "/integration", "/webhooks/onchain", "/.well-known/agent-card.json"],
     registration: { agentId: 10331, registry: "eip155:143:0x8004A169FB4a3325136EB29fA0ceB6D2e539a432" },
     registrationBase: { agentId: 114426, registry: "eip155:8453:0x8004A169FB4a3325136EB29fA0ceB6D2e539a432" },
@@ -1244,7 +1248,7 @@ app.get("/status", async (_req, res) => {
 // /network/refresh) into data/network.json, with a committed snapshot as last resort. The lead-monitor cache only
 // enriches it (welcomeTx, status), so a missing or corrupt cache file can no longer empty /network.
 import { fileURLToPath } from "url";
-import { readDirectory, resolveDirectory, rebuildDirectory } from "./network_directory.mjs";
+import { readDirectory, resolveDirectory, rebuildDirectory, rebuildTracker } from "./network_directory.mjs";
 const NETWORK_FILE = "/home/ubuntu/.hermes/cache/scratch/defigent_network.json";
 const NETWORK_LOCAL = fileURLToPath(new URL("./data/network.json", import.meta.url));     // runtime rebuild (gitignored)
 const NETWORK_SEED = fileURLToPath(new URL("./data/network.seed.json", import.meta.url)); // committed snapshot
@@ -1252,14 +1256,26 @@ const NETWORK_REBUILD_MS = 2 * 60 * 60 * 1000;
 function loadNetwork() { return resolveDirectory({ monitor: readDirectory(NETWORK_FILE), local: readDirectory(NETWORK_LOCAL), seed: readDirectory(NETWORK_SEED) }); }
 
 let networkRebuild = null, networkRebuildAt = 0, networkRefreshTimer = null;
+const networkRebuilds = rebuildTracker({ secrets: [RPC, RPC_BASE_URL] }); // reported by /status
 function rebuildNetwork() {
   if (networkRebuild) return networkRebuild;
   networkRebuildAt = Date.now();
   networkRebuild = rebuildDirectory({ ethCall: (to, data) => rpc("eth_call", [{ to, data }, "latest"]), file: NETWORK_LOCAL, seedFile: NETWORK_SEED, selfId: 10331 })
-    .then(r => console.error(`[defigent-http] network directory rebuilt from the registry: ${r.agents} agents, ${r.fetched} registration files read${r.truncated ? " — scan cap reached, newest agents may be missing" : ""}`))
-    .catch(e => console.error(`[defigent-http] network rebuild failed, serving the last good directory: ${String(e?.message || e).slice(0, 200)}`))
+    .then(r => {
+      networkRebuilds.ok();
+      console.error(`[defigent-http] network directory rebuilt from the registry: ${r.agents} agents, ${r.fetched} registration files read${r.truncated ? " — scan cap reached, newest agents may be missing" : ""}`);
+    })
+    .catch(e => {
+      networkRebuilds.fail(e);
+      console.error(`[defigent-http] network rebuild failed, serving the last good directory: ${String(e?.message || e).slice(0, 200)}`);
+    })
     .finally(() => { networkRebuild = null; });
   return networkRebuild;
+}
+function networkDirectoryStatus() {
+  let db = null;
+  try { db = loadNetwork(); } catch {} // a health endpoint must not fail over the directory file
+  return networkRebuilds.status(db);
 }
 
 app.get("/network", async (_req, res) => {
