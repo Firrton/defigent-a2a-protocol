@@ -7,7 +7,7 @@ export function buildTypedMessage({ name, body, contextId, text, messageId = cry
   return {
     kind: "message",
     messageId,
-    role: "agent",
+    role: "user",
     contextId,
     extensions: [EXT_URI],
     parts: [{ kind: "data", data: { [fullKey(name)]: body } }, { kind: "text", text }],

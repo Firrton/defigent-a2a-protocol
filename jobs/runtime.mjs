@@ -102,7 +102,7 @@ export function createJobsRuntime({
   async function evaluate({ name, msg }, contextId, now) {
     if (name === "offer") {
       const existingOffer = store.getOffer(msg.offerId);
-      const openOffersForAgent = msg.from ? store.countOpenOffersForAgent(msg.from.agentId) : 0;
+      const openOffersForAgent = msg.from ? store.countOpenOffersForAgent(msg.from.agentId, now) : 0;
       const tokenAllowed = await reader.isAllowedToken(msg.price.token);
       return { out: handleOffer({ msg, now, config, counts: { openOffersForAgent }, tokenAllowed, existingOffer }), actionContext: contextId };
     }

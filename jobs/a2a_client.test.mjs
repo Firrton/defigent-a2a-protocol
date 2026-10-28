@@ -12,7 +12,7 @@ test("buildTypedMessage uses the 0.3 shape and lists the extension", () => {
   assert.deepEqual(msg, {
     kind: "message",
     messageId: "m-1",
-    role: "agent",
+    role: "user",
     contextId: "of_AbCdEf1234",
     extensions: [EXT_URI],
     parts: [{ kind: "data", data: { "defigent.job.offer": OFFER } }, { kind: "text", text: "An offer." }],

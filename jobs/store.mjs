@@ -150,7 +150,7 @@ export function createJobsStore(db) {
     offerChecked: q(`UPDATE job_offers SET checked_at=? WHERE offer_id=?`),
     offersOpenJobs: q(`SELECT * FROM job_offers WHERE job_id IS NOT NULL AND job_terminal=0
       ORDER BY checked_at IS NOT NULL, checked_at, created_at, rowid LIMIT ?`),
-    offersOpenForAgent: q(`SELECT COUNT(*) AS n FROM job_offers WHERE peer_agent_id=? AND state IN ('open','under_review')`),
+    offersOpenForAgent: q(`SELECT COUNT(*) AS n FROM job_offers WHERE peer_agent_id=? AND state IN ('open','under_review') AND expires_at > ?`),
 
     // ON CONFLICT (not OR IGNORE) so only a duplicate key is a no-op; NOT NULL/CHECK violations still throw.
     actionInsert: q(`INSERT INTO job_actions (action_key, action, payload_json, context_id, state, created_at, updated_at)
@@ -227,8 +227,9 @@ export function createJobsStore(db) {
     openJobOffers(limit) {
       return stmt.offersOpenJobs.all(limit).map(offerFromRow);
     },
-    countOpenOffersForAgent(agentId) {
-      return stmt.offersOpenForAgent.get(agentId).n;
+    // now is Unix seconds (R10); an offer past its expiresAt no longer counts, since nothing writes state 'expired'.
+    countOpenOffersForAgent(agentId, now) {
+      return stmt.offersOpenForAgent.get(agentId, now).n;
     },
 
     enqueueAction({ key, action, payload, contextId, now }) {

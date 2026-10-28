@@ -229,9 +229,13 @@ test("countOpenOffersForAgent counts only open and under_review offers of that a
   s.acceptOffer("of_accept0001", A, 10331, "c", 2);
   s.insertOffer(offer({ offerId: "of_declined01", peerAgentId: 10270, state: "declined" }));
   s.insertOffer(offer({ offerId: "of_other00001", peerAgentId: 10271, state: "open" }));
-  assert.equal(s.countOpenOffersForAgent(10270), 2);
-  assert.equal(s.countOpenOffersForAgent(10271), 1);
-  assert.equal(s.countOpenOffersForAgent(99999), 0);
+  assert.equal(s.countOpenOffersForAgent(10270, 1000), 2);
+  assert.equal(s.countOpenOffersForAgent(10271, 1000), 1);
+  assert.equal(s.countOpenOffersForAgent(99999, 1000), 0);
+  // An 'open' offer whose expires_at <= now is not counted.
+  s.insertOffer(offer({ offerId: "of_stale00001", peerAgentId: 10272, state: "open", expiresAt: 1500 }));
+  assert.equal(s.countOpenOffersForAgent(10272, 1499), 1);
+  assert.equal(s.countOpenOffersForAgent(10272, 1500), 0);
 });
 
 test("transaction rolls back every write when fn throws", () => {

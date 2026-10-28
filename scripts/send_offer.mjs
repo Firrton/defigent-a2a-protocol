@@ -100,7 +100,7 @@ const runtime = createJobsRuntime({
   db, config, reader: createChainReader({ config, rpcUrl: process.env.RPC_URL || "https://rpc.monad.xyz" }), log: (...a) => console.error(...a),
 });
 
-const open = runtime.store.countOpenOffersForAgent(agentId);
+const open = runtime.store.countOpenOffersForAgent(agentId, now);
 if (open >= config.caps.maxOpenOffersPerAgent) die(`agent ${agentId} already has ${open} open offers (caps.maxOpenOffersPerAgent ${config.caps.maxOpenOffersPerAgent})`);
 
 runtime.store.insertOffer({
@@ -128,6 +128,8 @@ if (sent.result !== undefined) {
   }
 }
 
+// No new state on failure: the offer stays 'open' until expiresAt, after which countOpenOffersForAgent ignores it.
+if (sent.status === 0 || sent.result === undefined) console.error(`send failed; offer stays open until ${offer.expiresAt}`);
 console.log(JSON.stringify({ offerId, endpoint: args.endpoint, httpStatus: sent.status, ...(sent.error ? { error: sent.error } : {}), offerState: runtime.store.getOffer(offerId)?.state, replies }, null, 2));
 db.close();
 process.exit(sent.error ? 2 : 0);
