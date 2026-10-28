@@ -112,6 +112,7 @@ function logInbox(entry) {
 }
 
 // ---------- A2A agent card (well-known standard) ----------
+const IDENTITY_EXTENSION = { uri: "defigent:identity-eip712@v1", description: "Messages may carry params.auth {address,signature,timestamp,nonce} — EIP-712 signed identity (chainId 143). Verified replies set verified:true." };
 app.get("/.well-known/agent-card.json", (_req, res) => {
   res.json({
     name: "Defigent",
@@ -125,15 +126,15 @@ app.get("/.well-known/agent-card.json", (_req, res) => {
     ],
     address: PAY_TO,
     agentWallet: PAY_TO,
-    capabilities: { streaming: true, pushNotifications: false, stateTransitionHistory: true, extendedAgentCard: true },
+    capabilities: { streaming: true, pushNotifications: false, stateTransitionHistory: true, extendedAgentCard: true, extensions: [JOBS_EXTENSION, IDENTITY_EXTENSION] },
     securitySchemes: {},
-    extensions: [{ uri: "defigent:identity-eip712@v1", description: "Messages may carry params.auth {address,signature,timestamp,nonce} — EIP-712 signed identity (chainId 143). Verified replies set verified:true." }],
+    extensions: [IDENTITY_EXTENSION], // kept at top level for clients that read it there
     documentationUrl: `${BASE}/integration`,
     defaultInputModes: ["text/plain", "application/json"],
     defaultOutputModes: ["text/plain", "application/json"],
     skills: [
       { id: "digest", name: "Wallet digest", description: "On-chain balance digest for any address (Monad MON+USDC / Base ETH+USDC). Paid $0.001 USDC via x402 (Monad or Base).", tags: ["analytics", "monad", "base", "x402"] },
-      { id: "jobs", name: "Agentic jobs (ERC-8183)", description: "Escrowed agent jobs on our ERC-8183 deployment 0x61625eA32DaD03403db27cd94D6D3FE23b4A4a65 (Monad, fees 0/0). Negotiate over this inbox; the contract settles.", tags: ["jobs", "erc-8183", "escrow"] },
+      { id: "jobs", name: "Agentic jobs (ERC-8183)", description: "Escrowed agent jobs on our ERC-8183 deployment 0x61625eA32DaD03403db27cd94D6D3FE23b4A4a65 (Monad, fees 0/0). Negotiate over this inbox; the contract settles. Typed messages: " + EXT_URI, tags: ["jobs", "erc-8183", "escrow"] },
       { id: "agent-lookup", name: "Agent lookup", description: "Read any ERC-8004 agent registration from the Monad identity registry. Free.", tags: ["directory", "erc8004"] },
       { id: "status", name: "Status", description: "Live heartbeat: latency, uptime, balances, prices. Free.", tags: ["infra"] },
     ],
@@ -153,7 +154,7 @@ import { verifyTypedData, keccak256, toHex } from "viem";
 import { loadJobsConfig } from "./jobs/config.mjs";
 import { createChainReader } from "./jobs/chain.mjs";
 import { createJobsRuntime } from "./jobs/runtime.mjs";
-import { NAMES as JOB_NAMES, fullKey as jobKey } from "./jobs/protocol.mjs";
+import { EXT_URI, NAMES as JOB_NAMES, fullKey as jobKey } from "./jobs/protocol.mjs";
 import { chainUnavailable, extensionsEcho, invalidParams, negotiateVersion, sseFrame, typedResult } from "./jobs/wire.mjs";
 
 const A2A_DB = `${DATA_DIR}/defigent_a2a.db`;
@@ -268,6 +269,18 @@ const JOBS_CONFIG = loadJobsConfig();
 // The runtime's and its sweep's log lines (invalid claims, rejected claims, failed wakes) go to the inbox log; a body that comes with one is not logged.
 const logJobs = (msg) => logInbox({ ts: Date.now(), cls: "jobs_log", msg: String(msg).slice(0, 200) });
 const jobs = createJobsRuntime({ db: a2a, config: JOBS_CONFIG, reader: createChainReader({ config: JOBS_CONFIG, rpcUrl: RPC }), onAction: wakeTypedAction, onTaskUpdate: applyTypedTaskUpdate, log: logJobs });
+
+// The extension as the card declares it (capabilities.extensions), its JSON Schema (generated from the zod schemas the inbox validates with)
+// and its public spec. The spec is read next to this file, not from the cwd.
+const JOBS_EXTENSION = {
+  uri: EXT_URI,
+  description: "Typed ERC-8183 job offers and lifecycle messages as A2A DataParts.",
+  required: false,
+  params: { chainId: JOBS_CONFIG.chainId, escrow: JOBS_CONFIG.escrow, tokens: Object.values(JOBS_CONFIG.tokens).map((t) => t.address), schema: JOBS_CONFIG.schemaUrl },
+};
+const JOBS_SPEC_MD = fs.readFileSync(new URL("./docs/a2a-ext-erc8183-jobs-v1.md", import.meta.url), "utf8");
+app.get("/schemas/erc8183-jobs-v1.json", (_req, res) => res.json(jobs.jsonSchema()));
+app.get("/a2a/ext/erc8183-jobs/v1", (_req, res) => res.type("text/markdown; charset=utf-8").send(JOBS_SPEC_MD));
 
 // The stored meta of an agent message that carries a typed reply: the same {data, files} shape as the sender's parts.
 const typedMeta = (name, body) => (name ? JSON.stringify({ data: [{ [jobKey(name)]: body }], files: [] }) : null);
@@ -1303,7 +1316,15 @@ app.get("/integration", (_req, res) => {
     summary: "Defigent (ERC-8004 agentId 10331) runs the first standard A2A inbox and x402 payment storefront on Monad mainnet — now at A2A spec v1.0.1 parity (dual wire format 0.3.0+1.0, streaming SSE, DataPart/FilePart, artifacts, standard errors). Any agent (or its operator) can integrate in minutes.",
     a2a_spec_version: "1.0.1",
     wire_formats_accepted: ["0.3.0 (no header needed)", "1.0 / 1.0.1 (header A2A-Version)"],
+    jobs_protocol_v1: {
+      extension: EXT_URI,
+      schema: JOBS_CONFIG.schemaUrl,
+      spec: `${BASE}/a2a/ext/erc8183-jobs/v1`,
+      example_query: '{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{"role":"ROLE_USER","messageId":"<unique-id>","extensions":["' + EXT_URI + '"],"parts":[{"data":{"defigent.job.query":{"jobId":"42"}}}]}}}',
+      example_accept: '{"jsonrpc":"2.0","id":2,"method":"SendMessage","params":{"message":{"role":"ROLE_USER","messageId":"<unique-id>","contextId":"of_7Hq2kd9xTa","extensions":["' + EXT_URI + '"],"parts":[{"text":"Accepting offer of_7Hq2kd9xTa."},{"data":{"defigent.job.accept":{"offerId":"of_7Hq2kd9xTa","party":{"address":"<your checksummed address>","agentId":10270}}}}]}}}',
+    },
     offer_schema_v1: {
+      status: "legacy: still accepted, normalized to defigent.job.offer",
       description: "Send structured, machine-readable offers as a DataPart — Defigent parses them natively (no free-text guessing):",
       example: '{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{"role":"agent","parts":[{"text":"service proposal"},{"data":{"intent":"offer","service":"your-service","price":"1.00","asset":"USDC","expiry":1792000000000,"terms":"what you deliver"}}],"messageId":"<unique-id>"}}}',
       fields: "intent=offer (required) | service (required) | price (required) | asset (default USDC) | expiry (ms epoch) | terms | evidence",

@@ -329,11 +329,15 @@ describe("probes: the nine production probes replayed locally", { timeout: 12000
     assert.equal(r.json.address, "0x940ecB27d8f4F7009c8BC12969496E9639717638");
     assert.equal(r.json.agentWallet, r.json.address);
     // GAP(G12): stateTransitionHistory:true has no backing (tasks store only the current state); streaming:true is a one-shot replay (G5)
-    assert.deepEqual(r.json.capabilities, { streaming: true, pushNotifications: false, stateTransitionHistory: true, extendedAgentCard: true });
-    // GAP(G8): securitySchemes is empty although the inbox has an identity mechanism; the extension sits at top level, not in capabilities.extensions (G12)
+    // typed jobs protocol (R18): capabilities now also declares the extensions (G12 fixed for the extensions part)
+    const { extensions: capabilityExtensions, ...capabilities } = r.json.capabilities;
+    assert.deepEqual(capabilities, { streaming: true, pushNotifications: false, stateTransitionHistory: true, extendedAgentCard: true });
+    // GAP(G8): securitySchemes is empty although the inbox has an identity mechanism
     assert.deepEqual(r.json.securitySchemes, {});
+    // the top-level array is kept for compatibility
     assert.deepEqual(r.json.extensions.map((e) => e.uri), ["defigent:identity-eip712@v1"]);
-    assert.equal(r.json.capabilities.extensions, undefined);
+    // typed jobs protocol (R18): the extensions sit in capabilities.extensions (G12 fixed)
+    assert.deepEqual(capabilityExtensions.map((e) => e.uri), [EXT_URI, "defigent:identity-eip712@v1"]);
     // origin/main: the ERC-8183 escrow is a skill ("jobs") and the agent is also registered on Base (ERC-8004 agentId 114426)
     assert.deepEqual(r.json.skills.map((s) => s.id), ["digest", "jobs", "agent-lookup", "status"]);
     assert.deepEqual(r.json.registration, { agentId: 10331, registry: "eip155:143:0x8004A169FB4a3325136EB29fA0ceB6D2e539a432" });
@@ -3045,5 +3049,64 @@ describe("typed jobs protocol: chain unavailable", { timeout: 120000 }, () => {
     ] } });
     assert.equal((await h.get("/tasks/t-tu-1")).status, 404); // nothing persisted
     assert.equal(h.readJsonl("defigent_wake_queue.jsonl").length, 0);
+  });
+});
+
+describe("typed jobs protocol: card, schema and spec", { timeout: 120000 }, () => {
+  let h;
+  before(async () => { h = await Harness.start(); });
+  after(async () => { await h?.stop(); });
+
+  it("the card declares the jobs extension in capabilities.extensions and keeps the top-level array", async () => {
+    const card = (await h.get("/.well-known/agent-card.json")).json;
+    const identity = { uri: "defigent:identity-eip712@v1", description: "Messages may carry params.auth {address,signature,timestamp,nonce} — EIP-712 signed identity (chainId 143). Verified replies set verified:true." };
+    assert.deepEqual(card.capabilities.extensions, [
+      {
+        uri: EXT_URI,
+        description: "Typed ERC-8183 job offers and lifecycle messages as A2A DataParts.",
+        required: false,
+        params: { chainId: 143, escrow: JOBS_CONFIG.escrow, tokens: [JOBS_CONFIG.tokens.USDC.address], schema: "https://defigent.app/schemas/erc8183-jobs-v1.json" },
+      },
+      identity,
+    ]);
+    assert.deepEqual(card.extensions, [identity]);
+    const jobsSkill = card.skills.find((s) => s.id === "jobs");
+    assert.equal(jobsSkill.description, `Escrowed agent jobs on our ERC-8183 deployment 0x61625eA32DaD03403db27cd94D6D3FE23b4A4a65 (Monad, fees 0/0). Negotiate over this inbox; the contract settles. Typed messages: ${EXT_URI}`);
+  });
+
+  it("GET /schemas/erc8183-jobs-v1.json lists the 13 keys", async () => {
+    const r = await h.get("/schemas/erc8183-jobs-v1.json");
+    assert.equal(r.status, 200);
+    assert.equal(r.headers["content-type"], "application/json; charset=utf-8");
+    assert.equal(r.json.$schema, "https://json-schema.org/draft/2020-12/schema");
+    const keys = ["offer", "accept", "decline", "created", "budget_set", "funded", "submitted", "completed", "rejected", "expired", "query", "status", "error"].map((n) => `defigent.job.${n}`);
+    assert.deepEqual(r.json.anyOf.map((s) => Object.keys(s.properties)), keys.map((k) => [k]));
+    assert.deepEqual(r.json.anyOf.map((s) => s.required), keys.map((k) => [k]));
+  });
+
+  it("GET /a2a/ext/erc8183-jobs/v1 serves the markdown spec with the URI", async () => {
+    const r = await h.get("/a2a/ext/erc8183-jobs/v1");
+    assert.equal(r.status, 200);
+    assert.match(r.headers["content-type"], /^text\/markdown; charset=utf-8/);
+    assert.equal(r.text, readFileSync(join(ROOT, "docs/a2a-ext-erc8183-jobs-v1.md"), "utf8"));
+    assert.ok(r.text.includes(EXT_URI));
+    for (const name of ["offer", "accept", "decline", "created", "budget_set", "funded", "submitted", "completed", "rejected", "expired", "query", "status", "error"]) {
+      assert.ok(r.text.includes(`defigent.job.${name}`), `the spec documents defigent.job.${name}`);
+    }
+  });
+
+  it("/integration documents jobs_protocol_v1 and marks offer_schema_v1 as legacy", async () => {
+    const r = (await h.get("/integration")).json;
+    const p = r.jobs_protocol_v1;
+    assert.deepEqual(Object.keys(p), ["extension", "schema", "spec", "example_query", "example_accept"]);
+    assert.equal(p.extension, EXT_URI);
+    assert.equal(p.schema, "https://defigent.app/schemas/erc8183-jobs-v1.json");
+    assert.equal(p.spec, "https://defigent.app/a2a/ext/erc8183-jobs/v1");
+    const q = JSON.parse(p.example_query);
+    assert.deepEqual(q.params.message.parts.find((part) => part.data).data, { "defigent.job.query": { jobId: "42" } });
+    assert.deepEqual(q.params.message.extensions, [EXT_URI]);
+    const a = JSON.parse(p.example_accept);
+    assert.deepEqual(Object.keys(a.params.message.parts.find((part) => part.data).data), ["defigent.job.accept"]);
+    assert.equal(r.offer_schema_v1.status, "legacy: still accepted, normalized to defigent.job.offer");
   });
 });
