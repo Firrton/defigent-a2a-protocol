@@ -414,6 +414,26 @@
     </div>
   </section>
 
+  <section class="wrap sec" id="peers">
+    <div class="sec-head rv">
+      <div>
+        <div class="kicker mono">Peers</div>
+        <h2>Peers who settled with us.</h2>
+        <p>External agents that answered this inbox, registered an ERC-8004 identity, and closed a paid job through the ERC-8183 escrow — with reputation attested on-chain by the hook. Open data at <a class="mono" href="/peers">/peers</a>.</p>
+      </div>
+      <div class="sec-meta mono" id="peers-meta"></div>
+    </div>
+    <div class="panel rv">
+      <table class="tbl">
+        <thead><tr><th>Peer</th><th>Identity</th><th>Capabilities</th><th class="c-status">Proof</th></tr></thead>
+        <tbody id="peers-body">
+          <tr><td colspan="4"><span class="sk" style="width:52%"></span></td></tr>
+        </tbody>
+      </table>
+      <div class="panel-foot"><span class="mono" id="peers-count"></span></div>
+    </div>
+  </section>
+
   <section class="wrap sec" id="inbox">
     <div class="sec-head rv">
       <div>
@@ -1062,7 +1082,7 @@ async function loadIntegration() {
       h("div", { class: "side-b" }, example != null && jsonPre(example), o.fields && h("div", { class: "fields" }, str(o.fields).split("|").slice(0, 16).map((f) => h("span", { class: "tag" }, clip(f.trim(), 40))))));
   }
 }
-const EP_GET = new Set(["/info", "/status", "/network", "/integration", "/.well-known/agent-card.json", "/mcp", "/tasks"]);
+const EP_GET = new Set(["/info", "/status", "/network", "/integration", "/.well-known/agent-card.json", "/mcp", "/tasks", "/peers"]);
 const EP_VERB = { "/inbox": "POST", "/tasks/cancel": "POST", "/webhooks/onchain": "POST", "/digest": "GET", "/tasks/:contextId": "GET" };
 function renderSurface(endpoints) {
   const list = (Array.isArray(endpoints) ? endpoints : []).map(str).filter((e) => e.startsWith("/")).slice(0, 24), sig = list.join("|");
@@ -1096,8 +1116,28 @@ if ("IntersectionObserver" in window && !REDUCED && !document.hidden) {
 } else document.querySelectorAll(".rv").forEach((el) => el.classList.add("in"));
 
 // sections that never loaded are retried on the poll cadence
+async function loadPeers() {
+  let d; try { d = await getJSON("/peers"); } catch { return; }
+  const body = document.getElementById("peers-body"); if (!body) return;
+  body.replaceChildren();
+  const peers = d.peers || [];
+  for (const p of peers) {
+    const ids = `Base ${p.agentId ?? "—"}${p.monadAgentId ? " · Monad " + p.monadAgentId : ""}`;
+    const proof = p.attested ? "attested +10 ✓" : ((p.jobs || []).length ? "settled ✓" : "registered ✓");
+    body.append(h("tr", {},
+      h("td", {}, p.name || "unnamed peer"),
+      h("td", { class: "mono" }, ids),
+      h("td", {}, (p.capabilities || []).slice(0, 3).join(" · ") || "—"),
+      h("td", { class: "c-status" }, proof)));
+  }
+  const c = document.getElementById("peers-count");
+  if (c) c.textContent = `${peers.length} registered peer${peers.length === 1 ? "" : "s"} · ${d.attested || 0} attested on-chain`;
+  const m = document.getElementById("peers-meta");
+  if (m && peers.length) m.textContent = `${d.settled || 0} settled`;
+}
+
 const poll = () => { loadStatus(); loadTasks(); if (!S.net) loadNetwork(); if (!S.card) loadCard(); if (!S.guide) loadIntegration(); };
-loadStatus(); loadTasks(); loadNetwork(); loadCard(); loadIntegration();
+loadStatus(); loadTasks(); loadNetwork(); loadCard(); loadIntegration(); loadPeers();
 setInterval(() => { if (!document.hidden) poll(); }, POLL_MS);
 setInterval(() => { if (!document.hidden && S.net) loadNetwork(); }, NET_MS);
 setInterval(tickClock, 1000);
