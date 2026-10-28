@@ -30,6 +30,8 @@ test("loads data/jobs-config.json with checksummed addresses and bigint caps", (
   assert.equal(c.rpcTimeoutMs, 3000);
   assert.equal(c.sweepMs, 60000);
   assert.deepEqual(c.tokens.USDC, { address: "0x754704Bc059F8C67012fEd69BC8A327a5aafb603", decimals: 6 });
+  assert.equal(c.inboxUrl, "https://defigent.app/inbox");
+  assert.equal(c.schemaUrl, "https://defigent.app/schemas/erc8183-jobs-v1.json");
 });
 
 test("env overrides sweep interval, rpc timeout and hook", () => {
