@@ -1765,6 +1765,34 @@ describe("trust enrichment for signed senders that name an agentId (stub RPC)", 
   });
 });
 
+// /status awaited both RPCs one after the other with no time limit of its own: an RPC that accepts the connection and
+// never answers held the health endpoint (and the dashboard that polls it) for minutes.
+describe("GET /status with RPCs that never answer", { timeout: 60000 }, () => {
+  let h, hang; const sockets = new Set();
+  before(async () => {
+    hang = http.createServer(() => {}); // accepts every request and never answers
+    hang.on("connection", (s) => { sockets.add(s); s.on("close", () => sockets.delete(s)); });
+    await new Promise((r) => hang.listen(0, "127.0.0.1", r));
+    const url = `http://127.0.0.1:${hang.address().port}`;
+    h = await Harness.start({ rpcUrl: url, baseRpcUrl: url });
+  });
+  after(async () => { await h?.stop(); for (const s of sockets) s.destroy(); await new Promise((r) => hang ? hang.close(r) : r()); });
+
+  it("answers within the RPC timeout, both heads unknown, and waits on the two RPCs at once", async () => {
+    const t0 = Date.now();
+    const r = await h.get("/status");
+    const elapsed = Date.now() - t0;
+    assert.equal(r.status, 200);
+    // one 3 s timeout, not two in a row
+    assert.ok(elapsed < 5000, `took ${elapsed} ms`);
+    assert.equal(r.json.head_block, null);
+    assert.equal(r.json.rpc_latency_ms, null);
+    assert.equal(r.json.chains.base.head_block, null);
+    assert.equal(r.json.chains.base.rpc_latency_ms, null);
+    assert.equal(r.json.inbox_messages, 0);
+  });
+});
+
 // ---------------------------------------------------------------------------------------------------------------------
 // 9. Rate limit — the only group that sends an 11th request, in its own process
 // ---------------------------------------------------------------------------------------------------------------------
