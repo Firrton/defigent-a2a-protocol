@@ -78,6 +78,8 @@ export function offerNext(offer, now) {
   switch (offer.state) {
     case "accepted":
       if (offer.jobId != null) return none(`Job ${offer.jobId} exists; its on-chain state decides the next step.`);
+      // The job's expiredAt is the offer's expiresAt, so createJob reverts (ExpiryTooShort) once it has passed.
+      if (now >= offer.expiresAt) return none("The offer was accepted but no job was created before it expired.");
       return { actor: "client", ours: ourSide(offer) === "client", action: "create_job", note: "The offer was accepted. The client creates the job on the escrow." };
     case "declined":
       return none("The offer was declined.");
@@ -93,8 +95,9 @@ export function taskStateFor({ next, job, offer }) {
   if (job?.status === "Rejected" || job?.status === "Expired") return "failed";
   if (!job && offer) {
     if (offer.state === "declined") return offer.direction === "out" ? "completed" : "rejected";
-    // An open offer only loses its actor by passing expiresAt before the ledger marks it expired.
-    if (offer.state === "expired" || ((offer.state === "open" || offer.state === "under_review") && next?.actor === null)) return "failed";
+    // An open offer, or an accepted one with no job, only loses its actor by passing expiresAt before the ledger marks it expired.
+    const lapsable = offer.state === "open" || offer.state === "under_review" || (offer.state === "accepted" && offer.jobId == null);
+    if (offer.state === "expired" || (lapsable && next?.actor === null)) return "failed";
   }
   return next?.ours ? "working" : "input-required";
 }

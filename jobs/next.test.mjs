@@ -150,6 +150,10 @@ test("taskStateFor follows the offer state when there is no job", () => {
   assert.equal(taskStateFor({ next: offerNext(waiting, T), job: null, offer: waiting }), "input-required");
   const toCreate = offerRow({ state: "accepted", jobId: null });
   assert.equal(taskStateFor({ next: offerNext(toCreate, T), job: null, offer: toCreate }), "working");
+  assert.equal(taskStateFor({ next: offerNext(toCreate, EXPIRED_AT), job: null, offer: toCreate }), "failed");
+  // An accepted offer whose job is recorded but not loaded is not a lapsed offer.
+  const built = offerRow({ state: "accepted", jobId: "42" });
+  assert.equal(taskStateFor({ next: offerNext(built, EXPIRED_AT), job: null, offer: built }), "input-required");
 });
 
 test("offerNext covers open, under_review, accepted and declined", () => {
@@ -162,6 +166,13 @@ test("offerNext covers open, under_review, accepted and declined", () => {
   // Open or under review past expiresAt: nobody acts any more.
   assert.deepEqual(pick(offerNext(offerRow({ direction: "out", state: "open", jobId: null }), EXPIRED_AT)), { actor: null, ours: false, action: undefined });
   assert.deepEqual(pick(offerNext(inbound, EXPIRED_AT)), { actor: null, ours: false, action: undefined });
+  // Accepted but the job was never created before expiresAt: create_job would revert, nobody acts.
+  const unbuilt = offerRow({ state: "accepted", jobId: null });
+  assert.deepEqual(pick(offerNext(unbuilt, EXPIRED_AT - 1)), { actor: "client", ours: true, action: "create_job" });
+  assert.deepEqual(pick(offerNext(unbuilt, EXPIRED_AT)), { actor: null, ours: false, action: undefined });
+  assert.deepEqual(pick(offerNext(unbuilt, EXPIRED_AT + 86400)), { actor: null, ours: false, action: undefined });
+  // With a job on record the chain decides, whatever the clock says.
+  assert.equal(offerNext(offerRow({ state: "accepted", jobId: "42" }), EXPIRED_AT + 86400).note, "Job 42 exists; its on-chain state decides the next step.");
   for (const state of ["open", "under_review", "accepted", "declined", "expired"]) assert.equal(typeof offerNext(offerRow({ state, jobId: null }), T).note, "string");
 });
 
