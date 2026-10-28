@@ -1726,7 +1726,7 @@ describe("trust enrichment for signed senders that name an agentId (stub RPC)", 
   it("GET /status reports the head block from the RPC and counts inbox messages", async () => {
     const r = await h.get("/status");
     assert.equal(r.status, 200);
-    assert.deepEqual(Object.keys(r.json), ["service", "uptime_s", "rpc_latency_ms", "head_block", "chains", "inbox_messages", "endpoints", "registration", "registrationBase"]);
+    assert.deepEqual(Object.keys(r.json), ["service", "uptime_s", "rpc_latency_ms", "head_block", "chains", "inbox_messages", "network_directory", "endpoints", "registration", "registrationBase"]);
     assert.equal(r.json.head_block, "16");
     assert.equal(typeof r.json.rpc_latency_ms, "number");
     assert.equal(r.json.inbox_messages, 5);
@@ -1746,6 +1746,22 @@ describe("trust enrichment for signed senders that name an agentId (stub RPC)", 
     const r = await h.get("/status");
     assert.equal(r.status, 200);
     assert.equal(r.json.inbox_messages, 5);
+  });
+
+  // production served a 22-hour-old directory while every rebuild failed, and nothing outside the journal said so
+  it("GET /status reports a failed network-directory rebuild instead of hiding it", async () => {
+    // this stub reverts every tokenURI read, so the start-up scan finds no agents and the rebuild is refused
+    let d;
+    for (let i = 0; i < 50 && !d?.last_rebuild_error; i++) { d = (await h.get("/status")).json.network_directory; if (!d?.last_rebuild_error) await sleep(100); }
+    assert.deepEqual(Object.keys(d), ["updated_at", "agents", "last_rebuild_ok", "last_rebuild_ok_at", "last_rebuild_error"]);
+    assert.equal(d.last_rebuild_ok, false);
+    assert.equal(d.last_rebuild_ok_at, null);
+    assert.deepEqual(Object.keys(d.last_rebuild_error), ["at", "message"]);
+    assert.match(d.last_rebuild_error.message, /^scan returned 0 agents/);
+    assert.ok(Date.now() - Date.parse(d.last_rebuild_error.at) < 120000);
+    // the directory still served is the last good one (the committed seed or a local rebuild), never an empty one
+    assert.ok(d.agents > 0);
+    assert.ok(Date.parse(d.updated_at) > 0);
   });
 });
 
