@@ -1278,6 +1278,24 @@ app.get("/network/refresh", async (_req, res) => {
   res.json({ queued: true, hint: wait ? `directory rebuild from the ERC-8004 registry queued, runs in ~${Math.ceil(wait / 60000)} min (one scan per 10 min)` : "directory rebuild from the ERC-8004 registry started" });
 });
 
+// ---------- Registered peers (external agents that settled with us) ----------
+app.get("/peers", (_req, res) => {
+  try {
+    const raw = JSON.parse(fs.readFileSync("/home/ubuntu/defigent-mcp/data/providers.json", "utf8"));
+    const peers = Array.isArray(raw.peers) ? raw.peers : [];
+    res.json({
+      name: "Defigent Peer Registry",
+      description: "External agents that answered the Defigent inbox, registered an ERC-8004 identity, and settled jobs through the ERC-8183 escrow.",
+      count: peers.length,
+      settled: peers.filter(p => (p.jobs || []).length).length,
+      attested: peers.filter(p => p.attested).length,
+      peers,
+    });
+  } catch {
+    res.json({ count: 0, settled: 0, attested: 0, peers: [] });
+  }
+});
+
 // ---------- Integration guide (adoption) ----------
 app.get("/integration", (_req, res) => {
   res.json({

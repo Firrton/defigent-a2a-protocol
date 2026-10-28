@@ -5,7 +5,7 @@ import json, urllib.request, time, sys
 
 BATCH = int(sys.argv[1]) if len(sys.argv) > 1 else 50
 SKIP = int(sys.argv[2]) if len(sys.argv) > 2 else 0
-_data = json.load(open('/home/ubuntu/.hermes/cache/scratch/taifoon_a2a_alive.json'))
+_data = json.load(open('/home/ubuntu/defigent-data/taifoon_a2a_alive.json'))
 rows = _data['rows'] if isinstance(_data, dict) and 'rows' in _data else _data
 OFFER = (
     "We paid a real agent job on Monad mainnet this week (escrow ERC-8183, 0% fees) and we want YOU as the next provider.\n\n"

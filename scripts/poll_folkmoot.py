@@ -2,7 +2,7 @@
 """Defigent — poll de respuestas a la oferta (Folkmoot devolvió COMPLETED)."""
 import json, urllib.request, time
 
-rows = json.load(open('/home/ubuntu/.hermes/cache/scratch/taifoon_a2a_alive.json'))['rows']
+rows = json.load(open('/home/ubuntu/defigent-data/taifoon_a2a_alive.json'))['rows']
 fm = next(r for r in rows if 'Folkmoot' in str(r.get('name')))
 url = (fm.get('url') or '').rstrip('/')
 body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "message/send", "params": {"message": {

@@ -7,7 +7,7 @@ import path from "node:path";
 import http from "node:http";
 import {
   readDirectory, resolveDirectory, isPublicAddress, parseRegistration, fetchRegistration,
-  httpsGetText, decodeAbiString, scanRegistry, rebuildDirectory,
+  httpsGetText, decodeAbiString, scanRegistry, rebuildDirectory, pacer, RPC_PER_SEC,
 } from "./network_directory.mjs";
 
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), "defigent-net-"));
@@ -23,6 +23,8 @@ const registry = (uris) => async (_to, data) => {
   return id in uris ? abiString(uris[id]) : revert();
 };
 const agent = (agentId, extra = {}) => ({ agentId, name: "a" + agentId, inbox: null, x402: false, services: [], welcomeTx: null, status: "known", ...extra });
+const instant = async () => {};     // sleep that returns at once: pacing and backoff cost no wall time
+const rateLimited = () => new Error('{"code":-32007,"message":"50/second request limit reached"}');
 
 // ---------- what /network serves ----------
 test("regression: a missing lead-monitor cache no longer empties the directory", () => {
@@ -206,13 +208,59 @@ test("scanRegistry re-reads a registration file at most daily and keeps the last
 
 test("scanRegistry aborts on an RPC failure instead of mistaking it for the end of the registry", async () => {
   const flaky = async (_to, data) => { const id = Number(BigInt("0x" + data.slice(10))); if (id === 3) throw new Error("fetch failed"); return abiString(""); };
-  await assert.rejects(scanRegistry({ ethCall: flaky, firstId: 1, fetchReg: async () => null }), /registry read failed at agentId 3/);
-  await assert.rejects(scanRegistry({ ethCall: async () => "0x", firstId: 1, fetchReg: async () => null }), /registry read failed/);
+  await assert.rejects(scanRegistry({ ethCall: flaky, firstId: 1, fetchReg: async () => null, sleep: instant }), /registry read failed at agentId 3/);
+  await assert.rejects(scanRegistry({ ethCall: async () => "0x", firstId: 1, fetchReg: async () => null, sleep: instant }), /registry read failed/);
+});
+
+test("pacer spaces concurrent callers evenly, so no second holds more calls than the rate", async () => {
+  const waits = [];
+  const pace = pacer(20, { now: () => 0, sleep: async (ms) => { waits.push(ms); } });
+  await Promise.all(Array.from({ length: 41 }, () => pace()));
+  assert.deepEqual(waits, Array.from({ length: 40 }, (_, i) => (i + 1) * 50));
+});
+
+test("pacer gives no burst credit for idle time", async () => {
+  let t = 0;
+  const waits = [];
+  const pace = pacer(20, { now: () => t, sleep: async (ms) => { waits.push(ms); } });
+  await pace(); await pace();
+  t = 10_000;
+  await pace(); await pace();
+  assert.deepEqual(waits, [50, 50]);
+});
+
+// Production, 2026-10-27/28: every rebuild died at ~agentId 10377 with QuickNode's -32007, because the scan fired its
+// reads as fast as the RPC answered (hundreds per second) and retried them at once, inside the same second.
+test("regression: a scan stays under the RPC's 50 calls/s limit instead of dying on -32007", async () => {
+  const clock = { t: 0 };
+  const sleep = async (ms) => { clock.t += ms; };
+  const inner = registry(Object.fromEntries(Array.from({ length: 120 }, (_, i) => [1 + i, ""])));
+  const stamps = [];
+  const quicknode = async (to, data) => {
+    stamps.push(clock.t);
+    if (stamps.filter((s) => clock.t - s < 1000).length > 50) throw rateLimited();
+    return inner(to, data);
+  };
+  const d = await scanRegistry({ ethCall: quicknode, firstId: 1, fetchReg: async () => null, sleep, pace: pacer(RPC_PER_SEC, { now: () => clock.t, sleep }) });
+  assert.equal(d.agents.length, 120);
+});
+
+test("scanRegistry backs off on a rate-limited read and retries instead of aborting the rebuild", async () => {
+  let refusals = 3;
+  const waits = [];
+  const inner = registry({ 1: "", 2: "" });
+  const busy = async (to, data) => {
+    if (Number(BigInt("0x" + data.slice(10))) === 2 && refusals-- > 0) throw rateLimited();
+    return inner(to, data);
+  };
+  const d = await scanRegistry({ ethCall: busy, firstId: 1, fetchReg: async () => null, pace: instant, sleep: async (ms) => { waits.push(ms); } });
+  assert.deepEqual(d.agents.map((a) => a.agentId), [1, 2]);
+  assert.deepEqual(waits, [500, 1000, 2000]);
 });
 
 test("scanRegistry is bounded: a registry that never ends is cut at the cap, flagged, and reads a limited number of files", async () => {
   let fetches = 0;
-  const d = await scanRegistry({ ethCall: async () => abiString("https://spam.example/r.json"), firstId: 1, fetchReg: async () => { fetches++; return null; } });
+  const d = await scanRegistry({ ethCall: async () => abiString("https://spam.example/r.json"), firstId: 1, fetchReg: async () => { fetches++; return null; }, sleep: instant });
   assert.equal(d.agents.length, 1500);
   assert.equal(d.truncated, true);
   assert.ok(fetches <= 246, String(fetches));
@@ -236,7 +284,7 @@ test("rebuildDirectory never replaces a good directory with an empty or collapse
   await assert.rejects(rebuildDirectory({ ethCall: registry({ 1: "", 2: "" }), file, firstId: 1, fetchReg: async () => null }), /scan returned 2 agents \(had 5\)/);
   // an RPC node that lags: the scan ends below the newest id we already knew
   await assert.rejects(rebuildDirectory({ ethCall: registry({ 1: "", 2: "", 3: "", 4: "" }), file, firstId: 1, fetchReg: async () => null }), /scan returned 4 agents \(had 5\) up to id 4/);
-  await assert.rejects(rebuildDirectory({ ethCall: async () => { throw new Error("ECONNRESET"); }, file, firstId: 1, fetchReg: async () => null }), /registry read failed/);
+  await assert.rejects(rebuildDirectory({ ethCall: async () => { throw new Error("ECONNRESET"); }, file, firstId: 1, fetchReg: async () => null, sleep: instant }), /registry read failed/);
   assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), good);
 });
 

@@ -3,7 +3,7 @@
 import json, urllib.request, time, sys
 
 BATCH = int(sys.argv[1]) if len(sys.argv) > 1 else 12
-_data = json.load(open('/home/ubuntu/.hermes/cache/scratch/taifoon_a2a_alive.json'))
+_data = json.load(open('/home/ubuntu/defigent-data/taifoon_a2a_alive.json'))
 rows = _data['rows'] if isinstance(_data, dict) and 'rows' in _data else _data
 TEXT = ("Hello from Defigent (ERC-8004 agentId 10331 on Monad, 114426 on Base). We run a standard A2A inbox "
         "(EIP-712 signed senders, tasks, SSE streaming) + an ERC-8183 escrow with an auto-reputation hook "
