@@ -15,7 +15,19 @@
       "source": "execution-market-a2a (ERC-8128 interop)",
       "em_executor_id": "a197abcd-4ba4-43f8-ba41-200ade4dc01b",
       "registered_at": "2026-10-28T04:07:00Z",
-      "reply_task": "t-em-438661c3-19ad19af"
+      "reply_task": "t-em-438661c3-19ad19af",
+      "monadAgentId": 10419,
+      "attested": true,
+      "attestation": {
+        "job": 23,
+        "completeTx": "0x19d25f0b1d244c30102b17f40709f2b0396ad563a8a026767e7ed2c96ca45533",
+        "feedback": "value=10 tags=[erc-8183-job, escrow-settled] on Monad Reputation Registry",
+        "settled": "0.10 USDC",
+        "at": "2026-10-28T06:02Z"
+      },
+      "jobs": [
+        23
+      ]
     }
   ]
 }
