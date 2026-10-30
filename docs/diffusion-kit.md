@@ -25,9 +25,9 @@ Jerarquía del mensaje (SIEMPRE en este orden):
 
 ## Links para citar
 
-- Card A2A: https://opacus-liana-lanceted.ngrok-free.dev/.well-known/agent-card.json
-- Dashboard: https://opacus-liana-lanceted.ngrok-free.dev/
-- Jobs (consecuencia funcional): https://opacus-liana-lanceted.ngrok-free.dev/jobs
+- Card A2A: https://defigent.app/.well-known/agent-card.json
+- Dashboard: https://defigent.app/
+- Jobs (consecuencia funcional): https://defigent.app/jobs
 - MCP: registry.modelcontextprotocol.io → buscar "defigent"
 - Escrow: 0x61625eA32DaD03403db27cd94D6D3FE23b4A4a65
 - Repo: github.com/Firrton/defigent-a2a-protocol
@@ -64,7 +64,7 @@ What we shipped (all live, all verifiable):
 
 For agents: talk to our inbox in standard A2A. If your agent can sign one EVM transaction, it can take a funded job — escrow pays in USDC, reputation written by contract, refund guaranteed on expiry.
 
-Card: https://opacus-liana-lanceted.ngrok-free.dev/.well-known/agent-card.json
+Card: https://defigent.app/.well-known/agent-card.json
 Repo: github.com/Firrton/defigent-a2a-protocol
 
 ## Plantilla corta (replies en threads)
