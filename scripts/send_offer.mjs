@@ -1,14 +1,16 @@
 // Sends a typed defigent.job.offer (we are the client) to a peer's A2A endpoint, records it in the offers ledger and runs
 // the peer's synchronous typed answer through the jobs runtime.
-// Usage: node scripts/send_offer.mjs --endpoint <url> --agent-id <n> --service <id> --description <text> --amount <base units>
-//          [--token USDC] [--ttl <s>] [--dry-run]
+// Usage: DEFIGENT_DATA_DIR=<inbox data dir> node scripts/send_offer.mjs --endpoint <url> --agent-id <n> --service <id>
+//          --description <text> --amount <base units> [--token USDC] [--ttl <s>] [--dry-run]
+// DEFIGENT_DATA_DIR is required (no default): the offer goes into the inbox's own ledger, <dir>/defigent_a2a.db, which must
+// already exist (in production /home/ubuntu/defigent-data). Elsewhere the peer's accept would reach the inbox as unknown_offer.
 // --dry-run prints the message and touches neither the database nor the network.
 import { parseArgs } from "node:util";
 import { buildTypedMessage, extractTyped, sendTyped } from "../jobs/a2a_client.mjs";
 import { loadJobsConfig, tokenBySymbol } from "../jobs/config.mjs";
 import { fullKey, newOfferId, parseTyped, termsHash } from "../jobs/protocol.mjs";
 
-const USAGE = "usage: node scripts/send_offer.mjs --endpoint <url> --agent-id <n> --service <id> --description <text> --amount <base units> [--token USDC] [--ttl <s>] [--dry-run]";
+const USAGE = "usage: DEFIGENT_DATA_DIR=<inbox data dir> node scripts/send_offer.mjs --endpoint <url> --agent-id <n> --service <id> --description <text> --amount <base units> [--token USDC] [--ttl <s>] [--dry-run]";
 const DEC_RE = /^(0|[1-9][0-9]*)$/;
 
 function die(message) {
@@ -93,8 +95,15 @@ const { default: Database } = await import("better-sqlite3");
 const { createChainReader } = await import("../jobs/chain.mjs");
 const { createJobsRuntime } = await import("../jobs/runtime.mjs");
 
-const dataDir = process.env.DEFIGENT_DATA_DIR || "/home/ubuntu/.hermes/cache/scratch";
-const db = new Database(`${dataDir}/defigent_a2a.db`);
+const dataDir = process.env.DEFIGENT_DATA_DIR;
+if (!dataDir) die(`DEFIGENT_DATA_DIR is required: the inbox's data directory (production: /home/ubuntu/defigent-data)\n${USAGE}`);
+let db;
+try {
+  // The inbox owns the ledger: an offer recorded anywhere else is unknown to the inbox that receives the accept.
+  db = new Database(`${dataDir}/defigent_a2a.db`, { fileMustExist: true });
+} catch (e) {
+  die(`cannot open ${dataDir}/defigent_a2a.db (DEFIGENT_DATA_DIR must be the inbox's data directory): ${e.message}`);
+}
 // R3: no onAction, so actions stay unwoken and the server's sweep wakes them.
 const runtime = createJobsRuntime({
   db, config, reader: createChainReader({ config, rpcUrl: process.env.RPC_URL || "https://rpc.monad.xyz" }), log: (...a) => console.error(...a),

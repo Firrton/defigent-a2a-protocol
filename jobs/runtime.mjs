@@ -5,7 +5,7 @@ import { ChainUnavailable } from "./chain.mjs";
 import { handleAccept, handleDecline, handleJobMessage, handleOffer } from "./handlers.mjs";
 import { canonicalJson, detectTyped, fullKey, jobsJsonSchema, normalizeLegacyOffer, parseTyped } from "./protocol.mjs";
 import { createJobsStore, migrateJobsStore } from "./store.mjs";
-import { sweepJobs } from "./sweep.mjs";
+import { enqueueOrEscalate, sweepJobs } from "./sweep.mjs";
 import { adaptTextReply } from "./text_adapter.mjs";
 
 const DAY_SECONDS = 86400;
@@ -175,7 +175,7 @@ export function createJobsRuntime({
           result = replayOrConflict(stored, parsed.hash, parsed.name, parsed.msg);
         } else {
           for (const op of out.ops) applyOp(op, contextId, now);
-          for (const a of out.actions) if (store.enqueueAction({ ...a, contextId: actionContext, now })) fresh.push(a.key);
+          for (const a of out.actions) if (enqueueOrEscalate(store, a, actionContext, now)) fresh.push(a.key);
           if (key && !isError(result)) store.saveReply(key, parsed.hash, result, now);
         }
         remember(who, messageId, result, now);

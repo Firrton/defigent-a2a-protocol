@@ -125,25 +125,28 @@ Las ofertas y los jobs del protocolo tipado (`defigent.job.*`, ver `docs/jobs-pr
 Una acción despierta al operador con una línea de la wake queue con `cls: "typed_action"`. Además de los campos de siempre trae:
 
 - `action`: `{ key, action, payload }`. `key` es la clave de idempotencia (`create_job:of_…`, `fund:42`…), `action` es el tipo y `payload` los datos exactos de la operación.
-- `reply_via`: apunta al script (`command: "node scripts/jobs_actions.mjs apply <key>"`) en lugar de a una línea de outbox. No escribas una línea a mano para estas tareas.
+- `reply_via`: apunta al script en lugar de a una línea de outbox. `command` es el comando completo, listo para correr desde cualquier shell: `DEFIGENT_DATA_DIR=<directorio de datos del inbox> node --env-file=<archivo env> <ruta absoluta>/scripts/jobs_actions.mjs apply <key>`. El servidor lo arma con su propio `DEFIGENT_DATA_DIR` y con `DEFIGENT_OPERATOR_ENV_FILE` (por defecto `/home/ubuntu/.hermes/.env`). Agregale las opciones que pida la acción (`--verdict`…). No escribas una línea a mano para estas tareas.
 
 El `ts` de estas líneas es la hora del aviso, no la de un mensaje del remitente.
 
+Las tareas tipadas no pasan por el timeout del operador: su `working` significa "le toca a Defigent" (revisar, crear el job, fondear, evaluar) y lo mueve la cadena, no una respuesta de texto. El barrido de timeouts nunca las cambia a `input-required`, que para el peer significaría que el próximo paso es suyo.
+
 | `action` | Qué hace | Firma |
 |---|---|---|
-| `review_offer` | Revisar una oferta entrante; el veredicto es `accept` o `decline`. Sin transacción. | — |
+| `review_offer` | Revisar una oferta entrante; el veredicto es `accept` o `decline`. Sin transacción. El `payload` trae todo lo que aprobás al aceptar: `offerId`, `side`, `service`, `description`, `price`, `deliverable`, `gas`, `from`, `to` y `expiresAt` (que también será el vencimiento del job). | — |
 | `create_job` | `createJob(provider, evaluator, expiredAt, description, hook, agentId)` en el escrow. | `client` |
-| `gas_grant` | Mandar `amountWei` de MON al provider para su gas. | `client` |
+| `gas_grant` | Mandar `amountWei` de MON al provider para su gas. Solo existe para ofertas **nuestras** que traen `gas.grant`; el `gas.grant` de una oferta entrante lo elige el peer, se ve en el `review_offer` y nunca se paga. | `client` |
 | `fund` | `approve(escrow, amount)` sobre el token y después `fund(jobId, token, amount, 0x)`. | `client` |
-| `evaluate` | `complete(jobId, keccak256(reason), 0x)` o `reject(…)`. `complete` lleva al menos 700 000 de gas. | `evaluator` |
+| `evaluate` | `complete(jobId, keccak256(reason), 0x)` o `reject(…)`. `complete` lleva al menos 700 000 de gas. Solo para jobs que creamos nosotros como cliente; el `payload` trae `offerId` (o `null`) y `client`. Si en las últimas 6 h antes de `deadline` sigue pendiente, el barrido la vuelve a despertar una vez con `urgent: true`: pasado `expiredAt + 1 h` cualquiera puede reembolsar el job y el provider pierde el pago. | `evaluator` |
 | `refund` | `claimRefund(jobId)` de un job vencido. | `client` |
 | `review_claim` | Un claim tuyo que no pasó la verificación on-chain; `payload.reason` dice por qué. Se resuelve a mano. | — |
 
 ### Cómo usar `list` y `apply`
 
-El script lee el ledger y escribe el outbox en `$DEFIGENT_DATA_DIR`, el mismo directorio de datos del inbox; sin la variable usa el mismo defecto que el servidor. Nunca crea el ledger: si no existe, aborta.
+El script lee el ledger y escribe el outbox en `$DEFIGENT_DATA_DIR`, el mismo directorio de datos del inbox (en producción `/home/ubuntu/defigent-data`). La variable es **obligatoria**: no hay valor por defecto, porque el shell del operador no tiene la del servicio y un directorio equivocado deja las acciones fuera del ledger que barre el servidor. Nunca crea el ledger: si no existe, aborta. `scripts/send_offer.mjs` sigue la misma regla.
 
 ```bash
+export DEFIGENT_DATA_DIR=/home/ubuntu/defigent-data
 node scripts/jobs_actions.mjs list                                       # acciones pendientes, en JSON
 node scripts/jobs_actions.mjs apply fund:42 --dry-run                    # muestra las transacciones y no toca nada
 node --env-file=/home/ubuntu/.hermes/.env scripts/jobs_actions.mjs apply fund:42
@@ -164,6 +167,8 @@ Qué hace `apply` sin `--dry-run`, una transacción por vez y en orden:
 4. En `create_job`, saca el `jobId` del log `JobCreated`.
 5. Marca la acción como hecha en el ledger y agrega la línea de resultado a `$DEFIGENT_DATA_DIR/defigent_outbox.jsonl`.
 6. Le manda el aviso tipado al endpoint del peer, el mismo al que le mandamos la oferta. Es best effort: si falla, lo registra y sigue. Las ofertas entrantes no tienen endpoint guardado, así que ahí no hay aviso: el peer se entera consultando su tarea.
+
+Antes de tocar la clave o la cadena, `apply` **reclama** la acción en el ledger con un único `UPDATE` atómico. Si el webhook y el cron despiertan dos ejecuciones para la misma acción, solo una la reclama; la otra termina con "is being applied by another run" sin mandar nada. La ejecución que la reclamó la libera al salir, también cuando aborta. Un reclamo de más de 15 minutos se considera de una ejecución que murió y otra puede tomarlo.
 
 Una acción que ya no está `pending` no se vuelve a aplicar. Si un `create_job` o un `gas_grant` llegó a mandar su transacción y el script se cortó antes del receipt, tampoco: el hash queda en el resultado de la acción, y hay que mirarlo on-chain y resolverla a mano. Un `fund` cortado entre el `approve` y el `fund` se puede reintentar: el `approve` se repite sin daño.
 

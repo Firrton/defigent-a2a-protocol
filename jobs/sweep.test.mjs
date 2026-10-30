@@ -157,7 +157,9 @@ test("silent submit: a Submitted job without a notice gets evaluate with the gra
 
   const key = "evaluate:42";
   assert.deepEqual(store.listActions().map((a) => [a.key, a.contextId]), [[key, "ctx-accept"]]);
-  assert.deepEqual(store.getAction(key).payload, { jobId: "42", deadline: EXPIRES + 3600, urgent: false, deliverable: { hash: HASH, verified: true } });
+  assert.deepEqual(store.getAction(key).payload, {
+    jobId: "42", offerId: OFFER_ID, client: cfg.client, deadline: EXPIRES + 3600, urgent: false, deliverable: { hash: HASH, verified: true },
+  });
   assert.deepEqual(r.actions.map((a) => a.key), [key]);
   assert.deepEqual(woken.map((a) => a.key), [key]);
   assert.equal(store.getAction(key).wokenAt, T);
@@ -441,4 +443,44 @@ test("runtime.sweep runs the sweep with the runtime's clock and callbacks", asyn
   assert.equal(updates.length, 1);
   assert.equal(updates[0].body.next.function, SET_BUDGET);
   assert.deepEqual(woken, []);
+});
+
+test("evaluate turns urgent near the deadline: the pending action gets the urgent payload and is woken once more", async () => {
+  const submitted = { 42: job({ status: "Submitted", submittedAt: T - 100, budget: 250000n, paymentToken: USDC }) };
+  const { store, woken, sweep } = setup({ offers: [linkedRow()], reader: chain({ jobs: submitted, deliverables: { 42: HASH } }) });
+  const key = "evaluate:42";
+
+  await sweep();
+  assert.equal(store.getAction(key).payload.urgent, false);
+  assert.deepEqual(woken.map((a) => a.key), [key]);
+
+  // Two hours before expiredAt + 1 h: inside the last 6 h, so the step is urgent.
+  const late = EXPIRES + 3600 - 7200;
+  const lateChain = chain({ jobs: submitted, deliverables: { 42: HASH }, now: late });
+  const r = await sweep({ reader: lateChain, now: late });
+  assert.deepEqual(r.actions.map((a) => a.key), [key]);
+  const row = store.getAction(key);
+  assert.equal(row.state, "pending");
+  assert.equal(row.payload.urgent, true);
+  assert.equal(row.payload.deadline, EXPIRES + 3600);
+  assert.equal(row.wokenAt, late);
+  assert.deepEqual(woken.map((a) => [a.key, a.payload.urgent]), [[key, false], [key, true]]);
+
+  // Once urgent, later sweeps neither rewrite nor wake it again.
+  const again = await sweep({ reader: lateChain, now: late + 600 });
+  assert.deepEqual(again.actions, []);
+  assert.equal(woken.length, 2);
+  assert.equal(store.getAction(key).wokenAt, late);
+});
+
+test("a done evaluate is never reopened by an urgent sweep", async () => {
+  const submitted = { 42: job({ status: "Submitted", submittedAt: T - 100, budget: 250000n, paymentToken: USDC }) };
+  const { store, woken, sweep } = setup({ offers: [linkedRow()], reader: chain({ jobs: submitted }) });
+  await sweep();
+  store.finishAction("evaluate:42", "done", { verdict: "complete" }, T + 1);
+  const late = EXPIRES + 3600 - 7200;
+  await sweep({ reader: chain({ jobs: submitted, now: late }), now: late });
+  assert.equal(store.getAction("evaluate:42").state, "done");
+  assert.equal(store.getAction("evaluate:42").payload.urgent, false);
+  assert.equal(woken.length, 1);
 });

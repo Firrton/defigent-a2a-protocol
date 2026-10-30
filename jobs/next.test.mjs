@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { encodeFunctionData, zeroAddress } from "viem";
+import { encodeFunctionData, getAddress, zeroAddress } from "viem";
 import { ESCROW_ABI } from "./abi.mjs";
 import { loadJobsConfig } from "./config.mjs";
 import { nextStep, offerNext, taskStateFor } from "./next.mjs";
@@ -83,8 +83,10 @@ test("Funded: the provider submits", () => {
   assert.deepEqual(pick(n), { actor: "provider", ours: false, action: undefined });
   assert.equal(n.to, cfg.escrow);
   assert.equal(n.function, "submit(uint256,bytes32,bytes)");
-  assert.deepEqual(n.args, ["42", "keccak256(deliverable)", "0x"]);
+  // No args: the deliverable hash is the provider's, and args only ever carry real values (extension spec §4).
+  assert.equal(n.args, undefined);
   assert.equal(n.data, undefined);
+  assert.match(n.note, /submit\(42, <keccak256 of the deliverable>, 0x\)/);
 });
 
 test("Submitted: evaluate before expiredAt + 3600, urgent in the last 6 h", () => {
@@ -195,4 +197,9 @@ test("jobs whose client is not us never get ours: true", () => {
     { actor: "evaluator", ours: false, action: "evaluate" });
   assert.deepEqual(pick(nextStep({ job: job({ client: OTHER, status: "Funded" }), offer, now: EXPIRED_AT, config: cfg })),
     { actor: "anyone", ours: false, action: "refund" });
+});
+
+test("Submitted: a job that names Defigent as evaluator but has another client is not ours (roles in v1)", () => {
+  const n = nextStep({ job: job({ status: "Submitted", client: getAddress("0x3333333333333333333333333333333333333333"), budget: 250000n, paymentToken: USDC }), offer: null, now: T, config: cfg });
+  assert.deepEqual(pick(n), { actor: "evaluator", ours: false, action: "evaluate" });
 });

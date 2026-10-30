@@ -17,6 +17,13 @@ const CLAIM_READS = { decline: 0 };
 
 const same = (a, b) => typeof a === "string" && typeof b === "string" && a.toLowerCase() === b.toLowerCase();
 
+// A new action is inserted. An urgent one that is already pending replaces a non-urgent payload and is woken again,
+// so a missed first wake does not cost the provider its pay at the evaluation deadline.
+export function enqueueOrEscalate(store, action, contextId, now) {
+  if (store.enqueueAction({ ...action, contextId, now })) return true;
+  return action.payload?.urgent === true && store.escalateAction(action.key, action.payload, now);
+}
+
 class OutOfReads extends Error {}
 class OfferTaken extends Error {}
 
@@ -85,9 +92,10 @@ export function sweepJobs({ store, reader, config, now, onAction, onTaskUpdate =
     }
   }
 
-  // The keys of the actions that were new. Callers keep them only once their transaction commits.
+  // The keys of the actions that were new, or pending ones that just turned urgent (design §6: evaluate urgente).
+  // Callers keep them only once their transaction commits.
   function enqueue(actions, contextId) {
-    return actions.filter((a) => store.enqueueAction({ ...a, contextId, now })).map((a) => a.key);
+    return actions.filter((a) => enqueueOrEscalate(store, a, contextId, now)).map((a) => a.key);
   }
 
   // Writes the handler's ops and actions, the job bookkeeping and the claim verdict in one transaction.

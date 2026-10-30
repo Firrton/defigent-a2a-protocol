@@ -80,7 +80,10 @@ test("an inbound offer goes to review", () => {
   assert.deepEqual(o.actions.map((a) => a.key), [`review_offer:${inboundOffer.offerId}`]);
   assert.deepEqual(o.actions[0], {
     key: `review_offer:${inboundOffer.offerId}`, action: "review_offer",
-    payload: { offerId: inboundOffer.offerId, side: "provider", service: "hash-text", price, from: { address: A, agentId: 10270 } },
+    payload: {
+      offerId: inboundOffer.offerId, side: "provider", service: "hash-text", description: "keccak256 of a text", price,
+      deliverable: { mediaType: "text/plain", acceptance: "operator" }, gas: null, from: { address: A, agentId: 10270 }, to: null, expiresAt: EXPIRES,
+    },
   });
   // The peer endpoint is never taken from replyTo.url (R9).
   assert.deepEqual(o.ops, [{
@@ -287,7 +290,10 @@ test("a submitted notice stores the deliverable reference and enqueues evaluate"
     { op: "setDeliverable", offerId: outTerms.offerId, deliverable: notice.deliverable },
   ]);
   const ref = { hash: HASH, uri: "https://peer.example/out.json", mediaType: "application/json", verified: true };
-  assert.deepEqual(o.actions, [{ key: "evaluate:42", action: "evaluate", payload: { jobId: "42", deadline: EXPIRES + 3600, urgent: false, deliverable: ref } }]);
+  assert.deepEqual(o.actions, [{
+    key: "evaluate:42", action: "evaluate",
+    payload: { jobId: "42", offerId: outTerms.offerId, client: cfg.client, deadline: EXPIRES + 3600, urgent: false, deliverable: ref },
+  }]);
   assert.deepEqual(o.reply.body.job.deliverable, ref);
   assert.equal(o.reply.body.job.submittedAt, T);
   assert.equal(o.taskState, "working");
@@ -347,4 +353,47 @@ test("statusBody has only the parts it is given", () => {
   assert.equal(body.job.submittedAt, T);
   assert.equal(body.job.deliverable, null);
   assert.doesNotThrow(() => JSON.stringify(body));
+});
+
+test("an inbound offer's gas.grant is shown to the operator but never queued as gas_grant", () => {
+  const withGrant = parsed("offer", { ...inboundOffer, gas: { providerTxs: 2, grant: "1000000000000000000000" }, to: { agentId: 10331 } });
+  const review = handleOffer(offerArgs({ msg: withGrant }));
+  assert.deepEqual(review.actions[0].payload.gas, { providerTxs: 2, grant: "1000000000000000000000" });
+  assert.deepEqual(review.actions[0].payload.to, { agentId: 10331 });
+  assert.equal(review.actions[0].payload.description, "keccak256 of a text");
+  assert.equal(review.actions[0].payload.expiresAt, EXPIRES);
+
+  // The operator's accept verdict on it: create_job only.
+  const row = { ...review.ops[0].row, contextId: "ctx-1" };
+  const msg = parsed("accept", { offerId: withGrant.offerId, party: { address: A, agentId: 10270 } });
+  const o = handleAccept({ msg, offer: row, bound: true, now: T, config: cfg, counts: { createJobsToday: 0 }, verdict: true });
+  assert.deepEqual(o.actions.map((a) => a.key), [`create_job:${withGrant.offerId}`]);
+  const accepted = { ...row, state: "accepted", acceptedAddress: A, acceptedAgentId: 10270 };
+  assert.equal(actionFor({ kind: "gas_grant", next: { ours: true, action: "create_job" }, offer: accepted, config: cfg }), null);
+});
+
+test("an inbound offer whose decimals or symbol differ from the configured token gets unsupported_terms", () => {
+  assertError(handleOffer(offerArgs({ msg: { ...inboundOffer, price: { ...price, decimals: 18 } } })), "unsupported_terms", "price.decimals");
+  assertError(handleOffer(offerArgs({ msg: { ...inboundOffer, price: { ...price, symbol: "USDT" } } })), "unsupported_terms", "price.symbol");
+  assertError(handleOffer(offerArgs({ msg: { ...inboundOffer, price: { ...price, symbol: "usdc" } } })), "unsupported_terms", "price.symbol");
+});
+
+test("a job Defigent evaluates but did not create gets status only, never an evaluate action", () => {
+  // A stranger's job that names us as evaluator, with no offer in our ledger.
+  const foreign = job({ status: "Submitted", client: OTHER, provider: getAddress("0x4444444444444444444444444444444444444444"), budget: 250000n, paymentToken: USDC, submittedAt: T });
+  const o = handleJobMessage(jobArgs({ offer: null, job: foreign, deliverable: HASH }));
+  assert.equal(o.reply.name, "status");
+  assert.deepEqual([o.reply.body.next.actor, o.reply.body.next.ours, o.reply.body.next.action], ["evaluator", false, "evaluate"]);
+  assert.deepEqual(o.actions, []);
+  assert.equal(o.taskState, "input-required");
+  // actionFor refuses it even when told the step is ours.
+  const forced = { ours: true, action: "evaluate", deadline: EXPIRES + 3600, urgent: false };
+  assert.equal(actionFor({ kind: "evaluate", next: forced, job: foreign, offer: null, deliverable: HASH, config: cfg }), null);
+
+  // Our own job (we are the client) queried by jobId with no offer: evaluate, with client and offerId in the payload.
+  const ours = job({ status: "Submitted", budget: 250000n, paymentToken: USDC, submittedAt: T });
+  const mine = handleJobMessage(jobArgs({ offer: null, job: ours, deliverable: HASH }));
+  assert.deepEqual(mine.actions.map((a) => a.payload), [{
+    jobId: "42", offerId: null, client: cfg.client, deadline: EXPIRES + 3600, urgent: false, deliverable: { hash: HASH, verified: true },
+  }]);
 });

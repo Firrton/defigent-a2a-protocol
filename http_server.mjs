@@ -156,7 +156,7 @@ import { loadJobsConfig } from "./jobs/config.mjs";
 import { createChainReader } from "./jobs/chain.mjs";
 import { createJobsRuntime } from "./jobs/runtime.mjs";
 import { EXT_URI, NAMES as JOB_NAMES, fullKey as jobKey } from "./jobs/protocol.mjs";
-import { chainUnavailable, extensionsEcho, invalidParams, negotiateVersion, sseFrame, typedResult } from "./jobs/wire.mjs";
+import { chainUnavailable, extensionsEcho, internalError, invalidParams, negotiateVersion, sseFrame, typedResult } from "./jobs/wire.mjs";
 
 const A2A_DB = `${DATA_DIR}/defigent_a2a.db`;
 const a2a = new Database(A2A_DB);
@@ -270,6 +270,18 @@ const JOBS_CONFIG = loadJobsConfig();
 // The runtime's and its sweep's log lines (invalid claims, rejected claims, failed wakes) go to the inbox log; a body that comes with one is not logged.
 const logJobs = (msg) => logInbox({ ts: Date.now(), cls: "jobs_log", msg: String(msg).slice(0, 200) });
 const jobs = createJobsRuntime({ db: a2a, config: JOBS_CONFIG, reader: createChainReader({ config: JOBS_CONFIG, rpcUrl: RPC }), onAction: wakeTypedAction, onTaskUpdate: applyTypedTaskUpdate, log: logJobs });
+// Tasks the typed protocol answered. Their `working` means "Defigent's turn" (a review, create_job, fund, evaluate) and follows the chain,
+// so the operator-timeout sweeper's stuck pass leaves them alone: input-required would tell the peer the next move is theirs.
+a2a.exec(`CREATE TABLE IF NOT EXISTS typed_tasks (context_id TEXT PRIMARY KEY, created_at INTEGER NOT NULL)`);
+const markTypedTask = (contextId) => a2a.prepare(`INSERT INTO typed_tasks (context_id, created_at) VALUES (?,?) ON CONFLICT(context_id) DO NOTHING`).run(contextId, Date.now());
+
+// The command a typed_action wake line hands the operator: this server's own data directory and the env file with the key, so it
+// works from any shell (an operator's shell has no DEFIGENT_DATA_DIR, and the scripts have no default for it).
+const JOBS_ACTIONS_SCRIPT = fileURLToPath(new URL("./scripts/jobs_actions.mjs", import.meta.url));
+const OPERATOR_ENV_FILE = process.env.DEFIGENT_OPERATOR_ENV_FILE || "/home/ubuntu/.hermes/.env";
+const shellArg = (s) => (/^[\w@%+=:,./-]+$/.test(s) ? s : `'${String(s).replace(/'/g, "'\\''")}'`);
+const jobsActionCommand = (key) =>
+  `DEFIGENT_DATA_DIR=${shellArg(path.resolve(DATA_DIR))} node --env-file=${shellArg(OPERATOR_ENV_FILE)} ${shellArg(JOBS_ACTIONS_SCRIPT)} apply ${shellArg(key)}`;
 
 // The extension as the card declares it (capabilities.extensions), its JSON Schema (generated from the zod schemas the inbox validates with)
 // and its public spec. The spec is read next to this file, not from the cwd.
@@ -298,6 +310,7 @@ function wakeTypedAction(row) {
 function applyTypedTaskUpdate({ contextId, state, name, body, text }) {
   a2a.transaction(() => {
     upsertTask(contextId, state);
+    markTypedTask(contextId);
     addMessage(contextId, "agent", text, true, null, typedMeta(name, body));
   })();
 }
@@ -346,6 +359,7 @@ function applyOutboxLine(line, endOffset, ino) {
   const stale = o.inReplyTo !== undefined && !!a2a.prepare(`SELECT 1 FROM operator_bound WHERE context_id=? AND ts > ? LIMIT 1`).get(o.contextId, o.inReplyTo);
   a2a.transaction(() => {
     if (offerTask) upsertTask(o.contextId, state);
+    if (claim?.ok) markTypedTask(o.contextId); // a typed claim's working (the accept verdict) waits for the chain, not for a reply
     a2a.prepare(`INSERT INTO outbox_applied (reply_key, ts) VALUES (?,?)`).run(key, Date.now());
     addMessage(o.contextId, "agent", text, true, null, o.data ? JSON.stringify({ data: [o.data], files: [] }) : null);
     upsertTask(o.contextId, stale ? (task?.state ?? state) : state);
@@ -460,8 +474,10 @@ function sweepOperatorTimeouts() {
     else a2a.prepare(`UPDATE operator_bound SET resolved=? WHERE context_id=? AND ts=?`).run(OB_DONE, context_id, ts);
   }
   if (due.length === SWEEP_TICK_ROWS) return true; // a full page: there may be more
+  // typed tasks are excluded: their working is Defigent's turn on chain, not a wait for an operator reply (see typed_tasks)
   const stuck = a2a.prepare(`SELECT context_id FROM tasks t WHERE t.state='working' AND t.updated_at <= ?
-    AND NOT EXISTS (SELECT 1 FROM operator_bound b WHERE b.context_id = t.context_id AND b.resolved = 0) ORDER BY t.updated_at LIMIT ?`).all(cutoff, SWEEP_TICK_ROWS);
+    AND NOT EXISTS (SELECT 1 FROM operator_bound b WHERE b.context_id = t.context_id AND b.resolved = 0)
+    AND NOT EXISTS (SELECT 1 FROM typed_tasks y WHERE y.context_id = t.context_id) ORDER BY t.updated_at LIMIT ?`).all(cutoff, SWEEP_TICK_ROWS);
   for (const { context_id } of stuck) {
     if (spent()) return true;
     done++;
@@ -645,7 +661,7 @@ function wakeQueueLine(entry) {
   const thread = getHistory(entry.contextId, 6, false);
   const reply_via = entry.action ? {
     script: "scripts/jobs_actions.mjs",
-    command: `node scripts/jobs_actions.mjs apply ${entry.action.key}`,
+    command: jobsActionCommand(entry.action.key),
     note: "Typed action: run it with scripts/jobs_actions.mjs, which simulates, sends and writes the outbox line itself. Do not write a free-text outbox line for this task."
   } : {
     file: path.resolve(OUTBOX_FILE),
@@ -810,7 +826,7 @@ app.post("/inbox", async (req, res) => {
     const adapted = jobs.adaptText(text);
     if (adapted) detection = { kind: "typed", ...adapted };
   }
-  if (detection.kind !== "none") {
+  if (detection.kind !== "none") try {
     const contextId = msg?.contextId || msg?.taskId || `t-${messageId}`;
     const auth = body?.params?.auth || msg?.auth || null;
     const declaredSenderRaw = msg?.sender || msg?.from || null;
@@ -830,6 +846,7 @@ app.post("/inbox", async (req, res) => {
       // A retry of the same (sender, messageId) gets the same answer, but its exchange, artifact and log line are already stored.
       if (!r.replay) a2a.transaction(() => {
         upsertTask(contextId, r.taskState); // first: messages and artifacts reference the task (foreign keys are enforced)
+        markTypedTask(contextId);
         addMessage(contextId, "user", text || `(typed ${jobKey(requestName)})`, ident.verified, ident.address || declaredSender, JSON.stringify({ data: dataParts, files: fileParts }));
         if (detection.kind === "legacy") {
           a2a.prepare(`INSERT INTO artifacts (task_id, artifact_id, name, parts_json, ts) VALUES (?,?,?,?,?)`)
@@ -848,6 +865,11 @@ app.post("/inbox", async (req, res) => {
       }
       return res.json(rpcResponse);
     }
+  } catch (e) {
+    // anything unexpected on the typed path is answered as JSON-RPC -32603, never with Express's HTML 500
+    logInbox({ ts: Date.now(), cls: "jobs_error", messageId, error: String(e?.message || e).slice(0, 200) });
+    if (res.headersSent) return res.end();
+    return res.json(internalError({ id }));
   }
 
   // dedupe
@@ -1342,8 +1364,8 @@ app.get("/integration", (_req, res) => {
     offer_schema_v1: {
       status: "legacy: still accepted, normalized to defigent.job.offer",
       description: "Send structured, machine-readable offers as a DataPart — Defigent parses them natively (no free-text guessing):",
-      example: '{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{"role":"agent","parts":[{"text":"service proposal"},{"data":{"intent":"offer","service":"your-service","price":"1.00","asset":"USDC","expiry":1792000000000,"terms":"what you deliver"}}],"messageId":"<unique-id>"}}}',
-      fields: "intent=offer (required) | service (required) | price (required) | asset (default USDC) | expiry (ms epoch) | terms | evidence",
+      example: '{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{"role":"agent","parts":[{"text":"service proposal"},{"data":{"intent":"offer","service":"your-service","price":"1.00","asset":"USDC","terms":"what you deliver"}}],"messageId":"<unique-id>"}}}',
+      fields: "intent=offer (required) | service (required) | price (required) | asset (default USDC) | expiry (ms epoch; default 24 h from now) | terms | evidence",
     },
     steps: [
       {

@@ -293,7 +293,8 @@ test("a submitted notice on a Submitted job reads the deliverable and queues eva
   assert.deepEqual(r.body.job.deliverable, { hash: HASH, uri: "https://peer.example/out.json", verified: true });
   assert.deepEqual(r.actions.map((a) => a.key), ["evaluate:42"]);
   assert.deepEqual(r.actions[0].payload, {
-    jobId: "42", deadline: EXPIRES + 3600, urgent: false, deliverable: { hash: HASH, uri: "https://peer.example/out.json", verified: true },
+    jobId: "42", offerId: OFFER_ID, client: cfg.client, deadline: EXPIRES + 3600, urgent: false,
+    deliverable: { hash: HASH, uri: "https://peer.example/out.json", verified: true },
   });
   // Job actions belong to the offer's task, where the peer polls.
   assert.equal(r.actions[0].contextId, OFFER_ID);

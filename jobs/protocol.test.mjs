@@ -105,6 +105,13 @@ test("offer field rules: side, service, chainId, decimals, acceptance and length
   assert.equal(parseTyped("offer", offerWith({ gas: { grant: "1000" } })).value.gas.grant, "1000");
 });
 
+test("expiresAt is Unix seconds: a millisecond timestamp is refused", () => {
+  const ms = parseTyped("offer", offerWith({ expiresAt: 1792800000000 }));
+  assert.deepEqual([ms.ok, ms.field, ms.detail], [false, "expiresAt", "must be Unix seconds, not milliseconds"]);
+  assert.equal(parseTyped("offer", offerWith({ expiresAt: 9999999999 })).ok, true);
+  assert.equal(parseTyped("offer", offerWith({ expiresAt: 10000000000 })).field, "expiresAt");
+});
+
 test("optional offer parts may be absent", () => {
   const { providerSteps, gas, to, replyTo, ...bare } = validOffer;
   const r = parseTyped("offer", { ...bare, from: { address: A.toLowerCase(), agentId: 10331 } });

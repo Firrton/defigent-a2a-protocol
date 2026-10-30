@@ -161,6 +161,16 @@ export function createJobsStore(db) {
     actionWoken: q(`UPDATE job_actions SET woken_at=?, updated_at=? WHERE action_key=?`),
     actionsSince: q(`SELECT COUNT(*) AS n FROM job_actions WHERE action=? AND created_at > ?`),
     actionFinish: q(`UPDATE job_actions SET state=?, result_json=?, updated_at=? WHERE action_key=?`),
+    // A pending action whose stored payload is not urgent yet takes the urgent payload and is woken again, once.
+    actionEscalate: q(`UPDATE job_actions SET payload_json=?, woken_at=NULL, updated_at=? WHERE action_key=? AND state='pending'
+      AND COALESCE(json_extract(payload_json, '$.urgent'), 0) = 0`),
+    // One statement, so two concurrent runs of jobs_actions cannot both claim the action. A claim older than staleBefore
+    // (a run that crashed) can be taken over; result.sent is kept.
+    actionClaim: q(`UPDATE job_actions SET result_json=json_set(COALESCE(result_json, '{}'), '$.claim', json(?)), updated_at=?
+      WHERE action_key=? AND state='pending'
+      AND (result_json IS NULL OR json_extract(result_json, '$.claim') IS NULL OR json_extract(result_json, '$.claim.at') < ?)`),
+    actionRelease: q(`UPDATE job_actions SET result_json=NULLIF(json_remove(result_json, '$.claim'), '{}'), updated_at=?
+      WHERE action_key=? AND state='pending' AND json_extract(result_json, '$.claim.id')=?`),
 
     claimInsert: q(`INSERT INTO job_claims (context_id, reply_id, name, body_json, state, created_at, updated_at)
       VALUES (?,?,?,?,'pending',?,?) ON CONFLICT(context_id, reply_id) DO NOTHING`),
@@ -252,6 +262,17 @@ export function createJobsStore(db) {
     },
     finishAction(key, state, result, now) {
       stmt.actionFinish.run(state, toJson(result), now, key);
+    },
+    // True when the stored pending action was not urgent and now carries `payload` (urgent) with woken_at reset.
+    escalateAction(key, payload, now) {
+      return stmt.actionEscalate.run(JSON.stringify(payload ?? {}), now, key).changes === 1;
+    },
+    // Claims a pending action for one run of jobs_actions: true only for the run whose update changed the row.
+    claimAction(key, claim, staleBefore, now) {
+      return stmt.actionClaim.run(JSON.stringify(claim), now, key, staleBefore).changes === 1;
+    },
+    releaseAction(key, claimId, now) {
+      return stmt.actionRelease.run(now, key, claimId).changes === 1;
     },
 
     recordClaim({ contextId, replyId, name, body, now }) {

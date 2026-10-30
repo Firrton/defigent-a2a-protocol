@@ -7,6 +7,8 @@ const STATE_1_0 = Object.freeze({
   completed: "TASK_STATE_COMPLETED",
   rejected: "TASK_STATE_REJECTED",
   failed: "TASK_STATE_FAILED",
+  // R28: a peer's status or error keeps the task's previous state, which can be canceled.
+  canceled: "TASK_STATE_CANCELED",
 });
 
 const ERROR_INFO = "type.googleapis.com/google.rpc.ErrorInfo";
@@ -19,6 +21,8 @@ export function negotiateVersion(header) {
 
 // The JSON-RPC `result` for a typed reply. taskId equals contextId. With name null the message carries only the text part.
 export function typedResult({ version, contextId, state, name, body, text, messageId }) {
+  // Never a reply without status.state: an unknown state is a bug, and the caller answers it as an internal error.
+  if (!Object.hasOwn(STATE_1_0, state)) throw new Error(`typedResult: unknown task state ${JSON.stringify(state)}`);
   const timestamp = new Date().toISOString();
   const data = name === null ? null : { [fullKey(name)]: body };
   if (version === "1.0") {
@@ -42,6 +46,11 @@ export function chainUnavailable({ id }) {
   return rpcError(id, -32603, "Chain unavailable", [
     { "@type": ERROR_INFO, reason: "CHAIN_UNAVAILABLE", domain: EXT_URI, metadata: { retryable: "true" } },
   ]);
+}
+
+// An unexpected failure on the typed path: a JSON-RPC envelope, never the framework's HTML 500.
+export function internalError({ id }) {
+  return rpcError(id, -32603, "Internal error", [{ "@type": ERROR_INFO, reason: "INTERNAL", domain: EXT_URI, metadata: { retryable: "true" } }]);
 }
 
 function rpcError(id, code, message, data) {

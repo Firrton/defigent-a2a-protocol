@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { EXT_URI } from "./protocol.mjs";
-import { chainUnavailable, extensionsEcho, invalidParams, negotiateVersion, sseFrame, typedResult } from "./wire.mjs";
+import { chainUnavailable, extensionsEcho, internalError, invalidParams, negotiateVersion, sseFrame, typedResult } from "./wire.mjs";
 
 const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 
@@ -34,7 +34,10 @@ test("1.0 result wraps a task with TASK_STATE_* and ROLE_AGENT and no kind field
 });
 
 test("1.0 maps every task state to its TASK_STATE_ name", () => {
-  const map = { working: "TASK_STATE_WORKING", "input-required": "TASK_STATE_INPUT_REQUIRED", completed: "TASK_STATE_COMPLETED", rejected: "TASK_STATE_REJECTED", failed: "TASK_STATE_FAILED" };
+  const map = {
+    working: "TASK_STATE_WORKING", "input-required": "TASK_STATE_INPUT_REQUIRED", completed: "TASK_STATE_COMPLETED", rejected: "TASK_STATE_REJECTED",
+    failed: "TASK_STATE_FAILED", canceled: "TASK_STATE_CANCELED",
+  };
   for (const [state, wire] of Object.entries(map)) {
     assert.equal(typedResult({ version: "1.0", contextId: "c", state, name: "status", body: {}, text: "t", messageId: "m" }).task.status.state, wire);
   }
@@ -102,4 +105,22 @@ test("sseFrame is one data line ended by a blank line", () => {
   const r = { jsonrpc: "2.0", id: 1, result: { a: "x\ny" } };
   assert.equal(sseFrame(r), "data: " + JSON.stringify(r) + "\n\n");
   assert.equal(sseFrame(r).split("\n").length, 3);
+});
+
+test("a peer's status into a canceled task (R28) keeps canceled in both versions; an unknown state throws", () => {
+  const logged = { contextId: "c", state: "canceled", name: null, body: null, text: "Received.", messageId: "m" };
+  assert.equal(typedResult({ version: "1.0", ...logged }).task.status.state, "TASK_STATE_CANCELED");
+  assert.equal(typedResult({ version: "0.3", ...logged }).status.state, "canceled");
+  for (const state of ["submitted", undefined, null, "TASK_STATE_WORKING"]) {
+    assert.throws(() => typedResult({ version: "1.0", ...logged, state }), /unknown task state/);
+    assert.throws(() => typedResult({ version: "0.3", ...logged, state }), /unknown task state/);
+  }
+});
+
+test("internalError is a -32603 JSON-RPC envelope with an INTERNAL ErrorInfo", () => {
+  assert.deepEqual(internalError({ id: 7 }), {
+    jsonrpc: "2.0", id: 7,
+    error: { code: -32603, message: "Internal error", data: [{ "@type": "type.googleapis.com/google.rpc.ErrorInfo", reason: "INTERNAL", domain: EXT_URI, metadata: { retryable: "true" } }] },
+  });
+  assert.equal(internalError({}).id, null);
 });

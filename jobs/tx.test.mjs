@@ -31,7 +31,7 @@ const accepted = {
   offerId: OFFER_ID, direction: "out", contextId: OFFER_ID, terms, termsHash: termsHash(terms), state: "accepted", expiresAt: EXPIRES,
   acceptedAddress: A, acceptedAgentId: 10270,
 };
-const job = { jobId: 42n, paymentToken: USDC, budget: 250000n };
+const job = { jobId: 42n, client: cfg.client, paymentToken: USDC, budget: 250000n };
 // Action rows as the store returns them: built by the handlers' actionFor, plus the contextId the runtime stores.
 const row = (a, contextId = OFFER_ID) => ({ ...a, contextId, state: "pending" });
 const createAction = row(actionFor({ kind: "create_job", next: { ours: true, action: "create_job" }, offer: accepted, config: cfg }));
@@ -39,7 +39,7 @@ const grantAction = row(actionFor({ kind: "gas_grant", next: { ours: true, actio
 const fundAction = row(actionFor({ kind: "fund", next: { ours: true, action: "fund" }, job, config: cfg }));
 const evaluateAction = row(actionFor({ kind: "evaluate", next: { ours: true, action: "evaluate", deadline: EXPIRES + 3600, urgent: false }, job, config: cfg }));
 const refundAction = row(actionFor({ kind: "refund", next: { ours: true, action: "refund" }, job, config: cfg }));
-const reviewOffer = row({ key: `review_offer:${INBOUND_ID}`, action: "review_offer", payload: { offerId: INBOUND_ID, side: "provider", service: "hash-text", price: terms.price, from: { address: A, agentId: 10270 } } }, "ctx-offer");
+const reviewOffer = row({ key: `review_offer:${INBOUND_ID}`, action: "review_offer", payload: { offerId: INBOUND_ID, side: "provider", service: "hash-text", description: "keccak256 of a text", price: terms.price, deliverable: terms.deliverable, gas: null, from: { address: A, agentId: 10270 }, to: null, expiresAt: EXPIRES } }, "ctx-offer");
 const reviewClaim = row(actionFor({ kind: "review_claim", claimId: 7, claim: { name: "funded", body: { jobId: "42" }, reason: "job 42 is Open on chain" } }), "ctx-1");
 
 const decode = (abi, tx) => decodeFunctionData({ abi, data: tx.data });

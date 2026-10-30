@@ -1,10 +1,15 @@
 // Runs the operator actions of the typed jobs protocol (review_offer, create_job, gas_grant, fund, evaluate, refund, review_claim).
-// Usage: node scripts/jobs_actions.mjs list
-//        node --env-file=/home/ubuntu/.hermes/.env scripts/jobs_actions.mjs apply <key> [--verdict complete|reject|accept|decline]
-//          [--reason <text>] [--party-address 0x… --party-agent-id <n>] [--dry-run]
+// Usage: DEFIGENT_DATA_DIR=<inbox data dir> node scripts/jobs_actions.mjs list
+//        DEFIGENT_DATA_DIR=<inbox data dir> node --env-file=/home/ubuntu/.hermes/.env scripts/jobs_actions.mjs apply <key>
+//          [--verdict complete|reject|accept|decline] [--reason <text>] [--party-address 0x… --party-agent-id <n>] [--dry-run]
+// DEFIGENT_DATA_DIR is required (no default): the inbox's data directory (production: /home/ubuntu/defigent-data). The
+// typed_action wake line's reply_via.command already carries it.
+// apply first claims the action in the ledger with one atomic update, so two runs woken for the same action (webhook and
+// cron) cannot both send its transactions; the loser exits without touching the chain.
 // apply simulates each transaction from the signer, sends it and waits for its receipt, one at a time and in order (R33). It then
 // marks the action done, appends the result line to the outbox (the inbox verifies it on chain) and, best effort, pushes the typed
 // notice to the peer's endpoint. --dry-run prints the transactions and stops before the key, the chain and any write.
+import crypto from "node:crypto";
 import fs from "node:fs";
 import { parseArgs } from "node:util";
 import Database from "better-sqlite3";
@@ -16,14 +21,16 @@ import { KEY_PREFIX } from "../jobs/protocol.mjs";
 import { createJobsStore, migrateJobsStore } from "../jobs/store.mjs";
 import { buildActionTxs, createdJobId, outboxLineFor } from "../jobs/tx.mjs";
 
-const USAGE = "usage: node scripts/jobs_actions.mjs list\n" +
-  "       node --env-file=/home/ubuntu/.hermes/.env scripts/jobs_actions.mjs apply <key> [--verdict complete|reject|accept|decline] [--reason <text>] " +
+const USAGE = "usage: DEFIGENT_DATA_DIR=<inbox data dir> node scripts/jobs_actions.mjs list\n" +
+  "       DEFIGENT_DATA_DIR=<inbox data dir> node --env-file=/home/ubuntu/.hermes/.env scripts/jobs_actions.mjs apply <key> [--verdict complete|reject|accept|decline] [--reason <text>] " +
   "[--party-address 0x… --party-agent-id <n>] [--dry-run]";
 const DEC_RE = /^(0|[1-9][0-9]*)$/;
 const VERDICTS = { evaluate: ["complete", "reject"], review_offer: ["accept", "decline"] };
 // Sending these twice is not caught by the simulation (a second job, a second grant), so a recorded send blocks a retry.
 const NOT_RETRYABLE = new Set(["create_job", "gas_grant"]);
 const RECEIPT_TIMEOUT_MS = 120000;
+// A claim older than this belongs to a run that died without releasing it, and another run may take it over.
+const CLAIM_STALE_SECONDS = 15 * 60;
 
 const nowSeconds = () => Math.floor(Date.now() / 1000);
 const json = (value) => JSON.stringify(value, (_k, v) => (typeof v === "bigint" ? v.toString() : v), 2);
@@ -50,7 +57,8 @@ const [command, key, ...extra] = positionals;
 if (command === "list" ? positionals.length !== 1 : command !== "apply" || !key || extra.length) die(USAGE);
 
 const config = loadJobsConfig();
-const dataDir = process.env.DEFIGENT_DATA_DIR || "/home/ubuntu/.hermes/cache/scratch";
+const dataDir = process.env.DEFIGENT_DATA_DIR;
+if (!dataDir) die(`DEFIGENT_DATA_DIR is required: the inbox's data directory (production: /home/ubuntu/defigent-data)\n${USAGE}`);
 let db;
 try {
   // The inbox owns the ledger: this script never creates one.
@@ -108,7 +116,22 @@ if (args["dry-run"]) {
 }
 
 if (action.state !== "pending") die(`action ${key} is ${action.state}, not pending`);
-const sentBefore = action.result?.sent ?? [];
+// The claim: one UPDATE that succeeds for a single run. Every exit releases it (a finished action has no claim left).
+const claim = { id: crypto.randomUUID(), pid: process.pid, at: nowSeconds() };
+if (!store.claimAction(key, claim, claim.at - CLAIM_STALE_SECONDS, claim.at)) {
+  const current = store.getAction(key);
+  if (current?.state !== "pending") die(`action ${key} is ${current?.state}, not pending`);
+  die(`action ${key} is being applied by another run (claimed at ${current.result?.claim?.at}); check it with list before retrying`);
+}
+process.on("exit", () => {
+  try {
+    store.releaseAction(key, claim.id, nowSeconds());
+  } catch {
+    // the claim goes stale after CLAIM_STALE_SECONDS
+  }
+});
+// Read again under the claim: a run that finished in between may have recorded sends.
+const sentBefore = store.getAction(key).result?.sent ?? [];
 if (sentBefore.length && NOT_RETRYABLE.has(action.action))
   die(`action ${key} already sent ${sentBefore.join(", ")}; sending it again is not safe. Check those transactions on chain and settle the action by hand.`);
 
@@ -154,7 +177,7 @@ if (txs.length) {
       die(`${tx.label} was not accepted by the RPC: ${reasonOf(e)}.${minedSoFar()}`);
     }
     // Recorded before waiting: a crash or a timeout from here on leaves a trace of what may land.
-    store.finishAction(key, "pending", { sent: [...sentBefore, ...mined.map((t) => t.hash), hash] }, nowSeconds());
+    store.finishAction(key, "pending", { sent: [...sentBefore, ...mined.map((t) => t.hash), hash], claim }, nowSeconds());
     console.error(`${tx.label}: sent ${hash}`);
     let receipt;
     try {

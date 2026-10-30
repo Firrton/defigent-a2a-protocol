@@ -56,8 +56,12 @@ export function actionFor({ kind, next, job, offer, deliverable = null, config, 
   const make = (id, payload) => ({ key: `${kind}:${id}`, action: kind, payload });
   switch (kind) {
     case "review_offer": {
+      // Everything the operator approves with an accept: the job's terms, its expiry and what the peer asks for gas.
       const t = offer.terms;
-      return make(offer.offerId, { offerId: offer.offerId, side: t.side, service: t.service, price: t.price, from: t.from ?? null });
+      return make(offer.offerId, {
+        offerId: offer.offerId, side: t.side, service: t.service, description: t.description, price: t.price, deliverable: t.deliverable,
+        gas: t.gas ?? null, from: t.from ?? null, to: t.to ?? null, expiresAt: t.expiresAt,
+      });
     }
     case "create_job": {
       if (!ours(next, "create_job")) return null;
@@ -68,17 +72,20 @@ export function actionFor({ kind, next, job, offer, deliverable = null, config, 
       });
     }
     case "gas_grant": {
+      // Only our own outbound offers grant gas: an inbound offer's gas.grant is chosen by the peer and is never paid.
       const grant = offer.terms.gas?.grant;
-      if (!grant || !ours(next, "create_job")) return null;
+      if (offer.direction !== "out" || !grant || !ours(next, "create_job")) return null;
       return make(offer.offerId, { to: offer.acceptedAddress, amountWei: grant });
     }
     case "fund":
       if (!ours(next, "fund")) return null;
       return make(job.jobId.toString(), { jobId: job.jobId.toString(), token: job.paymentToken, amount: job.budget.toString() });
     case "evaluate":
-      if (!ours(next, "evaluate")) return null;
+      // Roles in v1: only a job Defigent created as the client (next.ours checks it as well).
+      if (!ours(next, "evaluate") || !same(job.client, config.client)) return null;
       return make(job.jobId.toString(), {
-        jobId: job.jobId.toString(), deadline: next.deadline, urgent: next.urgent, deliverable: deliverableRef(deliverable, offer?.deliverable),
+        jobId: job.jobId.toString(), offerId: offer?.offerId ?? null, client: job.client, deadline: next.deadline, urgent: next.urgent,
+        deliverable: deliverableRef(deliverable, offer?.deliverable),
       });
     case "refund":
       if (!ours(next, "refund")) return null;
@@ -101,8 +108,13 @@ export function handleOffer({ msg, now, config, counts: { openOffersForAgent }, 
   if (now >= msg.expiresAt) return fail("offer_expired", `Offer ${id} expired at ${msg.expiresAt}.`, "expiresAt");
   if (!same(msg.settlement.escrow, config.escrow))
     return fail("unsupported_terms", `Offer ${id} settles on escrow ${msg.settlement.escrow}; Defigent only uses ${config.escrow}.`, "settlement.escrow");
-  if (!tokenAllowed || !tokenByAddress(config, msg.price.token))
-    return fail("unsupported_terms", `Token ${msg.price.token} is not accepted for payment.`, "price.token");
+  const token = tokenByAddress(config, msg.price.token);
+  if (!tokenAllowed || !token) return fail("unsupported_terms", `Token ${msg.price.token} is not accepted for payment.`, "price.token");
+  // The operator judges the price from decimals and symbol, so they must be the configured token's.
+  if (msg.price.decimals !== token.decimals)
+    return fail("unsupported_terms", `Token ${token.address} has ${token.decimals} decimals, not ${msg.price.decimals}.`, "price.decimals");
+  if (msg.price.symbol !== token.symbol)
+    return fail("unsupported_terms", `Token ${token.address} is ${token.symbol}, not ${JSON.stringify(msg.price.symbol)}.`, "price.symbol");
   if (BigInt(msg.price.amount) > config.caps.maxOfferAmount)
     return fail("unsupported_terms", `Amount ${msg.price.amount} exceeds the cap of ${config.caps.maxOfferAmount} base units.`, "price.amount");
   if (openOffersForAgent >= config.caps.maxOpenOffersPerAgent)

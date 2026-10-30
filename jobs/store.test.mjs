@@ -250,3 +250,44 @@ test("transaction rolls back every write when fn throws", () => {
   assert.equal(s.transaction(() => s.enqueueAction({ key: "fund:42", action: "fund", payload: {}, contextId: "c", now: 1 })), true);
   assert.equal(s.getAction("fund:42").state, "pending");
 });
+
+test("claimAction lets exactly one run claim a pending action; a stale claim can be taken over and releaseAction keeps sent", () => {
+  const s = fresh();
+  s.enqueueAction({ key: "fund:42", action: "fund", payload: { jobId: "42" }, contextId: OFFER_ID, now: 100 });
+  const first = { id: "run-1", pid: 1, at: 1000 };
+  assert.equal(s.claimAction("fund:42", first, 1000 - 900, 1000), true);
+  assert.deepEqual(s.getAction("fund:42").result, { claim: first });
+  // A second run while the first one's claim is fresh loses.
+  assert.equal(s.claimAction("fund:42", { id: "run-2", pid: 2, at: 1001 }, 1001 - 900, 1001), false);
+  // A run's progress keeps its claim; releasing it keeps what was sent.
+  s.finishAction("fund:42", "pending", { sent: ["0xaa"], claim: first }, 1002);
+  assert.equal(s.releaseAction("fund:42", "run-2", 1003), false); // not the claimant
+  assert.equal(s.releaseAction("fund:42", "run-1", 1003), true);
+  assert.deepEqual(s.getAction("fund:42").result, { sent: ["0xaa"] });
+  // Claimed again, then abandoned: after the stale window another run takes it over.
+  assert.equal(s.claimAction("fund:42", { id: "run-3", pid: 3, at: 2000 }, 2000 - 900, 2000), true);
+  assert.equal(s.claimAction("fund:42", { id: "run-4", pid: 4, at: 2901 }, 2901 - 900, 2901), true);
+  assert.deepEqual(s.getAction("fund:42").result, { sent: ["0xaa"], claim: { id: "run-4", pid: 4, at: 2901 } });
+  // A claim with nothing else released leaves result NULL; done actions can never be claimed.
+  s.enqueueAction({ key: "refund:43", action: "refund", payload: { jobId: "43" }, contextId: OFFER_ID, now: 100 });
+  assert.equal(s.claimAction("refund:43", { id: "r", pid: 5, at: 3000 }, 2100, 3000), true);
+  assert.equal(s.releaseAction("refund:43", "r", 3001), true);
+  assert.equal(s.getAction("refund:43").result, null);
+  s.finishAction("refund:43", "done", { txs: [] }, 3002);
+  assert.equal(s.claimAction("refund:43", { id: "r2", pid: 6, at: 3003 }, 2103, 3003), false);
+  assert.equal(s.claimAction("missing:1", { id: "x", pid: 7, at: 3003 }, 2103, 3003), false);
+});
+
+test("escalateAction rewrites a pending non-urgent payload once and resets woken_at", () => {
+  const s = fresh();
+  s.enqueueAction({ key: "evaluate:42", action: "evaluate", payload: { jobId: "42", urgent: false }, contextId: OFFER_ID, now: 100 });
+  s.markWoken("evaluate:42", 101);
+  assert.equal(s.escalateAction("evaluate:42", { jobId: "42", urgent: true }, 200), true);
+  assert.deepEqual([s.getAction("evaluate:42").payload, s.getAction("evaluate:42").wokenAt], [{ jobId: "42", urgent: true }, null]);
+  s.markWoken("evaluate:42", 201);
+  assert.equal(s.escalateAction("evaluate:42", { jobId: "42", urgent: true }, 300), false);
+  assert.equal(s.getAction("evaluate:42").wokenAt, 201);
+  s.enqueueAction({ key: "evaluate:43", action: "evaluate", payload: { jobId: "43", urgent: false }, contextId: OFFER_ID, now: 100 });
+  s.finishAction("evaluate:43", "done", {}, 150);
+  assert.equal(s.escalateAction("evaluate:43", { jobId: "43", urgent: true }, 300), false);
+});

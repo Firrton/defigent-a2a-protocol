@@ -75,6 +75,8 @@ const REPUTATION_REG = "0x8004BAa17C55a88189AE136b182e5fdA19dE9b63";
 const OUTBOX = "defigent_outbox.jsonl";
 const OUTBOX_REJECTS = "defigent_outbox_rejects.jsonl";
 const WAKE_KEYS = ["ts", "contextId", "cls", "verified", "sender", "preview", "priority", "thread", "reply_via"];
+// typed jobs protocol: the command a typed_action wake line hands the operator carries the server's data directory and the env file
+const actionCommand = (h, key) => `DEFIGENT_DATA_DIR=${h.dir} node --env-file=/home/ubuntu/.hermes/.env ${join(ROOT, "scripts/jobs_actions.mjs")} apply ${key}`;
 const OUTBOX_STATES = ["completed", "input-required", "failed", "rejected"];
 const REPLY_KEYS = ["kind", "role", "parts", "messageId", "contextId", "verified", "sender", "task"];
 
@@ -823,7 +825,7 @@ describe("classifier: class, reply, state and wake queue per message class", { t
     assert.deepEqual([review.payload.service, review.payload.price.amount, review.payload.side], ["price-feed", "1000000", "provider"]);
     // a typed action is answered through scripts/jobs_actions.mjs, never with a free-text outbox line
     assert.deepEqual(Object.keys(typedLine.reply_via), ["script", "command", "note"]);
-    assert.equal(typedLine.reply_via.command, `node scripts/jobs_actions.mjs apply ${typedLine.action.key}`);
+    assert.equal(typedLine.reply_via.command, actionCommand(h, typedLine.action.key));
     assert.match(typedLine.reply_via.note, /jobs_actions/);
     assert.equal(typedLine.reply_via.line, undefined);
     assert.equal(preview("cl-10"), "Please send me a quote");
@@ -2838,7 +2840,10 @@ describe("typed jobs protocol: inbox divert", { timeout: 240000 }, () => {
       assert.equal(wake[0].verified, true);
       assert.deepEqual(wake[0].action, {
         key: `review_offer:${body.offer.offerId}`, action: "review_offer",
-        payload: { offerId: body.offer.offerId, side: "provider", service: "price-feed", price: { amount: "1000000", token: USDC, decimals: 6, symbol: "USDC" }, from: null },
+        payload: {
+          offerId: body.offer.offerId, side: "provider", service: "price-feed", description: "t", price: { amount: "1000000", token: USDC, decimals: 6, symbol: "USDC" },
+          deliverable: { mediaType: "application/octet-stream", acceptance: "operator" }, gas: null, from: null, to: null, expiresAt: legacy.expiry / 1000,
+        },
       });
       assert.equal(h.readJsonl("defigent_inbox.jsonl").find((e) => e.messageId === "tj-8").cls, "typed_offer");
     });
@@ -2879,7 +2884,7 @@ describe("typed jobs protocol: inbox divert", { timeout: 240000 }, () => {
       assert.ok(e, "a review_offer wake line");
       assert.equal(e.cls, "typed_action");
       assert.deepEqual(Object.keys(e.reply_via), ["script", "command", "note"]);
-      assert.equal(e.reply_via.command, `node scripts/jobs_actions.mjs apply ${e.action.key}`);
+      assert.equal(e.reply_via.command, actionCommand(h, e.action.key));
       assert.match(e.reply_via.note, /jobs_actions/);
       assert.equal(e.reply_via.line, undefined);
     });
@@ -2975,7 +2980,7 @@ describe("typed jobs protocol: outbox claims and the sweep", { timeout: 240000 }
       key: "review_claim:2", action: "review_claim",
       payload: { claimId: 2, name: "created", body: { jobId: "51", offerId: wrong.offerId }, reason },
     });
-    assert.equal(e.reply_via.command, "node scripts/jobs_actions.mjs apply review_claim:2");
+    assert.equal(e.reply_via.command, actionCommand(h, "review_claim:2"));
     assert.deepEqual(await query("SELECT job_id, chain_status FROM job_offers WHERE offer_id=?", wrong.offerId), { job_id: null, chain_status: null });
   });
 
@@ -2987,7 +2992,7 @@ describe("typed jobs protocol: outbox claims and the sweep", { timeout: 240000 }
     assert.equal(e.cls, "typed_action");
     assert.equal(e.contextId, "of_Direct0001");
     assert.deepEqual(e.action, { key, action: "create_job", payload });
-    assert.equal(e.reply_via.command, `node scripts/jobs_actions.mjs apply ${key}`);
+    assert.equal(e.reply_via.command, actionCommand(h, key));
     assert.notEqual((await query("SELECT woken_at FROM job_actions WHERE action_key=?", key)).woken_at, null);
     await sleep(1000); // several more sweeps: a woken action is not woken again
     assert.equal(h.readJsonl(WAKE).filter((x) => x.action?.key === key).length, 1);
@@ -3096,6 +3101,76 @@ describe("typed jobs protocol: chain unavailable", { timeout: 120000 }, () => {
   });
 });
 
+describe("typed jobs protocol: operator timeout, foreign jobs and unexpected errors", { timeout: 240000 }, () => {
+  const STRANGER = "0x3333333333333333333333333333333333333333";
+  const submittedJob = (client) => ({
+    client, provider: PROVIDER, evaluator: JOBS_CONFIG.evaluator, status: 2, expiredAt: nowSeconds() + 7 * 86400, hook: JOBS_CONFIG.hook,
+    budget: 250000n, paymentToken: USDC, submittedAt: nowSeconds() - 60, providerAgentId: 777n,
+  });
+  const inbound = {
+    offerId: "of_TimeOut001", side: "provider", service: "hash-text", description: "keccak256 of a text",
+    price: { amount: "250000", token: USDC, decimals: 6, symbol: "USDC" }, settlement: { chainId: 143, escrow: JOBS_CONFIG.escrow },
+    deliverable: { mediaType: "text/plain", acceptance: "operator" }, from: { address: PROVIDER, agentId: 777 }, expiresAt: nowSeconds() + 2 * 86400,
+  };
+  const writeDb = async (h, fn) => {
+    const { default: Database } = await import("better-sqlite3");
+    const db = new Database(join(h.dir, "defigent_a2a.db"), { fileMustExist: true });
+    try { return fn(db); } finally { db.close(); }
+  };
+  const task = async (h, id) => (await h.get(`/tasks/${id}`)).json;
+  const TIMEOUT_TEXT = /No operator reply yet/;
+  let h, stub;
+  before(async () => {
+    // 60 is our job (Defigent created it as the client); 61 is a stranger's job that only names Defigent as evaluator.
+    stub = await startChainStub({ jobs: { 60: submittedJob(JOBS_CONFIG.client), 61: submittedJob(STRANGER) }, bindings: [{ address: PROVIDER, agentId: 777 }], allowed: [USDC] });
+    h = await Harness.start({ rpcUrl: stub.url, env: { DEFIGENT_OPERATOR_TIMEOUT_MS: "1500", DEFIGENT_OPERATOR_SWEEP_MS: "300" } });
+  });
+  after(async () => { await h?.stop(); await stub?.close(); });
+
+  it("typed tasks that are working on Defigent's turn are never timed out; an old untyped stuck task still is", async () => {
+    const offer = await h.post(msgReq("tt-1", [{ data: { "defigent.job.offer": inbound } }]));
+    assert.equal(offer.json.result.status.state, "working");
+    const ours = await h.post(msgReq("tt-2", [{ data: { "defigent.job.query": { jobId: "60" } } }]));
+    assert.equal(ours.json.result.status.state, "working");
+    // a task left working with nothing queued for the operator (the sweeper's stuck pass) is the control
+    await writeDb(h, (db) => db.prepare("INSERT INTO tasks (context_id, state, created_at, updated_at) VALUES ('legacy-stuck', 'working', 0, 0)").run());
+    await h.waitFor(async () => (await task(h, "legacy-stuck")).task.state === "input-required", { what: "the untyped stuck task timed out" });
+    await sleep(3000); // two operator timeouts and several sweeps after the typed requests
+    for (const id of ["t-tt-1", "t-tt-2"]) {
+      const t = await task(h, id);
+      assert.equal(t.task.state, "working", id);
+      assert.ok(!t.history.some((m) => TIMEOUT_TEXT.test(m.text)), `${id} got no timeout message`);
+    }
+    assert.ok((await task(h, "legacy-stuck")).history.some((m) => TIMEOUT_TEXT.test(m.text)));
+    // our Submitted job wakes evaluate, with the client and no offer in its payload
+    const e = h.readJsonl("defigent_wake_queue.jsonl").find((x) => x.action?.key === "evaluate:60");
+    assert.ok(e, "an evaluate wake line for our job");
+    assert.deepEqual([e.action.payload.offerId, e.action.payload.client, e.action.payload.urgent], [null, JOBS_CONFIG.client, false]);
+  });
+
+  it("a stranger's job that names Defigent as evaluator gets status only: no evaluate action and input-required", async () => {
+    const r = await h.post(msgReq("tt-3", [{ data: { "defigent.job.query": { jobId: "61" } } }]));
+    const next = typedData(r)["defigent.job.status"].next;
+    assert.deepEqual([next.actor, next.ours, next.action], ["evaluator", false, "evaluate"]);
+    assert.equal(r.json.result.status.state, "input-required");
+    assert.equal(h.readJsonl("defigent_wake_queue.jsonl").find((x) => x.action?.key === "evaluate:61"), undefined);
+    const db = await h.db();
+    try { assert.equal(db.prepare("SELECT 1 FROM job_actions WHERE action_key='evaluate:61'").get(), undefined); } finally { db.close(); }
+  });
+
+  it("an unexpected failure on the typed path is a JSON-RPC -32603 envelope, not an HTML 500", async () => {
+    await writeDb(h, (db) => db.exec("DROP TABLE job_seen"));
+    const r = await h.post(msgReq("tt-4", [{ data: { "defigent.job.query": { jobId: "60" } } }]));
+    assert.equal(r.status, 200);
+    assert.match(r.headers["content-type"], /^application\/json/);
+    assert.deepEqual(r.json, { jsonrpc: "2.0", id: "tt-4", error: { code: -32603, message: "Internal error", data: [
+      { "@type": "type.googleapis.com/google.rpc.ErrorInfo", reason: "INTERNAL", domain: EXT_URI, metadata: { retryable: "true" } },
+    ] } });
+    assert.equal((await h.get("/tasks/t-tt-4")).status, 404);
+    assert.match(h.readJsonl("defigent_inbox.jsonl").find((x) => x.cls === "jobs_error" && x.messageId === "tt-4").error, /job_seen/);
+  });
+});
+
 describe("typed jobs protocol: card, schema and spec", { timeout: 120000 }, () => {
   let h;
   before(async () => { h = await Harness.start(); });
@@ -3152,5 +3227,9 @@ describe("typed jobs protocol: card, schema and spec", { timeout: 120000 }, () =
     const a = JSON.parse(p.example_accept);
     assert.deepEqual(Object.keys(a.params.message.parts.find((part) => part.data).data), ["defigent.job.accept"]);
     assert.equal(r.offer_schema_v1.status, "legacy: still accepted, normalized to defigent.job.offer");
+    // the documented example must not be answered offer_expired: it carries no expiry (24 h from now by default)
+    const legacy = JSON.parse(r.offer_schema_v1.example).params.message.parts.find((part) => part.data).data;
+    assert.equal(legacy.expiry, undefined);
+    assert.deepEqual([legacy.intent, legacy.service, legacy.price, legacy.asset], ["offer", "your-service", "1.00", "USDC"]);
   });
 });

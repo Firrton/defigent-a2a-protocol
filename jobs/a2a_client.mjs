@@ -42,7 +42,8 @@ export async function sendTyped({ endpoint, message, fetchImpl = fetch, timeoutM
   } catch {
     // handled below
   }
-  if (rpc?.error !== undefined) return { status: res.status, error: rpc.error };
+  // != null: a peer that answers `error: null` next to its result has not failed.
+  if (rpc?.error != null) return { status: res.status, error: rpc.error };
   if (rpc && Object.hasOwn(rpc, "result")) return { status: res.status, result: rpc.result };
   return { status: res.status, error: { message: `HTTP ${res.status}: response is not JSON-RPC: ${raw.slice(0, 200)}` } };
 }

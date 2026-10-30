@@ -64,7 +64,7 @@ Formats:
 |---|---|
 | Amount | base units as a decimal string, `^(0\|[1-9][0-9]*)$`, at most 2^256−1 (`"250000"` is 0.25 USDC) |
 | Address | `0x` + 40 hex. Accepted in any case, normalized to an EIP-55 checksum |
-| Time | Unix seconds |
+| Time | Unix seconds, below 10^10 (a millisecond timestamp is a schema error) |
 | `chainId` | always explicit; `143` (Monad) in v1 |
 | `offerId` | `of_` followed by 10 characters `[A-Za-z0-9]`, chosen by whoever issues the offer |
 | `jobId` | the escrow's job id as a decimal string of a uint256 ≥ 1 |
@@ -98,11 +98,11 @@ The JSON Schema is the normative field list. Fields in brackets are optional.
 | `side` | `"client"` (the issuer pays) or `"provider"` (the issuer works) |
 | `service` | lowercase slug `^[a-z0-9][a-z0-9-]{0,63}$` |
 | `description` | string, 1–2000 characters |
-| `price` | `{ amount, token, decimals (0–18), symbol (1–16 chars) }` |
+| `price` | `{ amount, token, decimals (0–18), symbol (1–16 chars) }`. `decimals` and `symbol` must be the token's own |
 | `settlement` | `{ chainId: 143, escrow }` |
 | `deliverable` | `{ mediaType, acceptance: "operator" \| "hash", [expectedHash] }` |
 | [`providerSteps`] | up to 16 strings, e.g. `["setBudget", "submit"]` |
-| [`gas`] | `{ providerTxs (0–100), grant: amount \| null }` |
+| [`gas`] | `{ providerTxs (0–100), grant: amount \| null }`. `grant` is wei of MON the client sends the provider for gas. Defigent pays it only on offers it issues; on an offer it receives, the grant is shown to its operator and never paid |
 | [`from`] | `{ address, agentId }`: the issuer's identity |
 | [`to`] | `{ agentId }`: the only agent allowed to accept |
 | [`replyTo`] | `{ url (http/https, ≤ 2048), contextId (1–256 chars) }` |
@@ -212,7 +212,7 @@ after `expiredAt` (the evaluation grace period).
 | [`action`] | the responder's internal step: `create_job`, `fund`, `evaluate`, `refund` |
 | [`to`] | contract to call |
 | [`function`] | full function signature, e.g. `setBudget(uint256,address,uint256,bytes)` |
-| [`args`] | arguments as strings, in order |
+| [`args`] | arguments as strings, in order. Present only when every argument is known: a `null` stands for a value the parties have not agreed here (a budget with no offer on record). After `Funded` there are no `args`, since only the provider knows the deliverable hash |
 | [`data`] | ready-to-sign calldata. An agent with a wallet can send it without knowing the ABI |
 | [`simulation`] | `{ ok: true }` or `{ ok: false, reason }`: the result of an `eth_call` of `data` from the provider's address |
 | [`deadline`], [`urgent`] | for `evaluate`: the end of the evaluation window and whether it is close |
@@ -234,8 +234,10 @@ Simulate before you spend gas: when `simulation.ok` is `false`, the transaction 
 | Open or Funded and expired, no pending claim | `claimRefund(jobId)` | anyone |
 
 In v1 Defigent is always the client and the evaluator. Inbound offers from either side go to review; the verdict comes
-back as a typed `accept` or `decline`. The responder also sweeps its open jobs periodically, so a `submit` nobody
-announced and an expiring job are still picked up.
+back as a typed `accept` or `decline`. A job that names Defigent as evaluator but was not created by Defigent gets a
+`status` only (`ours: false`): Defigent does not evaluate it. The responder also sweeps its open jobs periodically, so a
+`submit` nobody announced and an expiring job are still picked up, and a pending evaluation is raised again as `urgent`
+in the last 6 hours before its deadline.
 
 ## 5. A2A task state
 
@@ -252,7 +254,8 @@ the peer used.
 | The evaluator rejected the deliverable, the job expired, or the offer expired | `failed` |
 
 In A2A 1.0 these are `TASK_STATE_WORKING`, `TASK_STATE_INPUT_REQUIRED`, `TASK_STATE_COMPLETED`, `TASK_STATE_REJECTED`
-and `TASK_STATE_FAILED`.
+and `TASK_STATE_FAILED`. A `status` or `error` sent to the inbox keeps the task's state, which can also be `canceled`
+(`TASK_STATE_CANCELED`).
 
 ## 6. Errors
 
@@ -275,7 +278,7 @@ created. `error.data` carries a `google.rpc.BadRequest` with the field violation
 | `state_mismatch` | the message does not fit the offer's state, e.g. declining an accepted offer | no |
 | `idempotency_conflict` | the same `offerId` arrived before with different content | no |
 | `unsupported_key` | a `defigent.job.*` key that v1 does not define | no |
-| `unsupported_terms` | another escrow, a token that is not allowed, or an amount over the cap | no |
+| `unsupported_terms` | another escrow, a token that is not allowed, `decimals` or `symbol` that are not the token's, or an amount over the cap | no |
 | `capacity_exceeded` | a quantity cap was reached (open offers per agent, jobs per day) | yes |
 
 ## 7. Idempotency
@@ -299,15 +302,24 @@ version:
 {"offerId":"of_7Hq2kd9xTa","terms":"0x<keccak256 of the canonical offer JSON>","v":1}
 ```
 
-`terms` is the keccak256 of the offer's canonical JSON (same canonicalization). Anyone can check that a job matches the
-offer before spending gas on it. The job's `client` is the address that created it.
+`terms` is the keccak256 of the offer's canonical JSON (same canonicalization), computed on the offer **as the responder
+validated it**, not on the bytes that were sent:
+
+- addresses (`price.token`, `settlement.escrow`, `from.address`) in their EIP-55 checksum form;
+- hashes (`deliverable.expectedHash`) in lowercase;
+- fields this extension does not define removed, at every level;
+- optional fields that were absent stay absent (no defaults are added).
+
+An issuer that sent its offer in another form normalizes it the same way before hashing. Anyone can then check that a
+job matches the offer before spending gas on it. The job's `client` is the address that created it.
 
 ## 9. Compatibility with `offer_schema_v1`
 
 A DataPart `{ intent: "offer", service, price, asset?, expiry?, terms? }` is still accepted and normalized to a
 `defigent.job.offer` with `side: "provider"`: `price` (decimal) becomes base units of `asset` (USDC by default), `expiry`
 (milliseconds) becomes `expiresAt` (seconds; 24 h from now when absent), and `terms` becomes `description`. The reply is
-typed.
+typed, and the normalized offer follows the rules of a `defigent.job.offer`: an expired one gets `offer_expired`, and one
+over the amount cap gets `unsupported_terms`.
 
 ## 10. Security
 

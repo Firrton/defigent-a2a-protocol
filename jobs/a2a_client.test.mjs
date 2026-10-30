@@ -56,6 +56,10 @@ test("sendTyped returns JSON-RPC errors, HTTP failures and network failures with
   const asJson = (body, status) => async () => new Response(JSON.stringify(body), { status });
   assert.deepEqual(await sendTyped({ endpoint: "https://p.example", message, fetchImpl: asJson({ jsonrpc: "2.0", id: 1, error: rpcError }, 200) }),
     { status: 200, error: rpcError });
+  // error: null next to a result is a success: the peer's synchronous accept must not be lost.
+  const result = { kind: "task", id: "c", status: { state: "working" } };
+  assert.deepEqual(await sendTyped({ endpoint: "https://p.example", message, fetchImpl: asJson({ jsonrpc: "2.0", id: 1, error: null, result }, 200) }),
+    { status: 200, result });
 
   const html = await sendTyped({ endpoint: "https://p.example", message, fetchImpl: async () => new Response("<html>bad gateway</html>", { status: 502 }) });
   assert.equal(html.status, 502);

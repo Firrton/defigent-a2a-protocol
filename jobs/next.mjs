@@ -45,13 +45,15 @@ export function nextStep({ job, offer, now, config, pendingClaim = false }) {
     }
     case "Funded":
       return {
-        actor: "provider", ours: false, to: config.escrow, function: signature("submit"), args: [jobId, "keccak256(deliverable)", "0x"],
-        note: "The escrow is funded. Do the work and submit the keccak256 hash of the deliverable.",
+        // No args: the deliverable hash is only known to the provider, and args always carry real values.
+        actor: "provider", ours: false, to: config.escrow, function: signature("submit"),
+        note: `The escrow is funded. Do the work and call submit(${jobId}, <keccak256 of the deliverable>, 0x).`,
       };
     case "Submitted": {
       const deadline = job.expiredAt + EVALUATION_GRACE_SECONDS;
       return {
-        actor: "evaluator", ours: same(job.evaluator, config.evaluator), action: "evaluate", deadline, urgent: now >= deadline - URGENT_SECONDS,
+        // Roles in v1: Defigent evaluates only the jobs it created as the client; any other job naming it as evaluator gets status only.
+        actor: "evaluator", ours: isClient && same(job.evaluator, config.evaluator), action: "evaluate", deadline, urgent: now >= deadline - URGENT_SECONDS,
         note: "The deliverable was submitted. The evaluator completes or rejects the job before the deadline.",
       };
     }

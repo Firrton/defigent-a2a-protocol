@@ -27,7 +27,9 @@ const Address = z.string().regex(/^0x[0-9a-fA-F]{40}$/, "must be a 0x-prefixed 2
 const Hex32 = z.string().regex(/^0x[0-9a-fA-F]{64}$/, "must be a 0x-prefixed 32-byte hex value").transform((h) => h.toLowerCase());
 const OfferId = z.string().regex(/^of_[A-Za-z0-9]{10}$/, "must be of_ followed by 10 characters [A-Za-z0-9]");
 const AgentId = z.number().int().nonnegative();
-const UnixSeconds = z.number().int().positive();
+// Below 10^10 (year 2286): a millisecond timestamp (~1.7e12) is refused instead of becoming a job's expiredAt.
+const UNIX_SECONDS_MAX = 9999999999;
+const UnixSeconds = z.number().int().positive().max(UNIX_SECONDS_MAX, "must be Unix seconds, not milliseconds");
 
 const offer = z.object({
   offerId: OfferId,
