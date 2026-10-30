@@ -113,11 +113,18 @@ function logInbox(entry) {
 }
 
 // ---------- A2A agent card (well-known standard) ----------
+// Taifoon listing claim: the challenge nonce is read from disk on every request, so
+// re-claiming never needs a service restart (write data/taifoon_listing.json {"nonce": ...}).
+function readTaifoonListing() {
+  try { return JSON.parse(fs.readFileSync(`${DATA_DIR}/taifoon_listing.json`, "utf8")).nonce || null; }
+  catch { return null; }
+}
 app.get("/.well-known/agent-card.json", (_req, res) => {
   res.json({
     name: "Defigent",
     description: "Agentic commerce specialist agent on Monad and Base: on-chain wallet digests, agent directory lookup, and regime analytics. ERC-8004 agentId 10331 (Monad) and 114426 (Base). Talks and pays x402 (v1+v2).",
     url: `${BASE}/inbox`,
+    endpoint: `${BASE}/inbox`,
     version: "1.4.0",
     protocolVersion: "1.0.1",
     supportedInterfaces: [
@@ -126,6 +133,14 @@ app.get("/.well-known/agent-card.json", (_req, res) => {
     ],
     address: PAY_TO,
     agentWallet: PAY_TO,
+    endpoints: [
+      { url: `${BASE}/inbox`, kind: "a2a" },
+      { url: `${BASE}/mcp`, kind: "mcp" },
+    ],
+    classes: ["mcp.digest", "chat.word_count"],
+    price_usdc: { unit: "per-job", min: 0.05, max: 0.05 },
+    // Taifoon listing claim (path B): the nonce we must serve lands here (data/taifoon_listing.json).
+    ...(readTaifoonListing() ? { taifoon_listing: readTaifoonListing() } : {}),
     capabilities: { streaming: true, pushNotifications: false, stateTransitionHistory: true, extendedAgentCard: true },
     securitySchemes: {},
     extensions: [{ uri: "defigent:identity-eip712@v1", description: "Messages may carry params.auth {address,signature,timestamp,nonce} — EIP-712 signed identity (chainId 143). Verified replies set verified:true." }],
