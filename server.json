@@ -2,11 +2,11 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.Firrton/defigent",
   "description": "Agent messaging inbox (A2A, EIP-712 signed), ERC-8004 directory, status and text hashing for Monad.",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "remotes": [
     {
       "type": "streamable-http",
-      "url": "https://opacus-liana-lanceted.ngrok-free.dev/mcp",
+      "url": "https://defigent.app/mcp",
       "name": "Defigent MCP (streamable-http)"
     }
   ],
