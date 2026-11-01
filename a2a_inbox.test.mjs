@@ -4,7 +4,7 @@
 //        (needs Node >= 22: better-sqlite3@13 declares engines.node ">=22" and segfaults on Node 20, e.g.
 //         PATH="$HOME/.nvm/versions/node/v22.17.0/bin:$PATH" node --test a2a_inbox.test.mjs)
 //        Prerequisites: `pnpm install`, and outbound network access to the two x402 facilitators (Monad: molandak, Base: payai)
-//        (http_server.mjs awaits resourceServer.initialize() at start-up; the suite fails fast with a message if one is unreachable).
+//        for the /digest 402 test (the server starts without them; /digest answers 503 until both have answered).
 //
 // WHAT IT IS: a regression net that describes what the server does TODAY, defects included. It starts the real server
 // (node http_server.mjs) as a child process per test group, with DEFIGENT_DATA_DIR pointing at a fresh temp directory and
@@ -108,7 +108,7 @@ class Harness {
     Object.assign(env, extraEnv);
     const h = new Harness({ dir, port, env, budget });
     LIVE.add(h);
-    // an x402 facilitator is occasionally unreachable for a moment and would cancel a whole group: retry the start up to 2 more times
+    // a start that fails for a passing reason would cancel a whole group: retry it up to 2 more times
     for (let attempt = 0; ; attempt++) {
       try { await h.spawnServer(); return h; } catch (e) {
         await h.killChild();
@@ -155,8 +155,7 @@ class Harness {
       if (this.exit) {
         const { code, signal } = this.exit;
         let hint = "";
-        if (/no supported payment kinds|Failed to fetch supported kinds/.test(this.log)) hint = "\nAn x402 facilitator (https://x402-facilitator.molandak.org for Monad, https://facilitator.payai.network for Base) is unreachable from this machine. http_server.mjs awaits resourceServer.initialize() at start-up, so the server cannot start offline. Re-run with network access.";
-        else if (signal === "SIGSEGV" || code === 139) hint = `\nSIGSEGV on start-up: better-sqlite3@13 needs Node >= 22 (running ${process.versions.node}).`;
+        if (signal === "SIGSEGV" || code === 139) hint = `\nSIGSEGV on start-up: better-sqlite3@13 needs Node >= 22 (running ${process.versions.node}).`;
         throw new Error(`http_server.mjs exited during start-up (code ${code}, signal ${signal}).${hint}\n--- server output ---\n${this.log}`);
       }
       try {
@@ -164,7 +163,7 @@ class Harness {
         if (r.ok) return;
       } catch {}
       if (Date.now() - t0 > timeoutMs) {
-        throw new Error(`http_server.mjs did not answer GET /.well-known/agent-card.json within ${timeoutMs} ms. It may be stuck contacting an x402 facilitator (resourceServer.initialize()); check network access.\n--- server output ---\n${this.log}`);
+        throw new Error(`http_server.mjs did not answer GET /.well-known/agent-card.json within ${timeoutMs} ms.\n--- server output ---\n${this.log}`);
       }
       await sleep(100);
     }
@@ -1793,6 +1792,55 @@ describe("GET /status with RPCs that never answer", { timeout: 60000 }, () => {
   });
 });
 
+// A local stand-in for an x402 facilitator: GET /supported lists the exact scheme on one network, in the shape the real ones return.
+async function fakeFacilitator(network, port = 0) {
+  const server = http.createServer((req, res) => {
+    if (req.method !== "GET" || req.url !== "/supported") return res.writeHead(404).end();
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ kinds: [{ x402Version: 2, scheme: "exact", network, extra: {} }], extensions: [], signers: {} }));
+  });
+  await new Promise((r) => server.listen(port, "127.0.0.1", r));
+  return { url: `http://127.0.0.1:${server.address().port}`, close: () => new Promise((r) => server.close(r)) };
+}
+
+// @x402/express checked the facilitators in the background after `listening` and called process.exit(1) when one of them did not
+// list a /digest network (RouteConfigurationError "missing_facilitator"): an unreachable Base facilitator took the inbox down with it.
+describe("x402: an unreachable facilitator keeps the server up and /digest closed until it answers", { timeout: 60000 }, () => {
+  let h, monad, base, basePort;
+  before(async () => {
+    monad = await fakeFacilitator("eip155:143");
+    basePort = await freePort(); // closed: nothing listens here until the recovery test starts the Base stand-in
+    h = await Harness.start({ env: { FACILITATOR: monad.url, FACILITATOR_BASE: `http://127.0.0.1:${basePort}`, DEFIGENT_X402_RETRY_MS: "300" } });
+  });
+  after(async () => { await h?.stop(); await monad?.close(); await base?.close(); });
+
+  it("GET /digest answers 503 with Retry-After while the Base facilitator is unreachable", async () => {
+    const r = await h.get("/digest?address=0x0000000000000000000000000000000000000001");
+    assert.equal(r.status, 503);
+    assert.match(r.headers["retry-after"], /^\d+$/);
+    assert.match(r.json.error, /facilitator/);
+  });
+
+  it("stays up and keeps serving /inbox, the card, /tasks and /status", async () => {
+    await sleep(1000); // the old crash came right after the failed check: give it time to happen
+    assert.equal(h.exit, null, `server exited\n${h.log}`);
+    const r = await h.post(msgReq("x402-down-1", textParts(PROBE_TEXT)));
+    assertRpcResult(r, "x402-down-1");
+    assertHybridReply(r.json.result, { contextId: "t-x402-down-1", state: "working", text: TXT.other });
+    assert.equal((await h.get("/.well-known/agent-card.json")).status, 200);
+    assert.equal((await h.get("/tasks/t-x402-down-1")).json.task.state, "working");
+    assert.equal((await h.get("/status")).status, 200);
+    assert.equal(h.exit, null, `server exited\n${h.log}`);
+  });
+
+  it("opens /digest once the Base facilitator answers, with both networks on offer", async () => {
+    base = await fakeFacilitator("eip155:8453", basePort);
+    const r = await h.waitFor(async () => { const d = await h.get("/digest?address=0x0000000000000000000000000000000000000001"); return d.status === 402 && d; }, { what: "/digest to answer 402" });
+    const requirements = JSON.parse(Buffer.from(r.headers["payment-required"], "base64").toString("utf8"));
+    assert.deepEqual(requirements.accepts.map((a) => [a.network, a.amount]), [["eip155:143", "1000"], ["eip155:8453", "1000"]]);
+  });
+});
+
 // ---------------------------------------------------------------------------------------------------------------------
 // 9. Rate limit — the only group that sends an 11th request, in its own process
 // ---------------------------------------------------------------------------------------------------------------------
@@ -1852,7 +1900,7 @@ describe("rate limit: 10 requests per minute per IP on /inbox", { timeout: 12000
 // ---------------------------------------------------------------------------------------------------------------------
 describe("HTTP surface: streaming extras, CORS, neighbours, webhook", { timeout: 120000 }, () => {
   let h; const WEBHOOK_SECRET = "test-webhook-secret"; // the server's own HMAC auth path, exercised with a test secret
-  before(async () => { h = await Harness.start({ env: { WEBHOOK_SECRET } }); });
+  before(async () => { h = await Harness.start({ env: { WEBHOOK_SECRET, DEFIGENT_X402_RETRY_MS: "1000" } }); });
   after(async () => { await h?.stop(); });
 
   it("message/stream (0.3.0 name) streams without an Accept header and ends in the task's final state", async () => {
@@ -1909,7 +1957,9 @@ describe("HTTP surface: streaming extras, CORS, neighbours, webhook", { timeout:
   });
 
   it("GET /digest without payment answers 402 with a payment-required header and never reaches the handler", async () => {
-    const r = await h.get("/digest?address=0x0000000000000000000000000000000000000001");
+    // the real facilitators are checked in the background; a blip at start-up keeps /digest at 503 until a retry (1 s here) passes
+    const r = await h.waitFor(async () => { const d = await h.get("/digest?address=0x0000000000000000000000000000000000000001"); return d.status !== 503 && d; },
+      { what: "the x402 facilitators (Monad: molandak, Base: payai) to answer; /digest answers 503 while one is unreachable" });
     // GAP(G13): the paid skill exists only as this plain HTTP 402 flow, outside A2A
     assert.equal(r.status, 402);
     assert.ok(r.headers["payment-required"]);

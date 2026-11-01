@@ -1,13 +1,13 @@
 // Defigent HTTP x402 storefront — public sales endpoint on Monad mainnet
 // Endpoints: GET /info (free), GET /digest (paid $0.001 x402 exact eip155:143)
 import express from "express";
-import { paymentMiddleware, x402ResourceServer } from "@x402/express";
+import { paymentMiddlewareFromHTTPServer, x402HTTPResourceServer, x402ResourceServer } from "@x402/express";
 import { ExactEvmScheme } from "@x402/evm/exact/server";
 import { HTTPFacilitatorClient } from "@x402/core/server";
 
 const PAY_TO = "0x940ecB27d8f4F7009c8BC12969496E9639717638";
 const RPC = process.env.RPC_URL || "https://rpc.monad.xyz";
-const FACILITATOR = "https://x402-facilitator.molandak.org";
+const FACILITATOR = process.env.FACILITATOR || "https://x402-facilitator.molandak.org";
 const FACILITATOR_BASE = process.env.FACILITATOR_BASE || "https://facilitator.payai.network";
 const NETWORK = "eip155:143";
 const NETWORK_BASE = "eip155:8453";
@@ -35,25 +35,53 @@ app.use(express.static("public", { index: false })); // dashboard assets (public
 app.get("/", (_req, res) => res.sendFile("index.html", { root: "public" }));
 app.get("/jobs", (_req, res) => res.sendFile("jobs.html", { root: "public" }));
 
+// The x402 start-up check is ours, not the middleware's. With its default syncFacilitatorOnStart=true, @x402/express runs the check
+// un-awaited after `listening` and calls process.exit(1) when a facilitator does not list a /digest network (RouteConfigurationError
+// "missing_facilitator", which is what an unreachable facilitator looks like), so one facilitator being down took every route down.
+// Here the check runs in the background at start-up and again on demand, at most once per X402_RETRY_MS, and until it passes only
+// /digest answers 503. Once it has passed, the middleware is used exactly as before.
+const X402_RETRY_MS = Math.max(100, Number(process.env.DEFIGENT_X402_RETRY_MS) || 30_000);
+const X402_WAIT_MS = 5000; // how long a /digest request waits for a check already in flight before it answers 503
 const facilitatorMonad = new HTTPFacilitatorClient({ url: FACILITATOR });
 const facilitatorBase = new HTTPFacilitatorClient({ url: FACILITATOR_BASE });
 const resourceServer = new x402ResourceServer([facilitatorMonad, facilitatorBase])
   .register(NETWORK, new ExactEvmScheme())
   .register(NETWORK_BASE, new ExactEvmScheme());
-await resourceServer.initialize();
-
-app.use(paymentMiddleware(
-  {
-    "GET /digest": {
-      accepts: [
-        { scheme: "exact", price: "$0.001", network: NETWORK, payTo: PAY_TO },
-        { scheme: "exact", price: "$0.001", network: NETWORK_BASE, payTo: PAY_TO },
-      ],
-      description: "Defigent on-chain wallet digest (balances), ERC-8004 agentId 10331 (Monad) / 114426 (Base). Dual-chain x402.",
-    },
+const x402Http = new x402HTTPResourceServer(resourceServer, {
+  "GET /digest": {
+    accepts: [
+      { scheme: "exact", price: "$0.001", network: NETWORK, payTo: PAY_TO },
+      { scheme: "exact", price: "$0.001", network: NETWORK_BASE, payTo: PAY_TO },
+    ],
+    description: "Defigent on-chain wallet digest (balances), ERC-8004 agentId 10331 (Monad) / 114426 (Base). Dual-chain x402.",
   },
-  resourceServer
-));
+});
+const x402Payment = paymentMiddlewareFromHTTPServer(x402Http, undefined, undefined, false);
+let x402Ready = false, x402Check = null, x402LastCheck = 0;
+function checkX402() {
+  if (x402Ready || x402Check || Date.now() - x402LastCheck < X402_RETRY_MS) return x402Check;
+  x402LastCheck = Date.now();
+  // initialize() asks every facilitator for /supported, then checks that each /digest network has one
+  return x402Check = x402Http.initialize().then(
+    () => { x402Ready = true; console.error("[defigent-http] x402 facilitators ready, /digest open"); },
+    (e) => console.error(`[defigent-http] x402 facilitator check failed, /digest answers 503 until a retry passes: ${e.message}`),
+  ).finally(() => { x402Check = null; });
+}
+checkX402();
+app.use(async (req, res, next) => {
+  if (!x402Ready && x402Http.requiresPayment({ path: req.path, decodedPath: decodedPath(req.path), method: req.method })) {
+    await Promise.race([checkX402(), new Promise((r) => setTimeout(r, X402_WAIT_MS).unref())]);
+    if (!x402Ready) {
+      // a check still in flight (a facilitator that never answers holds one for up to its 90 s timeout) has no known end: one full interval
+      const retryAfter = Math.ceil((x402Check ? X402_RETRY_MS : Math.max(1000, x402LastCheck + X402_RETRY_MS - Date.now())) / 1000);
+      res.set("Retry-After", String(retryAfter));
+      return res.status(503).json({ error: "x402 payment facilitator unavailable, retry later", retryAfter });
+    }
+  }
+  return x402Payment(req, res, next);
+});
+// the path the middleware matches routes against as well (@x402/express decodedRoutePath)
+function decodedPath(p) { try { return decodeURIComponent(p); } catch { return p; } }
 
 app.get("/info", (_req, res) => {
   res.json({
