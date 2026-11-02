@@ -123,7 +123,8 @@ import path from "path";
 
 const BASE = `https://defigent.app`; // public origin: Cloudflare Tunnel -> this server on :8080
 const START_TS = Date.now();
-const DATA_DIR = process.env.DEFIGENT_DATA_DIR || "/home/ubuntu/.hermes/cache/scratch"; // override for local/test runs; default = production path
+// override for local/test runs; default = production path, outside the Hermes scratch cache (its pruner deleted the DB there)
+const DATA_DIR = process.env.DEFIGENT_DATA_DIR || "/home/ubuntu/defigent-data";
 const INBOX_FILE = `${DATA_DIR}/defigent_inbox.jsonl`;
 const WAKE_QUEUE_FILE = `${DATA_DIR}/defigent_wake_queue.jsonl`;
 const WEBHOOK_REJECTS_FILE = `${DATA_DIR}/defigent_webhook_rejects.jsonl`;
@@ -143,7 +144,7 @@ function logInbox(entry) {
 // ---------- A2A agent card (well-known standard) ----------
 const IDENTITY_EXTENSION = { uri: "defigent:identity-eip712@v1", description: "Messages may carry params.auth {address,signature,timestamp,nonce} — EIP-712 signed identity (chainId 143). Verified replies set verified:true." };
 // Taifoon listing claim: the challenge nonce is read from disk on every request, so
-// re-claiming never needs a service restart (write data/taifoon_listing.json {"nonce": ...}).
+// re-claiming never needs a service restart (write $DEFIGENT_DATA_DIR/taifoon_listing.json {"nonce": ...}).
 function readTaifoonListing() {
   try { return JSON.parse(fs.readFileSync(`${DATA_DIR}/taifoon_listing.json`, "utf8")).nonce || null; }
   catch { return null; }
@@ -168,7 +169,7 @@ app.get("/.well-known/agent-card.json", (_req, res) => {
     ],
     classes: ["mcp.digest", "chat.word_count"],
     price_usdc: { unit: "per-job", min: 0.05, max: 0.05 },
-    // Taifoon listing claim (path B): the nonce we must serve lands here (data/taifoon_listing.json).
+    // Taifoon listing claim (path B): the nonce we must serve lands here ($DEFIGENT_DATA_DIR/taifoon_listing.json).
     ...(readTaifoonListing() ? { taifoon_listing: readTaifoonListing() } : {}),
     capabilities: { streaming: true, pushNotifications: false, stateTransitionHistory: true, extendedAgentCard: true, extensions: [JOBS_EXTENSION, IDENTITY_EXTENSION] },
     securitySchemes: {},
@@ -1314,7 +1315,7 @@ app.get("/status", async (_req, res) => {
 // enriches it (welcomeTx, status), so a missing or corrupt cache file can no longer empty /network.
 import { fileURLToPath } from "url";
 import { readDirectory, resolveDirectory, rebuildDirectory, rebuildTracker } from "./network_directory.mjs";
-const NETWORK_FILE = "/home/ubuntu/.hermes/cache/scratch/defigent_network.json";
+const NETWORK_FILE = path.join(DATA_DIR, "defigent_network.json"); // lead-monitor cache, next to the rest of the server's data
 const NETWORK_LOCAL = fileURLToPath(new URL("./data/network.json", import.meta.url));     // runtime rebuild (gitignored)
 const NETWORK_SEED = fileURLToPath(new URL("./data/network.seed.json", import.meta.url)); // committed snapshot
 const NETWORK_REBUILD_MS = 2 * 60 * 60 * 1000;
