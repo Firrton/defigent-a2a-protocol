@@ -144,7 +144,7 @@ function logInbox(entry) {
 // ---------- A2A agent card (well-known standard) ----------
 const IDENTITY_EXTENSION = { uri: "defigent:identity-eip712@v1", description: "Messages may carry params.auth {address,signature,timestamp,nonce} — EIP-712 signed identity (chainId 143). Verified replies set verified:true." };
 // Taifoon listing claim: the challenge nonce is read from disk on every request, so
-// re-claiming never needs a service restart (write data/taifoon_listing.json {"nonce": ...}).
+// re-claiming never needs a service restart (write $DEFIGENT_DATA_DIR/taifoon_listing.json {"nonce": ...}).
 function readTaifoonListing() {
   try { return JSON.parse(fs.readFileSync(`${DATA_DIR}/taifoon_listing.json`, "utf8")).nonce || null; }
   catch { return null; }
@@ -169,7 +169,7 @@ app.get("/.well-known/agent-card.json", (_req, res) => {
     ],
     classes: ["mcp.digest", "chat.word_count"],
     price_usdc: { unit: "per-job", min: 0.05, max: 0.05 },
-    // Taifoon listing claim (path B): the nonce we must serve lands here (data/taifoon_listing.json).
+    // Taifoon listing claim (path B): the nonce we must serve lands here ($DEFIGENT_DATA_DIR/taifoon_listing.json).
     ...(readTaifoonListing() ? { taifoon_listing: readTaifoonListing() } : {}),
     capabilities: { streaming: true, pushNotifications: false, stateTransitionHistory: true, extendedAgentCard: true, extensions: [JOBS_EXTENSION, IDENTITY_EXTENSION] },
     securitySchemes: {},

@@ -316,7 +316,7 @@ describe("probes: the nine production probes replayed locally", { timeout: 12000
     // GAP(G12): ETag only; no Cache-Control on the card
     assert.equal(r.headers["cache-control"], undefined);
     assert.deepEqual(Object.keys(r.json), ["name", "description", "url", "endpoint", "version", "protocolVersion", "supportedInterfaces", "address", "agentWallet", "endpoints", "classes", "price_usdc", "capabilities", "securitySchemes", "extensions", "documentationUrl", "defaultInputModes", "defaultOutputModes", "skills", "provider", "registration", "registrations"]);
-    // origin/main (Taifoon listing claim): endpoint, endpoints, classes and price_usdc; taifoon_listing only while data/taifoon_listing.json holds a nonce
+    // origin/main (Taifoon listing claim): endpoint, endpoints, classes and price_usdc; taifoon_listing only while $DEFIGENT_DATA_DIR/taifoon_listing.json holds a nonce
     assert.equal(r.json.endpoint, `${BASE}/inbox`);
     assert.deepEqual(r.json.endpoints, [{ url: `${BASE}/inbox`, kind: "a2a" }, { url: `${BASE}/mcp`, kind: "mcp" }]);
     assert.deepEqual(r.json.classes, ["mcp.digest", "chat.word_count"]);
