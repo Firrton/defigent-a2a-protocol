@@ -123,7 +123,8 @@ import path from "path";
 
 const BASE = `https://defigent.app`; // public origin: Cloudflare Tunnel -> this server on :8080
 const START_TS = Date.now();
-const DATA_DIR = process.env.DEFIGENT_DATA_DIR || "/home/ubuntu/.hermes/cache/scratch"; // override for local/test runs; default = production path
+// override for local/test runs; default = production path, outside the Hermes scratch cache (its pruner deleted the DB there)
+const DATA_DIR = process.env.DEFIGENT_DATA_DIR || "/home/ubuntu/defigent-data";
 const INBOX_FILE = `${DATA_DIR}/defigent_inbox.jsonl`;
 const WAKE_QUEUE_FILE = `${DATA_DIR}/defigent_wake_queue.jsonl`;
 const WEBHOOK_REJECTS_FILE = `${DATA_DIR}/defigent_webhook_rejects.jsonl`;
@@ -1314,7 +1315,7 @@ app.get("/status", async (_req, res) => {
 // enriches it (welcomeTx, status), so a missing or corrupt cache file can no longer empty /network.
 import { fileURLToPath } from "url";
 import { readDirectory, resolveDirectory, rebuildDirectory, rebuildTracker } from "./network_directory.mjs";
-const NETWORK_FILE = "/home/ubuntu/.hermes/cache/scratch/defigent_network.json";
+const NETWORK_FILE = path.join(DATA_DIR, "defigent_network.json"); // lead-monitor cache, next to the rest of the server's data
 const NETWORK_LOCAL = fileURLToPath(new URL("./data/network.json", import.meta.url));     // runtime rebuild (gitignored)
 const NETWORK_SEED = fileURLToPath(new URL("./data/network.seed.json", import.meta.url)); // committed snapshot
 const NETWORK_REBUILD_MS = 2 * 60 * 60 * 1000;

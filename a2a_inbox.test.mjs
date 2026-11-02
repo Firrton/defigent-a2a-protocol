@@ -1810,6 +1810,21 @@ describe("trust enrichment for signed senders that name an agentId (stub RPC)", 
     assert.ok(d.agents > 0);
     assert.ok(Date.parse(d.updated_at) > 0);
   });
+
+  // production moved its data out of the pruned Hermes scratch cache, but the lead-monitor cache path stayed hard-coded there
+  it("GET /network reads the lead-monitor cache from the data directory", async () => {
+    const cache = join(h.dir, "defigent_network.json");
+    writeFileSync(cache, JSON.stringify({ updated: 1, agents: [{ agentId: 987654321, name: "monitor-only", welcomeTx: "0xfeed", status: "welcomed" }] }));
+    try {
+      const r = await h.get("/network");
+      assert.equal(r.status, 200);
+      const a = r.json.agents.find((x) => x.agentId === 987654321);
+      assert.ok(a, "the agent that only the monitor cache knows is served");
+      assert.equal(a.welcomeTx, "0xfeed");
+      assert.equal(a.status, "welcomed");
+      assert.ok(r.json.agents.length > 1, "the cache only adds to the directory, it does not replace it");
+    } finally { rmSync(cache, { force: true }); }
+  });
 });
 
 // /status awaited both RPCs one after the other with no time limit of its own: an RPC that accepts the connection and
