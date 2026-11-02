@@ -316,7 +316,17 @@ describe("probes: the nine production probes replayed locally", { timeout: 12000
     assert.match(r.headers["etag"], /^W\/"/);
     // GAP(G12): ETag only; no Cache-Control on the card
     assert.equal(r.headers["cache-control"], undefined);
-    assert.deepEqual(Object.keys(r.json), ["name", "description", "url", "version", "protocolVersion", "supportedInterfaces", "address", "agentWallet", "capabilities", "securitySchemes", "extensions", "documentationUrl", "defaultInputModes", "defaultOutputModes", "skills", "provider", "registration", "registrations"]);
+    assert.deepEqual(Object.keys(r.json), ["name", "description", "url", "endpoint", "version", "protocolVersion", "supportedInterfaces", "address", "agentWallet", "endpoints", "classes", "price_usdc", "capabilities", "securitySchemes", "extensions", "documentationUrl", "defaultInputModes", "defaultOutputModes", "skills", "provider", "registration", "registrations"]);
+    // origin/main (Taifoon listing claim): endpoint, endpoints, classes and price_usdc; taifoon_listing only while data/taifoon_listing.json holds a nonce
+    assert.equal(r.json.endpoint, `${BASE}/inbox`);
+    assert.deepEqual(r.json.endpoints, [{ url: `${BASE}/inbox`, kind: "a2a" }, { url: `${BASE}/mcp`, kind: "mcp" }]);
+    assert.deepEqual(r.json.classes, ["mcp.digest", "chat.word_count"]);
+    assert.deepEqual(r.json.price_usdc, { unit: "per-job", min: 0.05, max: 0.05 });
+    writeFileSync(join(h.dir, "taifoon_listing.json"), JSON.stringify({ nonce: "test-nonce-1" }));
+    const claimed = (await h.get("/.well-known/agent-card.json")).json;
+    assert.equal(claimed.taifoon_listing, "test-nonce-1");
+    assert.deepEqual(Object.keys(claimed).slice(9, 14), ["endpoints", "classes", "price_usdc", "taifoon_listing", "capabilities"]);
+    rmSync(join(h.dir, "taifoon_listing.json"));
     assert.equal(r.json.name, "Defigent");
     assert.equal(r.json.version, "1.4.0");
     // GAP(G10): the card advertises the hard-coded public origin, also for a local instance
