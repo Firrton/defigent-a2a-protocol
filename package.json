@@ -4,7 +4,7 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "node --test network_directory.test.mjs"
+    "test": "node --test network_directory.test.mjs jobs/*.test.mjs"
   },
   "keywords": [],
   "author": "",

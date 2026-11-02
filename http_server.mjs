@@ -141,6 +141,7 @@ function logInbox(entry) {
 }
 
 // ---------- A2A agent card (well-known standard) ----------
+const IDENTITY_EXTENSION = { uri: "defigent:identity-eip712@v1", description: "Messages may carry params.auth {address,signature,timestamp,nonce} — EIP-712 signed identity (chainId 143). Verified replies set verified:true." };
 // Taifoon listing claim: the challenge nonce is read from disk on every request, so
 // re-claiming never needs a service restart (write data/taifoon_listing.json {"nonce": ...}).
 function readTaifoonListing() {
@@ -169,15 +170,15 @@ app.get("/.well-known/agent-card.json", (_req, res) => {
     price_usdc: { unit: "per-job", min: 0.05, max: 0.05 },
     // Taifoon listing claim (path B): the nonce we must serve lands here (data/taifoon_listing.json).
     ...(readTaifoonListing() ? { taifoon_listing: readTaifoonListing() } : {}),
-    capabilities: { streaming: true, pushNotifications: false, stateTransitionHistory: true, extendedAgentCard: true },
+    capabilities: { streaming: true, pushNotifications: false, stateTransitionHistory: true, extendedAgentCard: true, extensions: [JOBS_EXTENSION, IDENTITY_EXTENSION] },
     securitySchemes: {},
-    extensions: [{ uri: "defigent:identity-eip712@v1", description: "Messages may carry params.auth {address,signature,timestamp,nonce} — EIP-712 signed identity (chainId 143). Verified replies set verified:true." }],
+    extensions: [IDENTITY_EXTENSION], // kept at top level for clients that read it there
     documentationUrl: `${BASE}/integration`,
     defaultInputModes: ["text/plain", "application/json"],
     defaultOutputModes: ["text/plain", "application/json"],
     skills: [
       { id: "digest", name: "Wallet digest", description: "On-chain balance digest for any address (Monad MON+USDC / Base ETH+USDC). Paid $0.001 USDC via x402 (Monad or Base).", tags: ["analytics", "monad", "base", "x402"] },
-      { id: "jobs", name: "Agentic jobs (ERC-8183)", description: "Escrowed agent jobs on our ERC-8183 deployment 0x61625eA32DaD03403db27cd94D6D3FE23b4A4a65 (Monad, fees 0/0). Negotiate over this inbox; the contract settles.", tags: ["jobs", "erc-8183", "escrow"] },
+      { id: "jobs", name: "Agentic jobs (ERC-8183)", description: "Escrowed agent jobs on our ERC-8183 deployment 0x61625eA32DaD03403db27cd94D6D3FE23b4A4a65 (Monad, fees 0/0). Negotiate over this inbox; the contract settles. Typed messages: " + EXT_URI, tags: ["jobs", "erc-8183", "escrow"] },
       { id: "agent-lookup", name: "Agent lookup", description: "Read any ERC-8004 agent registration from the Monad identity registry. Free.", tags: ["directory", "erc8004"] },
       { id: "status", name: "Status", description: "Live heartbeat: latency, uptime, balances, prices. Free.", tags: ["infra"] },
     ],
@@ -194,6 +195,11 @@ app.get("/.well-known/agent-card.json", (_req, res) => {
 import Database from "better-sqlite3";
 import crypto from "crypto";
 import { verifyTypedData, keccak256, toHex } from "viem";
+import { loadJobsConfig } from "./jobs/config.mjs";
+import { createChainReader } from "./jobs/chain.mjs";
+import { createJobsRuntime } from "./jobs/runtime.mjs";
+import { EXT_URI, NAMES as JOB_NAMES, fullKey as jobKey } from "./jobs/protocol.mjs";
+import { chainUnavailable, extensionsEcho, internalError, invalidParams, negotiateVersion, sseFrame, typedResult } from "./jobs/wire.mjs";
 
 const A2A_DB = `${DATA_DIR}/defigent_a2a.db`;
 const a2a = new Database(A2A_DB);
@@ -270,6 +276,9 @@ const historyItemNoData = ({ role, text, verified, sender, ts }) => ({ role, tex
 // The operator agent (outside this repo) appends one JSON object per line to OUTBOX_FILE:
 //   {"contextId": "<task id>", "text": "<reply>", "state": "completed|input-required|failed|rejected", "data": {…}, "replyId": "<idempotency key>", "inReplyTo": <ts of the wake-queue entry>}
 // A timer ingests new complete lines every 2 s, a bounded amount of work per tick. No HTTP route: the file is the only way in. Docs: docs/operator-outbox.md
+// A typed line (data carries exactly one defigent.job.* key) is also an operator claim: the jobs runtime records it and its sweep verifies
+// it on chain. Only a line that carries a valid claim may say "working" (the operator's accept verdict: the next step is ours again);
+// anything else would leave the task working with nothing to verify and no operator answer pending.
 const OUTBOX_STATES = ["completed", "input-required", "failed", "rejected"];
 const OUTBOX_MAX_TEXT = 4000, OUTBOX_MAX_DATA = 16 * 1024, OUTBOX_MAX_REPLY_ID = 200;
 const OUTBOX_WINDOW = 1 << 20; // bytes read per step; a line longer than this can never be valid
@@ -297,6 +306,58 @@ try { a2a.exec(`ALTER TABLE operator_bound ADD COLUMN resolved INTEGER NOT NULL 
 a2a.exec(`CREATE INDEX IF NOT EXISTS idx_operator_bound_open ON operator_bound(ts) WHERE resolved = 0;  -- the sweeper's queue
 CREATE INDEX IF NOT EXISTS idx_tasks_state_updated ON tasks(state, updated_at);                        -- tasks stuck in working`);
 
+// ---------- Typed jobs protocol (defigent.job.* DataParts, docs/jobs-protocol-v1-design.md) ----------
+// The runtime keeps its ledger in this same database. Its actions wake the operator through the wake queue (wakeTypedAction);
+// task changes found by its sweep land in the task the peer polls (applyTypedTaskUpdate).
+const JOBS_CONFIG = loadJobsConfig();
+// The runtime's and its sweep's log lines (invalid claims, rejected claims, failed wakes) go to the inbox log; a body that comes with one is not logged.
+const logJobs = (msg) => logInbox({ ts: Date.now(), cls: "jobs_log", msg: String(msg).slice(0, 200) });
+const jobs = createJobsRuntime({ db: a2a, config: JOBS_CONFIG, reader: createChainReader({ config: JOBS_CONFIG, rpcUrl: RPC }), onAction: wakeTypedAction, onTaskUpdate: applyTypedTaskUpdate, log: logJobs });
+// Tasks the typed protocol answered. Their `working` means "Defigent's turn" (a review, create_job, fund, evaluate) and follows the chain,
+// so the operator-timeout sweeper's stuck pass leaves them alone: input-required would tell the peer the next move is theirs.
+a2a.exec(`CREATE TABLE IF NOT EXISTS typed_tasks (context_id TEXT PRIMARY KEY, created_at INTEGER NOT NULL)`);
+const markTypedTask = (contextId) => a2a.prepare(`INSERT INTO typed_tasks (context_id, created_at) VALUES (?,?) ON CONFLICT(context_id) DO NOTHING`).run(contextId, Date.now());
+
+// The command a typed_action wake line hands the operator: this server's own data directory and the env file with the key, so it
+// works from any shell (an operator's shell has no DEFIGENT_DATA_DIR, and the scripts have no default for it).
+const JOBS_ACTIONS_SCRIPT = fileURLToPath(new URL("./scripts/jobs_actions.mjs", import.meta.url));
+const OPERATOR_ENV_FILE = process.env.DEFIGENT_OPERATOR_ENV_FILE || "/home/ubuntu/.hermes/.env";
+const shellArg = (s) => (/^[\w@%+=:,./-]+$/.test(s) ? s : `'${String(s).replace(/'/g, "'\\''")}'`);
+const jobsActionCommand = (key) =>
+  `DEFIGENT_DATA_DIR=${shellArg(path.resolve(DATA_DIR))} node --env-file=${shellArg(OPERATOR_ENV_FILE)} ${shellArg(JOBS_ACTIONS_SCRIPT)} apply ${shellArg(key)}`;
+
+// The extension as the card declares it (capabilities.extensions), its JSON Schema (generated from the zod schemas the inbox validates with)
+// and its public spec. The spec is read next to this file, not from the cwd.
+const JOBS_EXTENSION = {
+  uri: EXT_URI,
+  description: "Typed ERC-8183 job offers and lifecycle messages as A2A DataParts.",
+  required: false,
+  params: { chainId: JOBS_CONFIG.chainId, escrow: JOBS_CONFIG.escrow, tokens: Object.values(JOBS_CONFIG.tokens).map((t) => t.address), schema: JOBS_CONFIG.schemaUrl },
+};
+const JOBS_SPEC_MD = fs.readFileSync(new URL("./docs/a2a-ext-erc8183-jobs-v1.md", import.meta.url), "utf8");
+app.get("/schemas/erc8183-jobs-v1.json", (_req, res) => res.json(jobs.jsonSchema()));
+app.get("/a2a/ext/erc8183-jobs/v1", (_req, res) => res.type("text/markdown; charset=utf-8").send(JOBS_SPEC_MD));
+
+// The stored meta of an agent message that carries a typed reply: the same {data, files} shape as the sender's parts.
+const typedMeta = (name, body) => (name ? JSON.stringify({ data: [{ [jobKey(name)]: body }], files: [] }) : null);
+
+// An operator action of the jobs runtime (review_offer, create_job, fund...). It throws when the line cannot be written,
+// so the runtime leaves the action unwoken and its sweep tries again.
+function wakeTypedAction(row) {
+  const preview = `${row.action}: ${JSON.stringify(row.payload)}`.slice(0, 140);
+  const line = wakeQueueLine({ ts: Date.now(), contextId: row.contextId, cls: "typed_action", verified: true, sender: null, preview, replyExpected: true, action: { key: row.key, action: row.action, payload: row.payload } });
+  fs.appendFileSync(WAKE_QUEUE_FILE, line);
+  notifyHermes(line);
+}
+
+function applyTypedTaskUpdate({ contextId, state, name, body, text }) {
+  a2a.transaction(() => {
+    upsertTask(contextId, state);
+    markTypedTask(contextId);
+    addMessage(contextId, "agent", text, true, null, typedMeta(name, body));
+  })();
+}
+
 const getOutboxState = () => a2a.prepare(`SELECT byte_offset, ino FROM outbox_state WHERE id=1`).get() || { byte_offset: 0, ino: null };
 function setOutboxState(offset, ino) {
   a2a.prepare(`INSERT INTO outbox_state (id, byte_offset, ino) VALUES (1,?,?) ON CONFLICT(id) DO UPDATE SET byte_offset=excluded.byte_offset, ino=excluded.ino`).run(offset, ino);
@@ -318,13 +379,19 @@ function applyOutboxLine(line, endOffset, ino) {
   if (!text) return "text must be a non-empty string";
   if (text.length > OUTBOX_MAX_TEXT) return `text is longer than ${OUTBOX_MAX_TEXT} characters`;
   const state = o.state === undefined ? "completed" : o.state;
-  if (!OUTBOX_STATES.includes(state)) return `state must be one of ${OUTBOX_STATES.join(", ")}`;
+  const claim = jobs.parseClaim(o.data); // null: not a typed line
+  if (!OUTBOX_STATES.includes(state)) {
+    if (state !== "working" || !claim) return `state must be one of ${OUTBOX_STATES.join(", ")}`;
+    if (!claim.ok) return `state working needs a valid operator claim: ${claim.reason}`;
+  }
   if (o.data !== undefined && (!o.data || typeof o.data !== "object" || Array.isArray(o.data) || Buffer.byteLength(JSON.stringify(o.data)) > OUTBOX_MAX_DATA)) return "data must be a plain object of at most 16 kB";
   if (o.replyId !== undefined && (typeof o.replyId !== "string" || !o.replyId || o.replyId.length > OUTBOX_MAX_REPLY_ID)) return `replyId must be a non-empty string of at most ${OUTBOX_MAX_REPLY_ID} characters`;
   if (o.inReplyTo !== undefined && (typeof o.inReplyTo !== "number" || !Number.isFinite(o.inReplyTo))) return "inReplyTo must be a number (the ts of the wake-queue entry being answered)";
   const task = a2a.prepare(`SELECT state FROM tasks WHERE context_id=?`).get(o.contextId);
-  if (!task) return "unknown task: no task with that contextId";
-  if (task.state === "canceled") return "task is canceled";
+  // a valid claim about an offer accepted in a synchronous reply names the offer's context, which has no task yet: it gets one (R19)
+  const offerTask = !task && !!claim?.ok && !!a2a.prepare(`SELECT 1 FROM job_offers WHERE context_id=? LIMIT 1`).get(o.contextId);
+  if (!task && !offerTask) return "unknown task: no task with that contextId";
+  if (task?.state === "canceled") return "task is canceled";
   // idempotency, scoped to the task: replyId when given; otherwise a hash of the line plus the task's latest sender message, so the
   // same answer to a newer sender message is applied again while a replay of old lines (same latest message) is ignored
   const lastUser = a2a.prepare(`SELECT MAX(id) AS id FROM messages WHERE context_id=? AND role='user'`).get(o.contextId)?.id ?? 0;
@@ -334,11 +401,15 @@ function applyOutboxLine(line, endOffset, ino) {
   // input-required once it timed out): a newer message for the operator exists that this reply does not answer
   const stale = o.inReplyTo !== undefined && !!a2a.prepare(`SELECT 1 FROM operator_bound WHERE context_id=? AND ts > ? LIMIT 1`).get(o.contextId, o.inReplyTo);
   a2a.transaction(() => {
+    if (offerTask) upsertTask(o.contextId, state);
+    if (claim?.ok) markTypedTask(o.contextId); // a typed claim's working (the accept verdict) waits for the chain, not for a reply
     a2a.prepare(`INSERT INTO outbox_applied (reply_key, ts) VALUES (?,?)`).run(key, Date.now());
     addMessage(o.contextId, "agent", text, true, null, o.data ? JSON.stringify({ data: [o.data], files: [] }) : null);
-    upsertTask(o.contextId, stale ? task.state : state);
+    upsertTask(o.contextId, stale ? (task?.state ?? state) : state);
     // the operator has answered every sender message up to inReplyTo (all of them without it): none of them times out any more
     a2a.prepare(`UPDATE operator_bound SET resolved=? WHERE context_id=? AND ts <= ? AND resolved != ?`).run(OB_DONE, o.contextId, o.inReplyTo ?? Number.MAX_SAFE_INTEGER, OB_DONE);
+    // a claim (created, funded..., or an accept/decline verdict) is only recorded here; the jobs sweep verifies it on chain
+    if (o.data) jobs.recordOperatorClaim({ contextId: o.contextId, replyId: o.replyId ?? null, data: o.data });
     setOutboxState(endOffset, ino);
   })();
   return null;
@@ -446,8 +517,10 @@ function sweepOperatorTimeouts() {
     else a2a.prepare(`UPDATE operator_bound SET resolved=? WHERE context_id=? AND ts=?`).run(OB_DONE, context_id, ts);
   }
   if (due.length === SWEEP_TICK_ROWS) return true; // a full page: there may be more
+  // typed tasks are excluded: their working is Defigent's turn on chain, not a wait for an operator reply (see typed_tasks)
   const stuck = a2a.prepare(`SELECT context_id FROM tasks t WHERE t.state='working' AND t.updated_at <= ?
-    AND NOT EXISTS (SELECT 1 FROM operator_bound b WHERE b.context_id = t.context_id AND b.resolved = 0) ORDER BY t.updated_at LIMIT ?`).all(cutoff, SWEEP_TICK_ROWS);
+    AND NOT EXISTS (SELECT 1 FROM operator_bound b WHERE b.context_id = t.context_id AND b.resolved = 0)
+    AND NOT EXISTS (SELECT 1 FROM typed_tasks y WHERE y.context_id = t.context_id) ORDER BY t.updated_at LIMIT ?`).all(cutoff, SWEEP_TICK_ROWS);
   for (const { context_id } of stuck) {
     if (spent()) return true;
     done++;
@@ -469,6 +542,19 @@ function sweepTick(fromChain = false) {
 }
 setInterval(sweepTick, OPERATOR_SWEEP_MS).unref();
 setTimeout(sweepTick, Math.min(OPERATOR_SWEEP_MS, 1000)).unref();
+
+// ---------- Typed jobs sweep ----------
+// Every JOBS_CONFIG.sweepMs the jobs runtime verifies the operator's outbox claims on chain, follows the open jobs nobody messages us
+// about, and wakes the actions nobody has woken yet (those a script enqueued). One round at a time: a slow chain never stacks rounds.
+let sweeping = false;
+async function runJobsSweep() {
+  if (sweeping) return;
+  sweeping = true;
+  try { await jobs.sweep(); } catch (e) {
+    logInbox({ ts: Date.now(), cls: "jobs_sweep_error", error: String(e?.message || e).slice(0, 200) });
+  } finally { sweeping = false; }
+}
+setInterval(runJobsSweep, JOBS_CONFIG.sweepMs).unref();
 
 // ---------- Trust pipeline: on-chain owner check + reputation (all VERIFIED vs Monad live) ----------
 const IDENTITY_REG = "0x8004A169FB4a3325136EB29fA0ceB6D2e539a432";
@@ -608,13 +694,19 @@ const MAX_SENDER = 120; // declared (unverified) sender, cut at intake
 
 // One wake-queue line: the original fields plus the priority, the thread so far and how to answer (reply_via), so the entry is self-describing.
 // Informational entries (replyExpected false: a Taifoon notice, already answered by machine) carry `reply_expected: false` instead of reply_via.
-// `ts` is the stored timestamp of the sender's message: the operator copies it into `inReplyTo`. The line is kept within 4000 BYTES: thread
+// `ts` is the stored timestamp of the sender's message: the operator copies it into `inReplyTo`. On a typed_action line (entry.action set)
+// `ts` is the wake time, not a stored message ts, and reply_via points at scripts/jobs_actions.mjs instead of a free-text outbox line.
+// The line is kept within 4000 BYTES: thread
 // text is cut to 300 characters per message, and if escaping or multi-byte text still pushes it over, the cut is tightened and then the
 // oldest thread entries are dropped (ids and sender are already capped at intake, so the fixed part is small).
 const WAKE_MAX_BYTES = 4000;
 function wakeQueueLine(entry) {
   const thread = getHistory(entry.contextId, 6, false);
-  const reply_via = {
+  const reply_via = entry.action ? {
+    script: "scripts/jobs_actions.mjs",
+    command: jobsActionCommand(entry.action.key),
+    note: "Typed action: run it with scripts/jobs_actions.mjs, which simulates, sends and writes the outbox line itself. Do not write a free-text outbox line for this task."
+  } : {
     file: path.resolve(OUTBOX_FILE),
     line: { contextId: entry.contextId, text: "<your reply>", state: "completed", inReplyTo: entry.ts },
     states: OUTBOX_STATES,
@@ -625,10 +717,27 @@ function wakeQueueLine(entry) {
   for (const [cut, keep] of [[300, 6], [150, 6], [75, 6], [40, 6], [40, 3], [40, 1], [0, 1]]) {
     line = jsonl({ ts: entry.ts, contextId: entry.contextId, cls: entry.cls, verified: entry.verified, sender: entry.sender, preview: entry.preview, priority,
       thread: thread.slice(-keep).map(m => ({ role: m.role, text: m.text.slice(0, cut), verified: !!m.verified, sender: m.sender ? m.sender.slice(0, 42) : null })),
-      ...(entry.replyExpected === false ? { reply_expected: false } : { reply_via }) });
+      ...(entry.replyExpected === false ? { reply_expected: false } : { reply_via }), ...(entry.action ? { action: entry.action } : {}) });
     if (Buffer.byteLength(line) - 1 <= WAKE_MAX_BYTES) break;
   }
   return line;
+}
+
+// Event-driven wake: POST the wake line to the Hermes gateway webhook so the operator agent starts in seconds,
+// instead of waiting for the 3-minute cron poll. The adapter rejects anything whose route script exits nonzero
+// (defigent-operator-wake.py passes only replyExpected=true), so informatives are cheap no-ops.
+function notifyHermes(wakeLine) {
+  try {
+    const secret = process.env.HERMES_WEBHOOK_SUB_SECRET;
+    const url = process.env.HERMES_WEBHOOK_WAKE_URL || "http://127.0.0.1:8644/webhooks/defigent-operator";
+    if (secret) {
+      const payload = JSON.parse(wakeLine);
+      payload.event_type = "defigent-wake";   // the adapter reads event_type (or X-GitHub-Event), NOT .event
+      const body = JSON.stringify(payload);
+      const sig = "sha256=" + crypto.createHmac("sha256", secret).update(body).digest("hex");
+      fetch(url, { method: "POST", headers: { "Content-Type": "application/json", "X-Hub-Signature-256": sig, "X-Signature-256": sig }, body }).catch(() => {});
+    }
+  } catch {}
 }
 app.post("/inbox", async (req, res) => {
   const ip = req.ip || "unknown";
@@ -752,6 +861,60 @@ app.post("/inbox", async (req, res) => {
   const id = body?.id ?? null;
   const isStream = rpcMethod === "message/stream" || rpcMethod === "SendStreamingMessage";
   const messageId = msg?.messageId || `anon-${now}`;
+
+  // ---- typed jobs protocol: a defigent.job.* DataPart (or a valid legacy offer_schema_v1 offer, or a plain-text reply to one of our
+  // open offers) is answered by the jobs runtime, before the text classifier and its dedupe (the runtime dedupes by sender + messageId).
+  let detection = jobs.detect(dataParts);
+  if (detection.kind === "none" && text) {
+    const adapted = jobs.adaptText(text);
+    if (adapted) detection = { kind: "typed", ...adapted };
+  }
+  if (detection.kind !== "none") try {
+    const contextId = msg?.contextId || msg?.taskId || `t-${messageId}`;
+    const auth = body?.params?.auth || msg?.auth || null;
+    const declaredSenderRaw = msg?.sender || msg?.from || null;
+    const declaredSender = typeof declaredSenderRaw === "string" ? declaredSenderRaw.slice(0, MAX_SENDER) : null;
+    const ident = await verifyAuth(auth, declaredSender);
+    const version = negotiateVersion(verHeader);
+    // The replay cache is keyed by sender: only a verified address speaks for itself; a declared one gets its own namespace,
+    // so an unsigned peer can neither read nor pre-empt the cached reply of the address it names.
+    const replySender = ident.verified ? ident.address : (declaredSender ? `unverified:${declaredSender}` : null);
+    const r = await jobs.process({ detection, contextId, sender: replySender, messageId });
+    // A legacy offer that does not normalize keeps the old offer_structured path below, unchanged.
+    if (r.kind === "invalid" && detection.kind !== "legacy") return res.json(invalidParams({ id, field: r.field, detail: r.detail }));
+    if (r.kind === "chain_unavailable") return res.json(chainUnavailable({ id }));
+    if (r.kind === "ok") {
+      // the request's name, never a sender-chosen key outside the protocol (r.name is the reply's: status, error or null)
+      const requestName = detection.kind === "legacy" ? "offer" : JOB_NAMES.includes(detection.name) ? detection.name : "unsupported";
+      // A retry of the same (sender, messageId) gets the same answer, but its exchange, artifact and log line are already stored.
+      if (!r.replay) a2a.transaction(() => {
+        upsertTask(contextId, r.taskState); // first: messages and artifacts reference the task (foreign keys are enforced)
+        markTypedTask(contextId);
+        addMessage(contextId, "user", text || `(typed ${jobKey(requestName)})`, ident.verified, ident.address || declaredSender, JSON.stringify({ data: dataParts, files: fileParts }));
+        if (detection.kind === "legacy") {
+          a2a.prepare(`INSERT INTO artifacts (task_id, artifact_id, name, parts_json, ts) VALUES (?,?,?,?,?)`)
+            .run(contextId, `art-offer-${now}`, "received-offer", JSON.stringify([{ data: detection.body }]), Date.now());
+        }
+        addMessage(contextId, "agent", r.text, true, null, typedMeta(r.name, r.body));
+      })();
+      if (!r.replay) logInbox({ ts: now, ip, messageId, cls: `typed_${requestName}`, from: msg?.role || "unknown", declaredAgent: /agentId[ ]?\d+/i.exec(text)?.[0] || null, verified: ident.verified, sender: ident.address || null, contextId, hasData: dataParts.length > 0, hasFiles: fileParts.length > 0, text: (text || "").slice(0, 2000) });
+      const echo = extensionsEcho(req.headers);
+      if (echo) res.setHeader(echo.name, echo.value);
+      const rpcResponse = { jsonrpc: "2.0", id, result: typedResult({ version, contextId, state: r.taskState, name: r.name, body: r.body, text: r.text, messageId: `defigent-re-${now}` }) };
+      if (isStream) {
+        res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
+        res.write(sseFrame(rpcResponse));
+        return res.end();
+      }
+      return res.json(rpcResponse);
+    }
+  } catch (e) {
+    // anything unexpected on the typed path is answered as JSON-RPC -32603, never with Express's HTML 500
+    logInbox({ ts: Date.now(), cls: "jobs_error", messageId, error: String(e?.message || e).slice(0, 200) });
+    if (res.headersSent) return res.end();
+    return res.json(internalError({ id }));
+  }
+
   // dedupe
   if (global.__seenMsg && global.__seenMsg.has(messageId)) {
     return res.json({ jsonrpc: "2.0", id, result: { duplicate: true } });
@@ -875,22 +1038,7 @@ app.post("/inbox", async (req, res) => {
     try {
       fs.appendFileSync(WAKE_QUEUE_FILE, wakeLine);
     } catch {}
-    // Event-driven wake: POST the wake line to the Hermes gateway webhook so the operator agent starts in seconds,
-    // instead of waiting for the 3-minute cron poll. The adapter rejects anything whose route script exits nonzero
-    // (defigent-operator-wake.py passes only replyExpected=true), so informatives are cheap no-ops.
-    if (toOperator) {
-      try {
-        const secret = process.env.HERMES_WEBHOOK_SUB_SECRET;
-        const url = process.env.HERMES_WEBHOOK_WAKE_URL || "http://127.0.0.1:8644/webhooks/defigent-operator";
-        if (secret) {
-          const payload = JSON.parse(wakeLine);
-          payload.event_type = "defigent-wake";   // the adapter reads event_type (or X-GitHub-Event), NOT .event
-          const body = JSON.stringify(payload);
-          const sig = "sha256=" + crypto.createHmac("sha256", secret).update(body).digest("hex");
-          fetch(url, { method: "POST", headers: { "Content-Type": "application/json", "X-Hub-Signature-256": sig, "X-Signature-256": sig }, body }).catch(() => {});
-        }
-      } catch {}
-    }
+    if (toOperator) notifyHermes(wakeLine);
   }
   // task states: a template or a machine reply closes the task; a message for the operator stays `working` until the operator answers
   // through the outbox (and `input-required` only appears when the operator itself asks the sender something). A machine reply to a
@@ -1249,10 +1397,18 @@ app.get("/integration", (_req, res) => {
     summary: "Defigent (ERC-8004 agentId 10331) runs the first standard A2A inbox and x402 payment storefront on Monad mainnet — now at A2A spec v1.0.1 parity (dual wire format 0.3.0+1.0, streaming SSE, DataPart/FilePart, artifacts, standard errors). Any agent (or its operator) can integrate in minutes.",
     a2a_spec_version: "1.0.1",
     wire_formats_accepted: ["0.3.0 (no header needed)", "1.0 / 1.0.1 (header A2A-Version)"],
+    jobs_protocol_v1: {
+      extension: EXT_URI,
+      schema: JOBS_CONFIG.schemaUrl,
+      spec: `${BASE}/a2a/ext/erc8183-jobs/v1`,
+      example_query: '{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{"role":"ROLE_USER","messageId":"<unique-id>","extensions":["' + EXT_URI + '"],"parts":[{"data":{"defigent.job.query":{"jobId":"42"}}}]}}}',
+      example_accept: '{"jsonrpc":"2.0","id":2,"method":"SendMessage","params":{"message":{"role":"ROLE_USER","messageId":"<unique-id>","contextId":"of_7Hq2kd9xTa","extensions":["' + EXT_URI + '"],"parts":[{"text":"Accepting offer of_7Hq2kd9xTa."},{"data":{"defigent.job.accept":{"offerId":"of_7Hq2kd9xTa","party":{"address":"<your checksummed address>","agentId":10270}}}}]}}}',
+    },
     offer_schema_v1: {
+      status: "legacy: still accepted, normalized to defigent.job.offer",
       description: "Send structured, machine-readable offers as a DataPart — Defigent parses them natively (no free-text guessing):",
-      example: '{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{"role":"agent","parts":[{"text":"service proposal"},{"data":{"intent":"offer","service":"your-service","price":"1.00","asset":"USDC","expiry":1792000000000,"terms":"what you deliver"}}],"messageId":"<unique-id>"}}}',
-      fields: "intent=offer (required) | service (required) | price (required) | asset (default USDC) | expiry (ms epoch) | terms | evidence",
+      example: '{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{"role":"agent","parts":[{"text":"service proposal"},{"data":{"intent":"offer","service":"your-service","price":"1.00","asset":"USDC","terms":"what you deliver"}}],"messageId":"<unique-id>"}}}',
+      fields: "intent=offer (required) | service (required) | price (required) | asset (default USDC) | expiry (ms epoch; default 24 h from now) | terms | evidence",
     },
     steps: [
       {
