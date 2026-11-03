@@ -149,14 +149,32 @@ function readTaifoonListing() {
   try { return JSON.parse(fs.readFileSync(`${DATA_DIR}/taifoon_listing.json`, "utf8")).nonce || null; }
   catch { return null; }
 }
-app.get("/.well-known/agent-card.json", (_req, res) => {
-  res.json({
+// ERC-8004 identity: one IdentityRegistry address on Monad and Base. The card and /.well-known/agent-registration.json are both built from
+// these, so the two cannot disagree. agentRegistry is the ERC's "{namespace}:{chainId}:{identityRegistry}".
+const IDENTITY_REG = "0x8004A169FB4a3325136EB29fA0ceB6D2e539a432";
+const ERC8004_REGISTRATIONS = [
+  { chain: "Monad", chainId: 143, agentId: 10331 },
+  { chain: "Base", chainId: 8453, agentId: 114426 },
+].map((r) => ({ ...r, agentRegistry: `eip155:${r.chainId}:${IDENTITY_REG}` }));
+const A2A_PROTOCOL_VERSION = "1.0.1";
+const CARD_URL = `${BASE}/.well-known/agent-card.json`;
+// Skills say only what a route of this server returns. The directory is what GET /network and the MCP tool defigent_network_list serve:
+// the agents rebuilt from the Monad identity registry from agentId FIRST_ID on. No route reads one registration by agentId (the stdio
+// server.mjs agent_lookup is not reachable over the network), so no card offers a lookup. Shared by the public and the extended card.
+const DIRECTORY_SKILL = { id: "network-directory", name: "Network directory", description: `Directory of the ERC-8004 agents registered on Monad from agentId ${FIRST_ID} on, rebuilt from the identity registry: name, A2A inbox, x402 flag and services of each, at GET ${BASE}/network or through the MCP tool defigent_network_list. Free.`, tags: ["directory", "erc8004", "discovery"] };
+const STATUS_SKILL = { id: "status", name: "Status", description: `Live heartbeat at GET ${BASE}/status: uptime, head block and RPC latency on Monad and Base, inbox message count and the directory's rebuild state. Free.`, tags: ["infra"] };
+// GET /inbox serves the same card: 8004scan health-checks the declared A2A endpoint with a GET and wants a 200 JSON card with a name
+// (a 404 there marked the A2A service unhealthy). A2A clients only POST JSON-RPC to it; POST /inbox and its rate limit are unchanged.
+app.get("/.well-known/agent-card.json", (_req, res) => res.json(publicAgentCard()));
+app.get("/inbox", (_req, res) => res.json(publicAgentCard()));
+function publicAgentCard() {
+  return {
     name: "Defigent",
-    description: "Agentic commerce specialist agent on Monad and Base: on-chain wallet digests, agent directory lookup, and regime analytics. ERC-8004 agentId 10331 (Monad) and 114426 (Base). Talks and pays x402 (v1+v2).",
+    description: `Agentic commerce specialist agent on Monad and Base: on-chain wallet digests and a directory of the ERC-8004 agents on Monad. ERC-8004 agentId ${ERC8004_REGISTRATIONS.map((r) => `${r.agentId} (${r.chain})`).join(" and ")}. Talks and pays x402 (v1+v2).`,
     url: `${BASE}/inbox`,
     endpoint: `${BASE}/inbox`,
     version: "1.4.0",
-    protocolVersion: "1.0.1",
+    protocolVersion: A2A_PROTOCOL_VERSION,
     supportedInterfaces: [
       { url: `${BASE}/inbox`, protocolBinding: "JSONRPC", protocolVersion: "1.0" },
       { url: `${BASE}/inbox`, protocolBinding: "JSONRPC", protocolVersion: "0.3.0" },
@@ -178,17 +196,40 @@ app.get("/.well-known/agent-card.json", (_req, res) => {
     defaultInputModes: ["text/plain", "application/json"],
     defaultOutputModes: ["text/plain", "application/json"],
     skills: [
-      { id: "digest", name: "Wallet digest", description: "On-chain balance digest for any address (Monad MON+USDC / Base ETH+USDC). Paid $0.001 USDC via x402 (Monad or Base).", tags: ["analytics", "monad", "base", "x402"] },
+      // GET /digest reads Monad only (MON and USDC); the x402 payment can be made on Monad or Base
+      { id: "digest", name: "Wallet digest", description: "On-chain balance digest for any address (Monad MON+USDC). Paid $0.001 USDC via x402 (Monad or Base).", tags: ["analytics", "monad", "base", "x402"] },
       { id: "jobs", name: "Agentic jobs (ERC-8183)", description: "Escrowed agent jobs on our ERC-8183 deployment 0x61625eA32DaD03403db27cd94D6D3FE23b4A4a65 (Monad, fees 0/0). Negotiate over this inbox; the contract settles. Typed messages: " + EXT_URI, tags: ["jobs", "erc-8183", "escrow"] },
-      { id: "agent-lookup", name: "Agent lookup", description: "Read any ERC-8004 agent registration from the Monad identity registry. Free.", tags: ["directory", "erc8004"] },
-      { id: "status", name: "Status", description: "Live heartbeat: latency, uptime, balances, prices. Free.", tags: ["infra"] },
+      DIRECTORY_SKILL,
+      STATUS_SKILL,
     ],
     provider: { organization: "Defigent (operator: FirrtonH)", url: `${BASE}/info` },
-    registration: { agentId: 10331, registry: "eip155:143:0x8004A169FB4a3325136EB29fA0ceB6D2e539a432" },
-    registrations: [
-      { agentId: 10331, registry: "eip155:143:0x8004A169FB4a3325136EB29fA0ceB6D2e539a432" },
-      { agentId: 114426, registry: "eip155:8453:0x8004A169FB4a3325136EB29fA0ceB6D2e539a432" },
+    // the card's own key name is `registry` (the registration file below uses the ERC's `agentRegistry`)
+    registration: { agentId: ERC8004_REGISTRATIONS[0].agentId, registry: ERC8004_REGISTRATIONS[0].agentRegistry },
+    registrations: ERC8004_REGISTRATIONS.map((r) => ({ agentId: r.agentId, registry: r.agentRegistry })),
+  };
+}
+
+// ---------- ERC-8004 registration file (Endpoint Domain Verification) ----------
+// A directory treats an endpoint's domain as the agent's when https://{domain}/.well-known/agent-registration.json lists a registration
+// whose agentRegistry and agentId match the on-chain agent. The agentURI is a data: URI (no domain of its own), so this file is what ties
+// defigent.app to agentId 10331 (Monad) and 114426 (Base). The ERC needs only `registrations`; the rest follows its registration-v1 shape.
+app.get("/.well-known/agent-registration.json", (_req, res) => {
+  const where = ERC8004_REGISTRATIONS.map((r) => `${r.chain} (agentId ${r.agentId})`).join(" and ");
+  res.json({
+    type: "https://eips.ethereum.org/EIPS/eip-8004#registration-v1",
+    name: "Defigent",
+    description: `A2A and MCP agent registered under ERC-8004 on ${where}. Skills: Monad wallet digest, MON and USDC balances of any address (paid, $0.001 USDC per call via x402 on Monad or Base, at GET ${BASE}/digest); directory of the ERC-8004 agents on Monad from agentId ${FIRST_ID} on (free, at GET ${BASE}/network and through the MCP tool defigent_network_list); status heartbeat (free, at GET ${BASE}/status); negotiation of escrowed jobs on its ERC-8183 contract on Monad, ${JOBS_CONFIG.escrow}. A2A JSON-RPC requests go to POST ${BASE}/inbox; the agent card is at ${CARD_URL}.`,
+    services: [
+      { name: "web", endpoint: `${BASE}/` },
+      { name: "A2A", endpoint: CARD_URL, version: A2A_PROTOCOL_VERSION },
+      { name: "MCP", endpoint: `${BASE}/mcp`, version: MCP_PROTOCOL_VERSION },
+      { name: "jobs", endpoint: `eip155:${JOBS_CONFIG.chainId}:${JOBS_CONFIG.escrow}`, version: "erc-8183" },
+      ...ERC8004_REGISTRATIONS.map((r) => ({ name: "agentWallet", endpoint: `eip155:${r.chainId}:${PAY_TO}` })),
     ],
+    x402Support: true,
+    active: true,
+    registrations: ERC8004_REGISTRATIONS.map((r) => ({ agentId: r.agentId, agentRegistry: r.agentRegistry })),
+    supportedTrust: ["reputation"],
   });
 });
 
@@ -558,7 +599,7 @@ async function runJobsSweep() {
 setInterval(runJobsSweep, JOBS_CONFIG.sweepMs).unref();
 
 // ---------- Trust pipeline: on-chain owner check + reputation (all VERIFIED vs Monad live) ----------
-const IDENTITY_REG = "0x8004A169FB4a3325136EB29fA0ceB6D2e539a432";
+// IDENTITY_REG is declared with the agent card above
 const REPUTATION_REG = "0x8004BAa17C55a88189AE136b182e5fdA19dE9b63";
 const repCache = new Map(); // address -> {ts, trust}
 
@@ -692,6 +733,14 @@ const GREETING_START = /^(?:hi|hello|hey|hola|gm|greetings|saludos|good (?:morni
 // is named `t-<messageId>` and clients echo that id back, so messageId is capped 2 characters lower: every id we hand out passes the rule.
 const ID_RULES = { contextId: /^[\w.:-]{1,128}$/, taskId: /^[\w.:-]{1,128}$/, messageId: /^[\w.:-]{1,126}$/ };
 const MAX_SENDER = 120; // declared (unverified) sender, cut at intake
+// The offer nonce of a Taifoon hire or class probe: the `nonce` string of the first DataPart that has one (a hire sends it only there),
+// else the "(nonce: <uuid>)" a class probe quotes in its text. null unless it is 1-64 letters, digits or dashes (a UUID is 36), so sender
+// text is never reflected into a reply.
+const OFFER_NONCE_RULE = /^[A-Za-z0-9-]{1,64}$/;
+function offerNonce(dataParts, text) {
+  const nonce = dataParts.find((d) => typeof d?.nonce === "string")?.nonce ?? /\(nonce:\s*([^)\s]{1,64})\)/.exec(text || "")?.[1];
+  return typeof nonce === "string" && OFFER_NONCE_RULE.test(nonce) ? nonce : null;
+}
 
 // One wake-queue line: the original fields plus the priority, the thread so far and how to answer (reply_via), so the entry is self-describing.
 // Informational entries (replyExpected false: a Taifoon notice, already answered by machine) carry `reply_expected: false` instead of reply_via.
@@ -958,10 +1007,11 @@ app.post("/inbox", async (req, res) => {
   // Tolerant to harvester rotations ('sha256 hash of "X"' AND 'return the sha256 digest (hex) of the UTF-8 text "X" (nonce:...)'):
   // algorithm keyword, then <=120 filler chars, then the FIRST quoted string.
   const digestMatch = /(?:keccak256|sha256)\b[^"\n]{0,120}?"([^"]{1,4096})"/i.exec(text || "");
+  const digestAlgorithm = digestMatch && /sha256/i.test(digestMatch[0]) ? "sha256" : "keccak256";
   let digestValue = null;
   if (digestMatch) {
     try {
-      digestValue = /sha256/i.test(digestMatch[0])
+      digestValue = digestAlgorithm === "sha256"
         ? crypto.createHash("sha256").update(digestMatch[1], "utf8").digest("hex")
         : keccak256(toHex(digestMatch[1]));
     } catch { digestValue = null; }
@@ -989,6 +1039,7 @@ app.post("/inbox", async (req, res) => {
   // replies never interpolate sender-controlled text (offer fields, task id): the parsed offer travels as the received-offer artifact
   const POLL = `poll GetTask / tasks/get with the task id from this response (or GET ${BASE}/tasks/{id})`;
   let reply;
+  let answer = null; // the computed answer of a graded machine class (digest, word_count): echoed with the offer nonce below
   if (cls === "handshake") {
     reply = "READY";
   } else if (cls === "taifoon_notice") {
@@ -996,11 +1047,14 @@ app.post("/inbox", async (req, res) => {
     reply = '{"interested": true}';
   } else if (cls === "word_count") {
     // Taifoon practice probe: conteo de palabras del texto citado (respuestas deterministas)
-    reply = String(wcMatch[1].trim().split(/\s+/).filter(Boolean).length);
+    const words = wcMatch[1].trim().split(/\s+/).filter(Boolean).length;
+    reply = String(words);
+    answer = { words };
   } else if (cls === "taifoon_probe") {
     reply = `Practice probe received and logged for operator review. Defigent supports deterministic classes: mcp.digest (sha256/keccak256), chat.word_count, web.search. Operator: Telegram @FirrtonH.`;
   } else if (cls === "digest") {
     reply = String(digestValue);
+    answer = { algorithm: digestAlgorithm, digest: digestValue };
   } else if (cls === "greeting") {
     reply = `Hello! Defigent here (ERC-8004 agentId 10331, Monad). We run the standard A2A inbox you are using right now — any agent on Monad can write to us here. Our paid services run on x402: wallet digest $0.001, agent lookup free. Let's interop.`;
   } else if (cls === "offer_structured") {
@@ -1013,11 +1067,19 @@ app.post("/inbox", async (req, res) => {
     reply = `Message queued for the operator agent. Its reasoned reply will be posted to this same task: ${POLL}. ${OPERATOR_WAIT_NOTE} Card: ${BASE}/.well-known/agent-card.json`;
   }
 
-  addMessage(contextId, "agent", reply, true, null);
+  // Taifoon grades a hire of mcp.digest / chat.word_count on the class check (digest_exact, count_exact) AND nonce_echo: a reply that does
+  // not carry the offer nonce back is "undecided" and counts as a failed hire (that paused the listing on 2026-10-31). The answer stays
+  // alone in the text part (count_exact counts every number in the text, and a UUID can hold an all-digit group); the nonce goes back
+  // verbatim in a DataPart that repeats the answer (the shape of Taifoon's own webhook sellers, never with a `provider`) and in the
+  // message metadata, and the parts then carry the A2A 0.3 `kind`. Without a nonce the reply is exactly what it was.
+  const echoNonce = answer ? offerNonce(dataParts, text) : null;
+  const echo = echoNonce ? { nonce: echoNonce, status: "delivered", result: answer } : null;
+
+  addMessage(contextId, "agent", reply, true, null, echo ? JSON.stringify({ data: [echo], files: [] }) : null);
   // artifact: structured outputs travel as artifacts (A2A v1.0 §4.1.7)
   if (cls === "digest") {
     a2a.prepare(`INSERT INTO artifacts (task_id, artifact_id, name, parts_json, ts) VALUES (?,?,?,?,?)`)
-      .run(contextId, `art-digest-${now}`, "digest-result", JSON.stringify([{ data: { algorithm: /sha256/i.test(digestMatch[0]) ? "sha256" : "keccak256", input: digestMatch[1], digest: digestValue } }]), Date.now());
+      .run(contextId, `art-digest-${now}`, "digest-result", JSON.stringify([{ data: { algorithm: digestAlgorithm, input: digestMatch[1], digest: digestValue } }]), Date.now());
   }
   if (cls === "question" || cls === "offer_structured") {
     const art = cls === "question"
@@ -1049,12 +1111,13 @@ app.post("/inbox", async (req, res) => {
 
   const replyMsg = {
     kind: "message", role: "agent",
-    parts: [{ type: "text", text: reply }],
+    parts: echo ? [{ kind: "text", text: reply }, { kind: "data", data: echo }] : [{ type: "text", text: reply }],
     messageId: `defigent-re-${now}`,
     contextId,
     verified: ident.verified,
     sender: ident.address || null,
     task: { id: contextId, state: finalState },
+    ...(echo ? { metadata: { nonce: echoNonce } } : {}),
   };
 
   // trust enrichment (non-blocking best-effort): declare peer trust level in the reply
@@ -1136,6 +1199,7 @@ app.get("/tasks/:contextId", (req, res) => {
 });
 
 // ---------- MCP 2026-07-28 stateless surface (headers Mcp-Method/Mcp-Name; cada request self-contained) ----------
+const MCP_PROTOCOL_VERSION = "2026-07-28"; // also the MCP service version in /.well-known/agent-registration.json
 const MCP_TOOLS = [
   { name: "defigent_hash", description: "Compute the SHA-256 or Keccak-256 hex digest of a UTF-8 text.", inputSchema: { type: "object", properties: { algorithm: { type: "string", enum: ["sha256", "keccak256"], description: "hash algorithm" }, text: { type: "string", description: "the UTF-8 text to hash" } }, required: ["algorithm", "text"], additionalProperties: false } },
   { name: "defigent_inbox_send", description: "Send an A2A message to the Defigent inbox (the standard agent messaging channel on Monad). Returns the inbox reply + task state. Optional: contextId to continue a thread.", inputSchema: { type: "object", properties: { text: { type: "string", description: "Message text" }, contextId: { type: "string", description: "Optional task contextId to continue a thread" }, sender: { type: "string", description: "Optional sender identifier (e.g. ERC-8004 agentId or address)" } }, required: ["text"] } },
@@ -1180,7 +1244,7 @@ async function mcpToolCall(name, args) {
 }
 
 app.get("/mcp", (_req, res) => {
-  res.json({ server: { name: "defigent", version: "1.4.0", description: "Defigent A2A inbox + network directory as stateless MCP server (spec 2026-07-28: header routing + standard JSON-RPC body methods)" }, protocolVersion: "2026-07-28", transport: "streamable-http", tools: MCP_TOOLS, x402_note: "Paid x402 services (GET /digest) remain on the HTTP storefront; MCP surface exposes the free messaging/discovery/hash tools." });
+  res.json({ server: { name: "defigent", version: "1.4.0", description: "Defigent A2A inbox + network directory as stateless MCP server (spec 2026-07-28: header routing + standard JSON-RPC body methods)" }, protocolVersion: MCP_PROTOCOL_VERSION, transport: "streamable-http", tools: MCP_TOOLS, x402_note: "Paid x402 services (GET /digest) remain on the HTTP storefront; MCP surface exposes the free messaging/discovery/hash tools." });
 });
 
 // standard MCP JSON-RPC body methods (initialize/tools/list/tools/call/ping) — registry-compatible
@@ -1192,7 +1256,7 @@ app.post("/mcp", async (req, res) => {
 
   // header routing (2026-07-28 header-based, back-compat)
   if (headerMethod && !bodyMethod) {
-    if (headerMethod === "server/discover") return res.json({ protocolVersion: "2026-07-28", server: { name: "defigent", version: "1.4.0" }, capabilities: { tools: {} }, tools: MCP_TOOLS });
+    if (headerMethod === "server/discover") return res.json({ protocolVersion: MCP_PROTOCOL_VERSION, server: { name: "defigent", version: "1.4.0" }, capabilities: { tools: {} }, tools: MCP_TOOLS });
     if (headerMethod === "tools/list") return res.json({ tools: MCP_TOOLS });
     if (headerMethod === "tools/call") {
       const out = await mcpToolCall(body?.name || body?.params?.name, body?.arguments || body?.params?.arguments || {});
@@ -1204,7 +1268,7 @@ app.post("/mcp", async (req, res) => {
   // standard JSON-RPC routing
   if (bodyMethod === "initialize") {
     return res.json({ jsonrpc: "2.0", id: rpcId, result: {
-      protocolVersion: "2026-07-28",
+      protocolVersion: MCP_PROTOCOL_VERSION,
       capabilities: { tools: { listChanged: false } },
       serverInfo: { name: "defigent", version: "1.4.0", title: "Defigent — Monad A2A inbox + x402" },
     }});
@@ -1314,7 +1378,7 @@ app.get("/status", async (_req, res) => {
 // /network/refresh) into data/network.json, with a committed snapshot as last resort. The lead-monitor cache only
 // enriches it (welcomeTx, status), so a missing or corrupt cache file can no longer empty /network.
 import { fileURLToPath } from "url";
-import { readDirectory, resolveDirectory, rebuildDirectory, rebuildTracker } from "./network_directory.mjs";
+import { FIRST_ID, readDirectory, resolveDirectory, rebuildDirectory, rebuildTracker } from "./network_directory.mjs";
 const NETWORK_FILE = path.join(DATA_DIR, "defigent_network.json"); // lead-monitor cache, next to the rest of the server's data
 const NETWORK_LOCAL = fileURLToPath(new URL("./data/network.json", import.meta.url));     // runtime rebuild (gitignored)
 const NETWORK_SEED = fileURLToPath(new URL("./data/network.seed.json", import.meta.url)); // committed snapshot
@@ -1464,8 +1528,7 @@ const EXTENDED_CARD = {
   security: [{ eip712: [] }],
   skills: [
     { id: "digest", name: "Wallet digest", description: "On-chain MON+USDC balance digest for any address on Monad mainnet. Paid $0.001 USDC via x402.", tags: ["analytics", "monad", "x402"], examples: ["GET /digest?address=0x..."] },
-    { id: "agent-lookup", name: "Agent lookup", description: "Read any ERC-8004 agent registration from the Monad identity registry. Free.", tags: ["directory", "erc8004"] },
-    { id: "network-directory", name: "Network directory", description: "Full ERC-8004 agent directory of Monad with inbox/x402 capability flags. Free.", tags: ["discovery"] },
+    DIRECTORY_SKILL,
     { id: "a2a-inbox", name: "A2A inbox", description: "Standard JSON-RPC message/send + SendMessage with EIP-712 sender verification, stateful tasks, SSE streaming, structured offers (schema v1).", tags: ["a2a", "messaging"] },
     { id: "trust-check", name: "Peer trust check", description: "On-chain ownerOf/getAgentWallet verification + Reputation Registry read for any agentId. Used internally; exposed as data in replies (trust field).", tags: ["trust", "erc8004"] },
   ],

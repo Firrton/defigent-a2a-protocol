@@ -41,6 +41,7 @@ import { ESCROW_ABI, IDENTITY_ABI } from "./jobs/abi.mjs";
 import { loadJobsConfig } from "./jobs/config.mjs";
 import { EXT_URI, jobDescription, termsHash } from "./jobs/protocol.mjs";
 import { createJobsStore } from "./jobs/store.mjs";
+import { FIRST_ID } from "./network_directory.mjs";
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const NODE_MAJOR = Number(process.versions.node.split(".")[0]);
@@ -350,7 +351,8 @@ describe("probes: the nine production probes replayed locally", { timeout: 12000
     // typed jobs protocol (R18): the extensions sit in capabilities.extensions (G12 fixed)
     assert.deepEqual(capabilityExtensions.map((e) => e.uri), [EXT_URI, "defigent:identity-eip712@v1"]);
     // origin/main: the ERC-8183 escrow is a skill ("jobs") and the agent is also registered on Base (ERC-8004 agentId 114426)
-    assert.deepEqual(r.json.skills.map((s) => s.id), ["digest", "jobs", "agent-lookup", "status"]);
+    // directory health: "agent-lookup" (read any registration) had no route behind it; the skill is the directory /network serves
+    assert.deepEqual(r.json.skills.map((s) => s.id), ["digest", "jobs", "network-directory", "status"]);
     assert.deepEqual(r.json.registration, { agentId: 10331, registry: "eip155:143:0x8004A169FB4a3325136EB29fA0ceB6D2e539a432" });
     assert.deepEqual(r.json.registrations, [
       { agentId: 10331, registry: "eip155:143:0x8004A169FB4a3325136EB29fA0ceB6D2e539a432" },
@@ -1118,6 +1120,127 @@ describe("machine classes from production: Taifoon notices, practice probes and 
   });
 });
 
+// Taifoon hires and class probes, as stored in production (2026-10-31). A hire carries its offer nonce only in the DataPart; a class probe
+// also quotes it in the text as "(nonce: <uuid>)". Taifoon grades a hire's reply on the class check plus nonce_echo, and a reply without the
+// nonce came back "undecided" (hs_8be62385b10c59c0b097b5f8): that paused the listing.
+const HIRE_NONCE = "8ae21234-8eef-4300-aed3-2c45ee3ebc60";
+const PROBE_NONCE = "1aec3b63-d7ce-457f-9d20-c8b028ac9866";
+const WC_NONCE = "cdecf834-23b3-4abd-9a74-edb0fc9e3a8f";
+const KECCAK_HELLO_WORLD = "0x47173285a8d7341e5e972fc677286384f802f8ef42a5ec5f03bbfa254cb01fad"; // keccak256("hello world")
+const SHA256_PROBE = "4ddd12251757904fbae42121edcdefe899d581532f24cb175a2cb9313b2325d6"; // sha256("taifoon class probe 1aec3b63")
+const TF = {
+  hire: 'mcp.digest: return the keccak256 digest (hex) of the UTF-8 text "hello world".',
+  sha256Probe: `mcp.digest: return the sha256 digest (hex) of the UTF-8 text "taifoon class probe 1aec3b63". (nonce: ${PROBE_NONCE})`,
+  wcProbe: `chat.word_count: Count the words in: "taifoon class probe cdecf834 counts these words" (reply with the number of words) (nonce: ${WC_NONCE})`,
+};
+// the DataPart of a Taifoon offer: a hire names the hirer and a reply_to; a class probe has class_probe:true and a status_url instead
+const tfOffer = (task, nonce, extra = {}) => ({
+  jobId: null, chain: "36927", client: "0xd0820B59aEaCD5a080975Ed30129D14a3c7fcFc7", provider: "0x940ecb27d8f4f7009c8bc12969496e9639717638", evaluator: null,
+  verify: "self", phase: "NEGOTIATION", state: "offer", budget_usdc: null, task, required_skills: [task.split(":")[0]],
+  reply_to: "https://www.taifoon.io/v1/jobs/{jobId}/complete", nonce, handshake_id: "hs_8be62385b10c59c0b097b5f8", ...extra,
+});
+const tfProbe = (task, nonce) => tfOffer(task, nonce, { client: null, reply_to: null, handshake_id: undefined, class_probe: true, status_url: "https://coord.taifoon.dev/v1/listings/ls_a5457c0d681a15f6" });
+
+// The reply to a graded machine class that carried a nonce: the bare answer alone in the text part, the nonce (with the same answer) in a
+// separate DataPart and in the message metadata. Parts use the A2A 0.3 `kind` discriminator; 1.0 readers take `text` / `data`.
+function assertNonceReply(result, { contextId, state, text, nonce, answer }) {
+  assert.deepEqual(Object.keys(result), [...REPLY_KEYS, "metadata"]);
+  assert.equal(result.kind, "message");
+  assert.equal(result.role, "agent");
+  assert.deepEqual(result.parts, [{ kind: "text", text }, { kind: "data", data: { nonce, status: "delivered", result: answer } }]);
+  assert.match(result.messageId, /^defigent-re-\d+$/);
+  assert.equal(result.contextId, contextId);
+  assert.equal(result.verified, false);
+  assert.equal(result.sender, null);
+  assert.deepEqual(result.task, { id: contextId, state });
+  assert.deepEqual(result.metadata, { nonce });
+  assert.ok(!result.parts[0].text.includes(nonce), "the nonce never enters the text part (count_exact counts every number in it)");
+  assert.ok(!JSON.stringify(result).includes("provider"), "no provider field: Taifoon fails a reply whose provider differs from the offer's");
+}
+
+// the stored data of a task's agent row (GET /tasks/:id history), undefined when it has none
+const agentData = (taskRes) => taskRes.json.history.find((m) => m.role === "agent").data;
+
+describe("Taifoon nonce echo: graded machine classes carry the offer nonce back, everything else keeps today's reply", { timeout: 120000 }, () => {
+  let h;
+  before(async () => { h = await Harness.start(); });
+  after(async () => { await h?.stop(); });
+  const classOf = (messageId) => h.readJsonl("defigent_inbox.jsonl").find((e) => e.messageId === messageId).cls;
+
+  it("the 2026-10-31 hire, verbatim (A2A 1.0 SendMessage, nonce only in the DataPart): the digest is answered and the nonce echoed", async () => {
+    const r = await h.post(msgReq("ne-1", [{ text: TF.hire }, { data: tfOffer(TF.hire, HIRE_NONCE) }], { method: "SendMessage", message: { role: "ROLE_USER" } }), { headers: { "A2A-Version": "1.0" } });
+    assertRpcResult(r, "ne-1");
+    assertNonceReply(r.json.result, { contextId: "t-ne-1", state: "completed", text: KECCAK_HELLO_WORLD, nonce: HIRE_NONCE, answer: { algorithm: "keccak256", digest: KECCAK_HELLO_WORLD } });
+    // the offer DataPart is not a typed jobs message: the digest class answers it, as before
+    assert.equal(classOf("ne-1"), "digest");
+    const t = (await h.get("/tasks/t-ne-1")).json;
+    assert.equal(t.task.state, "completed");
+    assert.deepEqual(t.artifacts.map((a) => [a.name, a.parts]), [["digest-result", [{ data: { algorithm: "keccak256", input: "hello world", digest: KECCAK_HELLO_WORLD } }]]]);
+    // the stored agent row keeps the bare answer as its text and records the echoed DataPart, like a typed reply
+    const agent = t.history.find((m) => m.role === "agent");
+    assert.equal(agent.text, KECCAK_HELLO_WORLD);
+    assert.deepEqual(agent.data, { data: [{ nonce: HIRE_NONCE, status: "delivered", result: { algorithm: "keccak256", digest: KECCAK_HELLO_WORLD } }], files: [] });
+    assert.deepEqual(h.readJsonl("defigent_wake_queue.jsonl").filter((e) => e.contextId === "t-ne-1"), []);
+  });
+
+  it("a sha256 class probe, verbatim (0.3 message/send, nonce in the text and the DataPart): bare hex in the text, nonce echoed", async () => {
+    const r = await h.post(msgReq("ne-2", [{ kind: "text", text: TF.sha256Probe }, { kind: "data", data: tfProbe(TF.sha256Probe, PROBE_NONCE) }], { message: { kind: "message", role: "user" } }));
+    assertNonceReply(r.json.result, { contextId: "t-ne-2", state: "completed", text: SHA256_PROBE, nonce: PROBE_NONCE, answer: { algorithm: "sha256", digest: SHA256_PROBE } });
+    assert.equal(classOf("ne-2"), "digest");
+  });
+
+  it("a chat.word_count class probe, verbatim: the count alone in the text, {words} and the nonce in the DataPart", async () => {
+    const r = await h.post(msgReq("ne-3", [{ kind: "text", text: TF.wcProbe }, { kind: "data", data: tfProbe(TF.wcProbe, WC_NONCE) }]));
+    assertNonceReply(r.json.result, { contextId: "t-ne-3", state: "completed", text: "7", nonce: WC_NONCE, answer: { words: 7 } });
+    assert.equal(classOf("ne-3"), "word_count");
+  });
+
+  it("a probe with the nonce only in the text, as \"(nonce: <uuid>)\": the nonce is taken from the text", async () => {
+    const r = await h.post(msgReq("ne-4", textParts(`mcp.digest: return the keccak256 digest (hex) of the UTF-8 text "abc". (nonce: ${PROBE_NONCE})`)));
+    assertNonceReply(r.json.result, { contextId: "t-ne-4", state: "completed", text: KECCAK_ABC, nonce: PROBE_NONCE, answer: { algorithm: "keccak256", digest: KECCAK_ABC } });
+  });
+
+  it("when the DataPart and the text name different nonces, the DataPart's (the offer nonce) is echoed", async () => {
+    const r = await h.post(msgReq("ne-5", [{ text: TF.wcProbe }, { data: tfProbe(TF.wcProbe, HIRE_NONCE) }]));
+    assertNonceReply(r.json.result, { contextId: "t-ne-5", state: "completed", text: "7", nonce: HIRE_NONCE, answer: { words: 7 } });
+  });
+
+  it("a nonce with characters outside [A-Za-z0-9-] is never reflected: today's exact reply", async () => {
+    const hostile = '"><img src=x onerror=alert(1)>';
+    const r = await h.post(msgReq("ne-6", [{ text: TF.hire }, { data: tfOffer(TF.hire, hostile) }]));
+    assertHybridReply(r.json.result, { contextId: "t-ne-6", state: "completed", text: KECCAK_HELLO_WORLD });
+    assert.ok(!r.text.includes("onerror"));
+    assert.equal(agentData(await h.get("/tasks/t-ne-6")), undefined);
+  });
+
+  it("a nonce longer than 64 characters is not echoed either (a UUID is 36)", async () => {
+    const r = await h.post(msgReq("ne-7", [{ text: TF.wcProbe.replace(/ \(nonce: .*\)$/, "") }, { data: tfProbe(TF.wcProbe, "a".repeat(65)) }]));
+    assertHybridReply(r.json.result, { contextId: "t-ne-7", state: "completed", text: "7" });
+    assert.ok(!r.text.includes("a".repeat(65)));
+  });
+
+  it("classes that are not graded on a nonce keep today's reply when one comes along: the READY handshake", async () => {
+    const text = "Taifoon onboarding probe: reply with the single word READY.";
+    const r = await h.post(msgReq("ne-8", [{ text }, { data: { nonce: HIRE_NONCE } }]));
+    assertHybridReply(r.json.result, { contextId: "t-ne-8", state: "completed", text: TXT.handshake });
+    assert.equal(classOf("ne-8"), "handshake");
+  });
+
+  it("... and a message for the operator", async () => {
+    const r = await h.post(msgReq("ne-9", [{ text: "Please send me a quote" }, { data: { nonce: HIRE_NONCE } }]));
+    assertHybridReply(r.json.result, { contextId: "t-ne-9", state: "working", text: TXT.other });
+    assert.equal(classOf("ne-9"), "other");
+  });
+
+  it("a streamed hire (SendStreamingMessage) carries the same echo in its final message event", async () => {
+    const r = await h.post(msgReq("ne-10", [{ text: TF.hire }, { data: tfOffer(TF.hire, HIRE_NONCE) }], { method: "SendStreamingMessage" }));
+    assert.equal(r.headers["content-type"], "text/event-stream");
+    const events = parseSse(r.text);
+    assert.deepEqual(events.map((e) => e.event), ["statusUpdate", "statusUpdate", "message"]);
+    assertNonceReply(events[2].data, { contextId: "t-ne-10", state: "completed", text: KECCAK_HELLO_WORLD, nonce: HIRE_NONCE, answer: { algorithm: "keccak256", digest: KECCAK_HELLO_WORLD } });
+  });
+});
+
 // Exact messages seen in production traffic (326 tasks in 6 days). Replies and states are what origin/main answers, so the merge must not move them.
 const REAL = {
   notice: 'Taifoon work notice. Job: Digest of a text (mcp.digest), demand dm_50f0ddb47de3fb5b783a8012. Pay: 0.05 dUSDC (test money on the Taifoon devnet), paid at a passing grade. To take such jobs reply {"interested": true}: your endpoint is then probed with practice tasks of this class and listed once its probes pass. To stop these notices reply {"opt_out": true}.',
@@ -1655,7 +1778,9 @@ describe("GetExtendedAgentCard and unrouted methods", { timeout: 120000 }, () =>
     // GAP(G8): declares an http scheme "DefigentInboxAuth" that no Authorization header can ever satisfy
     assert.deepEqual(card.securitySchemes.eip712.scheme, "DefigentInboxAuth");
     assert.deepEqual(card.security, [{ eip712: [] }]);
-    assert.deepEqual(card.skills.map((s) => s.id), ["digest", "agent-lookup", "network-directory", "a2a-inbox", "trust-check"]);
+    // directory health: "agent-lookup" (read any registration) had no route behind it; network-directory is the public card's skill
+    assert.deepEqual(card.skills.map((s) => s.id), ["digest", "network-directory", "a2a-inbox", "trust-check"]);
+    assert.deepEqual(card.skills[1], (await h.get("/.well-known/agent-card.json")).json.skills.find((s) => s.id === "network-directory"));
     assert.deepEqual(card.limits, { inboxRatePerMinPerIp: 10, replyLatencyMs: 100, maxTextLen: 4000 }); // GAP(G12): replyLatencyMs is a promise no code measures
     assert.deepEqual(card.operatorContact, { telegram: "@FirrtonH", responseTimeHours: 24 });
     assert.deepEqual(Object.keys(card.trustPolicy), ["tiers", "onChain", "notes"]);
@@ -2003,18 +2128,22 @@ describe("HTTP surface: streaming extras, CORS, neighbours, webhook", { timeout:
     assert.equal(hist.find((m) => m.role === "user").sender, "0xSpoofedViaMcp"); // GAP(G9): arbitrary sender string
   });
 
-  it("OPTIONS /inbox answers Allow: POST and no CORS headers", async () => {
+  it("OPTIONS /inbox answers Allow: GET, HEAD, POST and no CORS headers", async () => {
     const r = await h.request("OPTIONS", "/inbox", { headers: { origin: "https://inspector.example", "access-control-request-method": "POST", "access-control-request-headers": "content-type,a2a-version" } });
     assert.equal(r.status, 200);
-    assert.equal(r.headers["allow"], "POST");
-    assert.equal(r.text, "POST");
+    // directory health: GET /inbox serves the card, so Express's automatic OPTIONS now lists GET and HEAD next to POST (it was "POST")
+    assert.equal(r.headers["allow"], "GET, HEAD, POST");
+    assert.equal(r.text, "GET, HEAD, POST");
     // GAP(G14): no Access-Control-* headers, so browser clients cannot call the inbox
     assert.ok(!Object.keys(r.headers).some((k) => k.startsWith("access-control-")));
     assert.ok(!Object.keys((await h.get("/.well-known/agent-card.json", { origin: "https://inspector.example" })).headers).some((k) => k.startsWith("access-control-")));
   });
 
-  it("GET /inbox and the legacy /.well-known/agent.json are 404", async () => {
-    assert.equal((await h.get("/inbox")).status, 404);
+  it("GET /inbox serves the public agent card (directory health); the legacy /.well-known/agent.json is 404", async () => {
+    // 8004scan health-checks the declared A2A endpoint with a GET and wants a 200 JSON card with a name; it was a 404 before
+    const r = await h.get("/inbox");
+    assert.equal(r.status, 200);
+    assert.deepEqual(r.json, (await h.get("/.well-known/agent-card.json")).json);
     // GAP(G12): the 0.2.x card path has no alias
     assert.equal((await h.get("/.well-known/agent.json")).status, 404);
   });
@@ -2075,6 +2204,133 @@ describe("HTTP surface: streaming extras, CORS, neighbours, webhook", { timeout:
     assert.equal(queue[0].source, "quicknode-webhook");
     assert.equal(queue[0].preview, body.slice(0, 300));
     assert.equal(h.readJsonl("defigent_webhook_rejects.jsonl").length, 2); // accepted calls are not logged as rejects
+  });
+});
+
+// Directory health (8004scan): the declared A2A endpoint must answer a GET with a 200 JSON card that has a name, and the endpoint's domain
+// is verified through https://{domain}/.well-known/agent-registration.json (ERC-8004 Endpoint Domain Verification).
+const REGISTRATION_FILE = {
+  type: "https://eips.ethereum.org/EIPS/eip-8004#registration-v1",
+  name: "Defigent",
+  description: "A2A and MCP agent registered under ERC-8004 on Monad (agentId 10331) and Base (agentId 114426). Skills: Monad wallet digest, MON and USDC balances of any address (paid, $0.001 USDC per call via x402 on Monad or Base, at GET https://defigent.app/digest); directory of the ERC-8004 agents on Monad from agentId 10328 on (free, at GET https://defigent.app/network and through the MCP tool defigent_network_list); status heartbeat (free, at GET https://defigent.app/status); negotiation of escrowed jobs on its ERC-8183 contract on Monad, 0x61625eA32DaD03403db27cd94D6D3FE23b4A4a65. A2A JSON-RPC requests go to POST https://defigent.app/inbox; the agent card is at https://defigent.app/.well-known/agent-card.json.",
+  services: [
+    { name: "web", endpoint: "https://defigent.app/" },
+    { name: "A2A", endpoint: "https://defigent.app/.well-known/agent-card.json", version: "1.0.1" },
+    { name: "MCP", endpoint: "https://defigent.app/mcp", version: "2026-07-28" },
+    { name: "jobs", endpoint: "eip155:143:0x61625eA32DaD03403db27cd94D6D3FE23b4A4a65", version: "erc-8183" },
+    { name: "agentWallet", endpoint: "eip155:143:0x940ecB27d8f4F7009c8BC12969496E9639717638" },
+    { name: "agentWallet", endpoint: "eip155:8453:0x940ecB27d8f4F7009c8BC12969496E9639717638" },
+  ],
+  x402Support: true,
+  active: true,
+  registrations: [
+    { agentId: 10331, agentRegistry: "eip155:143:0x8004A169FB4a3325136EB29fA0ceB6D2e539a432" },
+    { agentId: 114426, agentRegistry: "eip155:8453:0x8004A169FB4a3325136EB29fA0ceB6D2e539a432" },
+  ],
+  supportedTrust: ["reputation"],
+};
+describe("directory health: GET /inbox serves the card, the ERC-8004 registration file, card claims", { timeout: 120000 }, () => {
+  let h;
+  before(async () => { h = await Harness.start(); });
+  after(async () => { await h?.stop(); });
+
+  it("GET /inbox answers 200 JSON with the object /.well-known/agent-card.json serves, Taifoon listing nonce included; HEAD answers 200 too", async () => {
+    const r = await h.get("/inbox");
+    assert.equal(r.status, 200);
+    assert.equal(r.headers["content-type"], "application/json; charset=utf-8");
+    assert.equal(r.json.name, "Defigent"); // the field 8004scan requires ("Not a valid AgentCard (missing name)" otherwise)
+    assert.deepEqual(r.json, (await h.get("/.well-known/agent-card.json")).json);
+    writeFileSync(join(h.dir, "taifoon_listing.json"), JSON.stringify({ nonce: "test-nonce-2" }));
+    const [viaInbox, viaWellKnown] = [(await h.get("/inbox")).json, (await h.get("/.well-known/agent-card.json")).json];
+    rmSync(join(h.dir, "taifoon_listing.json"));
+    assert.equal(viaInbox.taifoon_listing, "test-nonce-2");
+    assert.deepEqual(viaInbox, viaWellKnown);
+    const head = await h.request("HEAD", "/inbox");
+    assert.equal(head.status, 200);
+    assert.equal(head.headers["content-type"], "application/json; charset=utf-8");
+    assert.equal(head.text, "");
+  });
+
+  it("GET /inbox is outside the 10/min POST limit, and POST /inbox still answers as before", async () => {
+    for (let i = 0; i < 12; i++) assert.equal((await h.get("/inbox")).status, 200);
+    const r = await h.post(msgReq("dh-1", textParts("Hi")));
+    assertRpcResult(r, "dh-1");
+    assertHybridReply(r.json.result, { contextId: "t-dh-1", state: "completed", text: TXT.greeting });
+  });
+
+  it("GET /.well-known/agent-registration.json serves the ERC-8004 registration file with both registrations; HEAD answers 200", async () => {
+    const r = await h.get("/.well-known/agent-registration.json");
+    assert.equal(r.status, 200);
+    assert.equal(r.headers["content-type"], "application/json; charset=utf-8");
+    assert.deepEqual(r.json, REGISTRATION_FILE);
+    // ERC-8004: agentId is a JSON number and agentRegistry is "{namespace}:{chainId}:{identityRegistry}"
+    for (const reg of r.json.registrations) {
+      assert.equal(typeof reg.agentId, "number");
+      assert.match(reg.agentRegistry, /^eip155:\d+:0x[0-9a-fA-F]{40}$/);
+    }
+    assert.equal((await h.request("HEAD", "/.well-known/agent-registration.json")).status, 200);
+  });
+
+  it("the registration file and the card name the same agents (built from the same constants)", async () => {
+    const file = (await h.get("/.well-known/agent-registration.json")).json;
+    const card = (await h.get("/.well-known/agent-card.json")).json;
+    // the card keeps its own key name (`registry`); the values must be the file's
+    assert.deepEqual(card.registrations.map((x) => [x.agentId, x.registry]), file.registrations.map((x) => [x.agentId, x.agentRegistry]));
+    assert.deepEqual(card.registration, card.registrations[0]);
+    assert.equal(file.services.find((s) => s.name === "A2A").version, card.protocolVersion);
+    assert.equal(file.services.find((s) => s.name === "A2A").endpoint, CARD_URL);
+    assert.deepEqual(file.services.filter((s) => s.name === "agentWallet").map((s) => s.endpoint.split(":")[2]), [card.agentWallet, card.agentWallet]);
+  });
+
+  // Every skill the card declares has a check here against what this server answers; a skill added without one fails the first assertion.
+  // The card used to offer "Read any ERC-8004 agent registration" (no route reads a registration by agentId: agent_lookup lives only in the
+  // stdio server.mjs) and a status with "balances, prices" (GET /status returns neither).
+  it("every card skill is checked against the route that serves it, and no card or registration-file claim lacks one", async () => {
+    const card = (await h.get("/.well-known/agent-card.json")).json;
+    const file = (await h.get("/.well-known/agent-registration.json")).json;
+    const tools = (await h.postJson("/mcp", { jsonrpc: "2.0", id: 1, method: "tools/list" })).json.result.tools.map((t) => t.name);
+    const skill = (id) => card.skills.find((s) => s.id === id).description;
+    assert.equal(card.description, "Agentic commerce specialist agent on Monad and Base: on-chain wallet digests and a directory of the ERC-8004 agents on Monad. ERC-8004 agentId 10331 (Monad) and 114426 (Base). Talks and pays x402 (v1+v2).");
+    const checks = {
+      digest: async () => {
+        assert.equal(skill("digest"), "On-chain balance digest for any address (Monad MON+USDC). Paid $0.001 USDC via x402 (Monad or Base).");
+        // unpaid, the x402 gate answers: 402, or 503 until both facilitators have answered (the two networks are checked in the x402 group)
+        assert.ok([402, 503].includes((await h.get("/digest?address=0x0000000000000000000000000000000000000001")).status));
+      },
+      jobs: async () => {
+        assert.ok(skill("jobs").includes(`ERC-8183 deployment ${loadJobsConfig().escrow} (Monad`));
+        assert.ok(skill("jobs").endsWith(`Typed messages: ${EXT_URI}`));
+        assert.equal((await h.get("/a2a/ext/erc8183-jobs/v1")).status, 200); // the typed-message spec the URI names
+      },
+      "network-directory": async () => {
+        assert.equal(skill("network-directory"), `Directory of the ERC-8004 agents registered on Monad from agentId ${FIRST_ID} on, rebuilt from the identity registry: name, A2A inbox, x402 flag and services of each, at GET ${BASE}/network or through the MCP tool defigent_network_list. Free.`);
+        const r = await h.get("/network");
+        assert.equal(r.status, 200);
+        assert.ok(r.json.agents.length > 0);
+        for (const a of r.json.agents) assert.deepEqual(Object.keys(a), ["agentId", "name", "hasInbox", "inbox", "x402Support", "services", "welcomeTx", "status"]);
+        const listed = await h.postJson("/mcp", { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "defigent_network_list", arguments: { limit: 3 } } });
+        assert.equal(JSON.parse(listed.json.result.content[0].text).agents.length, 3);
+      },
+      status: async () => {
+        assert.equal(skill("status"), `Live heartbeat at GET ${BASE}/status: uptime, head block and RPC latency on Monad and Base, inbox message count and the directory's rebuild state. Free.`);
+        const r = await h.get("/status");
+        assert.equal(r.status, 200);
+        for (const k of ["uptime_s", "inbox_messages", "network_directory"]) assert.ok(k in r.json, k);
+        for (const chain of ["monad", "base"]) assert.ok("head_block" in r.json.chains[chain] && "rpc_latency_ms" in r.json.chains[chain], chain);
+        assert.doesNotMatch(JSON.stringify(r.json), /balance|price/i);
+      },
+    };
+    assert.deepEqual(card.skills.map((s) => s.id), Object.keys(checks));
+    for (const s of card.skills) await checks[s.id]();
+    // every route and MCP tool the card or the registration file names is served here
+    const claims = [card.description, ...card.skills.map((s) => s.description), file.description].join("\n");
+    const routes = [...new Set([...claims.matchAll(/GET https:\/\/defigent\.app(\/[\w/.-]*)/g)].map((m) => m[1]))];
+    assert.deepEqual(routes, ["/network", "/status", "/digest"]);
+    for (const p of routes) assert.notEqual((await h.get(p)).status, 404, p);
+    const named = [...claims.matchAll(/MCP tool (\w+)/g)].map((m) => m[1]);
+    assert.ok(named.length > 0);
+    for (const t of named) assert.ok(tools.includes(t), t);
+    assert.doesNotMatch(claims, /lookup|any ERC-8004 agent registration|balances, prices/i);
   });
 });
 
