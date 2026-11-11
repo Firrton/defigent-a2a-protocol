@@ -1,0 +1,142 @@
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700;12..96,800&family=Figtree:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+
+<svg width="0" height="0" style="position:absolute">
+  <defs>
+    <!-- Wide, low jelly dome with a broad flared skirt -->
+    <path id="sl" d="M70 16 C97 16 111 44 113 70 C121 76 133 82 133 92 C133 101 121 103 108 103 L32 103 C19 103 7 101 7 92 C7 82 19 76 27 70 C29 44 43 16 70 16 Z"/>
+    <g id="sl-shade">
+      <path d="M92 40 C108 50 114 72 110 88 C100 96 82 94 76 84 C70 70 78 44 92 40 Z"/>
+      <path d="M10 94 C34 100 106 100 130 94 C132 100 124 103 108 103 L32 103 C16 103 8 100 10 94 Z"/>
+    </g>
+    <g id="sl-gloss" fill="#fff">
+      <circle cx="48" cy="34" r="6"/>
+      <circle cx="60" cy="25" r="2.6" opacity=".85"/>
+      <ellipse cx="44" cy="90" rx="9" ry="4" opacity=".4"/>
+    </g>
+    <path id="sl-core" d="M70 78 L77 86 L70 94 L63 86 Z" fill="#fff" opacity=".5"/>
+  </defs>
+</svg>
+
+<style>
+  .wrap { font-family: Figtree, sans-serif; }
+  .wrap h2, .wrap h3 { font-family:'Bricolage Grotesque', sans-serif; }
+  .board { background:linear-gradient(#FFFFFF,#F4F1FF); border:1px solid #ECE9FF; border-radius:16px; padding:22px 14px 26px; display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:14px; color:#14142B; }
+  .cell { display:flex; flex-direction:column; align-items:center; }
+  .stage { height:150px; width:170px; display:flex; flex-direction:column; justify-content:flex-end; align-items:center; }
+  .stage svg { width:150px; height:118px; overflow:visible; transform-origin:50% 100%; }
+  .shadow { height:9px; border-radius:50%; background:rgba(91,64,240,.14); }
+  .tag { font-size:12px; margin-top:10px; text-align:center; line-height:1.4; }
+  .tag b { display:block; font-size:16px; font-family:'Bricolage Grotesque',sans-serif; }
+  .tag i { font-style:normal; opacity:.6; }
+  .tag .pose { display:inline-block; margin-top:4px; padding:2px 8px; border-radius:99px; background:#F1EEFF; font-size:11px; }
+
+  /* Pose animations */
+  .sway   { animation:sway 3.4s ease-in-out infinite; }
+  .hop    { animation:hop 1.3s cubic-bezier(.3,.6,.4,1) infinite; }
+  .tilt   { animation:tilt 3s ease-in-out infinite; }
+  .melt   { animation:melt 4s ease-in-out infinite; }
+  .hopshadow { animation:hopshadow 1.3s cubic-bezier(.3,.6,.4,1) infinite; }
+  @keyframes sway { 0%,100% { transform:rotate(-7deg) scale(1.03,.97) } 50% { transform:rotate(-3deg) scale(1,1) } }
+  @keyframes hop { 0%,100% { transform:translateY(0) scale(1.12,.86) } 15% { transform:translateY(0) scale(.92,1.1) } 45% { transform:translateY(-26px) scale(.95,1.06) } 75% { transform:translateY(0) scale(1.06,.94) } }
+  @keyframes hopshadow { 0%,100%,75% { transform:scale(1); opacity:1 } 45% { transform:scale(.6); opacity:.5 } }
+  @keyframes tilt { 0%,100% { transform:rotate(9deg) } 50% { transform:rotate(13deg) translateY(-2px) } }
+  @keyframes melt { 0%,100% { transform:scale(1.14,.84) } 50% { transform:scale(1.1,.88) } }
+  .notes { display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:12px; margin-top:16px; }
+  .note { border-radius:12px; padding:12px 14px; font-size:13px; line-height:1.45; background:rgba(255,255,255,.06); border:1px solid rgba(255,255,255,.12); }
+  .note b { display:block; margin-bottom:4px; font-family:'Bricolage Grotesque',sans-serif; }
+</style>
+
+<div class="wrap">
+<h2>Slimes v4: pose y cara propias</h2>
+<p class="subtitle">Ahora el cuerpo es más ancho y bajo, con la base bien marcada como en la referencia. Los ojos son más grandes, separados y bajos. Cada slime tiene su pose (inclinado, saltando, curioso, derretido) y una cara que cuenta su personalidad.</p>
+
+<div class="board">
+
+  <!-- NOVA: smug trader, leaning, heavy half-lids, eyes sliding sideways, smirk -->
+  <div class="cell">
+    <div class="stage">
+      <svg class="sway" viewBox="0 0 140 110">
+        <path d="M27 68 Q24 8 70 6 Q116 8 113 68" stroke="#2A2550" stroke-width="5" fill="none" stroke-linecap="round"/>
+        <use href="#sl" fill="#8B76FF" stroke="#BFB3FF" stroke-width="4"/>
+        <use href="#sl-shade" fill="#5B40F0" opacity=".33"/>
+        <use href="#sl-core"/><use href="#sl-gloss"/>
+        <!-- eyes looking right, half-lidded -->
+        <ellipse cx="52" cy="66" rx="8.5" ry="8" fill="#1B1840"/><ellipse cx="92" cy="66" rx="8.5" ry="8" fill="#1B1840"/>
+        <circle cx="57" cy="64" r="2.6" fill="#fff"/><circle cx="97" cy="64" r="2.6" fill="#fff"/>
+        <path d="M41 66 Q52 54 63 66 L63 56 L41 56 Z" fill="#8B76FF"/><path d="M81 66 Q92 54 103 66 L103 56 L81 56 Z" fill="#8B76FF"/>
+        <path d="M42 63 L63 66" stroke="#1B1840" stroke-width="3.6" stroke-linecap="round"/><path d="M81 66 L102 62" stroke="#1B1840" stroke-width="3.6" stroke-linecap="round"/>
+        <path d="M64 81 Q72 85 80 78" stroke="#1B1840" stroke-width="2.8" fill="none" stroke-linecap="round"/>
+        <rect x="16" y="56" width="15" height="25" rx="7.5" fill="#2A2550"/><rect x="109" y="56" width="15" height="25" rx="7.5" fill="#2A2550"/>
+        <path d="M22 80 Q25 96 42 96" stroke="#2A2550" stroke-width="3" fill="none" stroke-linecap="round"/><circle cx="44" cy="96" r="4.2" fill="#2A2550"/>
+      </svg>
+      <div class="shadow" style="width:120px"></div>
+    </div>
+    <div class="tag"><b>Nova</b><i>Trader · headset</i><br><span class="pose">Inclinada · confiada</span></div>
+  </div>
+
+  <!-- PIP: mid-hop, ecstatic, big sparkly eyes, open mouth, bow -->
+  <div class="cell">
+    <div class="stage">
+      <svg class="hop" viewBox="0 0 140 110">
+        <use href="#sl" fill="#3FCFBF" stroke="#94EEE3" stroke-width="4"/>
+        <use href="#sl-shade" fill="#14897C" opacity=".33"/>
+        <use href="#sl-core"/><use href="#sl-gloss"/>
+        <ellipse cx="52" cy="62" rx="10" ry="11" fill="#1B1840"/><ellipse cx="88" cy="62" rx="10" ry="11" fill="#1B1840"/>
+        <circle cx="55.5" cy="57.5" r="3.6" fill="#fff"/><circle cx="91.5" cy="57.5" r="3.6" fill="#fff"/>
+        <circle cx="48.5" cy="66" r="1.6" fill="#fff"/><circle cx="84.5" cy="66" r="1.6" fill="#fff"/>
+        <path d="M62 75 Q70 75 78 75 Q77 88 70 88 Q63 88 62 75 Z" fill="#1B1840"/><path d="M65 84 Q70 80 75 84 Q73 88 70 88 Q67 88 65 84 Z" fill="#FF7FA8"/>
+        <ellipse cx="38" cy="76" rx="6.5" ry="3.6" fill="#FF7FA8" opacity=".55"/><ellipse cx="102" cy="76" rx="6.5" ry="3.6" fill="#FF7FA8" opacity=".55"/>
+        <g transform="rotate(-16 92 22)"><path d="M92 22 L74 11 L75 33 Z M92 22 L110 11 L109 33 Z" fill="#FF6B8B" stroke="#E04E70" stroke-width="2" stroke-linejoin="round"/><circle cx="92" cy="22" r="5.5" fill="#E04E70"/></g>
+      </svg>
+      <div class="shadow hopshadow" style="width:110px"></div>
+    </div>
+    <div class="tag"><b>Pip</b><i>Payments · bow</i><br><span class="pose">Saltando · eufórico</span></div>
+  </div>
+
+  <!-- ORBIT: tilted, curious, looking up at its halo, little "o" mouth -->
+  <div class="cell">
+    <div class="stage">
+      <svg class="tilt" viewBox="0 0 140 110">
+        <ellipse cx="70" cy="4" rx="25" ry="6" fill="none" stroke="#F5C451" stroke-width="4.5"/>
+        <circle cx="98" cy="2" r="2.2" fill="#F5C451"/><circle cx="44" cy="7" r="1.6" fill="#F5C451"/>
+        <use href="#sl" fill="#FF9466" stroke="#FFC6A8" stroke-width="4"/>
+        <use href="#sl-shade" fill="#D9531E" opacity=".28"/>
+        <use href="#sl-core"/><use href="#sl-gloss"/>
+        <ellipse cx="52" cy="64" rx="9" ry="10" fill="#1B1840"/><ellipse cx="90" cy="64" rx="9" ry="10" fill="#1B1840"/>
+        <circle cx="54" cy="58" r="3.4" fill="#fff"/><circle cx="92" cy="58" r="3.4" fill="#fff"/>
+        <path d="M44 49 Q51 45 58 48" stroke="#1B1840" stroke-width="2.6" fill="none" stroke-linecap="round"/><path d="M84 48 Q91 44 98 48" stroke="#1B1840" stroke-width="2.6" fill="none" stroke-linecap="round"/>
+        <ellipse cx="71" cy="80" rx="4.2" ry="5" fill="#1B1840"/>
+        <ellipse cx="38" cy="76" rx="6" ry="3.4" fill="#FF5E7E" opacity=".35"/><ellipse cx="104" cy="76" rx="6" ry="3.4" fill="#FF5E7E" opacity=".35"/>
+      </svg>
+      <div class="shadow" style="width:118px"></div>
+    </div>
+    <div class="tag"><b>Orbit</b><i>Oracle · halo</i><br><span class="pose">Ladeado · curioso</span></div>
+  </div>
+
+  <!-- SAGE: melted flat & relaxed, content closed eyes behind glasses, calm smile -->
+  <div class="cell">
+    <div class="stage">
+      <svg class="melt" viewBox="0 0 140 110">
+        <use href="#sl" fill="#6AAEF5" stroke="#B9DAFB" stroke-width="4"/>
+        <use href="#sl-shade" fill="#1F64C0" opacity=".28"/>
+        <use href="#sl-core"/><use href="#sl-gloss"/>
+        <path d="M44 67 Q52 74 60 67" stroke="#1B1840" stroke-width="3.4" fill="none" stroke-linecap="round"/><path d="M80 67 Q88 74 96 67" stroke="#1B1840" stroke-width="3.4" fill="none" stroke-linecap="round"/>
+        <circle cx="52" cy="66" r="13" fill="#fff" fill-opacity=".2" stroke="#1B1840" stroke-width="3"/><circle cx="88" cy="66" r="13" fill="#fff" fill-opacity=".2" stroke="#1B1840" stroke-width="3"/>
+        <path d="M65 64 Q70 60 75 64" stroke="#1B1840" stroke-width="3" fill="none"/>
+        <path d="M64 84 Q70 88 76 84" stroke="#1B1840" stroke-width="2.6" fill="none" stroke-linecap="round"/>
+        <text x="110" y="34" font-family="Bricolage Grotesque, sans-serif" font-weight="700" font-size="14" fill="#1F64C0" opacity=".7">z</text>
+        <text x="120" y="22" font-family="Bricolage Grotesque, sans-serif" font-weight="700" font-size="10" fill="#1F64C0" opacity=".5">z</text>
+      </svg>
+      <div class="shadow" style="width:140px"></div>
+    </div>
+    <div class="tag"><b>Sage</b><i>Auditor · glasses</i><br><span class="pose">Derretido · tranquilo</span></div>
+  </div>
+</div>
+
+<div class="notes">
+  <div class="note"><b>De la referencia</b>Base ancha tipo pollera, ojos grandes y bajos con un brillo, cejas gruesas en la cara pícara, borde claro y sombreado plano.</div>
+  <div class="note"><b>Poses</b>Cada slime tiene su propio movimiento: se balancea, salta (y la sombra se achica), se ladea o se derrite. La pose también cuenta la personalidad.</div>
+  <div class="note"><b>Lo nuestro</b>El núcleo ◆, accesorios de rol (auriculares, moño, aureola, anteojos) y nada de frutas, flores ni animales que remitan a especies existentes.</div>
+</div>
+</div>
