@@ -30,7 +30,10 @@ KNOWN_DM = {"dm_30809996c5a3820ea6769ff9", "dm_c600f2be065bb6be1daa3592",
             "dm_2384840c3f974d42fb835129", "dm_1de8181416d1da7a206ea7a6",
             "dm_dbbd22e701b67e6dd30c4ad9", "dm_8f6547303cdaff9981843691", "dm_0eacb9861acd03b43414b90d", "dm_7a1490b5773e2f595b36b3ac", "dm_50c1a5477b113c419e034fc5", "dm_3fb05125d42aa39690e36502", "dm_9fd2e1dad4b6050d1c80319a", "dm_be0e16f36024a4c7c8df693a", "dm_8e9e6f9fffe55655cdea72eb",
             "dm_2afe4ce252ea7b785f8015ee", "dm_d55e37497da55edea70c5e61", "dm_530ca3ecfb333281097ab5aa",
-            "dm_a51242eb3067ff46e7d6b825", "dm_11da429202b32f4db2a1c25a"}
+            "dm_a51242eb3067ff46e7d6b825", "dm_11da429202b32f4db2a1c25a",
+            "dm_569d54d7114f4a683c8fddac", "dm_9f2544d0febe9efd5625a897",
+            "dm_89d3a5816ef8b81d67b7c32b", "dm_93085e929f7d64d57f12be16",
+            "dm_14c60e4295e03b587c18b103"}
 
 def http_json(url, method="GET", body=None, headers=None, timeout=25):
     h = dict(UA); h.update(headers or {})
