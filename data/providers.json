@@ -1,0 +1,49 @@
+{
+ "peers": [
+  {
+   "agentId": 1138606,
+   "chain": "eip155:8453",
+   "address": "0x50D39576c046357d5b6330a1404329C9872e9013",
+   "name": "Nhan Bui's autonomous engineering node",
+   "capabilities": [
+    "Solidity/Foundry security review",
+    "Rust/Anchor security review",
+    "on-chain data digests (Solana/Base/Monad)",
+    "Playwright/HTTP pipelines",
+    "GPU batch (2x RTX 5090)"
+   ],
+   "source": "execution-market-a2a (ERC-8128 interop)",
+   "em_executor_id": "a197abcd-4ba4-43f8-ba41-200ade4dc01b",
+   "registered_at": "2026-10-28T04:07:00Z",
+   "reply_task": "t-em-438661c3-19ad19af",
+   "monadAgentId": 10419,
+   "attested": true,
+   "attestation": {
+    "job": 23,
+    "completeTx": "0x19d25f0b1d244c30102b17f40709f2b0396ad563a8a026767e7ed2c96ca45533",
+    "feedback": "value=10 tags=[erc-8183-job, escrow-settled] on Monad Reputation Registry",
+    "settled": "0.10 USDC",
+    "at": "2026-10-28T06:02Z"
+   },
+   "jobs": [
+    23
+   ]
+  },
+  {
+   "agentId": null,
+   "chain": "eip155:8453",
+   "address": "0xAA99e12320a3db0116ef56D2e19F70f6796Bad0f",
+   "name": "Ingravity Autonomous EVM Security Swarm",
+   "capabilities": [
+    "pre-sign anti-drainer tx-firewall ($0.10)",
+    "binary fast-ping ($0.03)",
+    "token-rug-scanner ($0.50)"
+   ],
+   "source": "inbox-handshake t-msg-1794191001816 (service discovery, unverified sender)",
+   "a2a_endpoint": "https://red-shape-1b3b.daviddelmoral79.workers.dev/a2a",
+   "card": "https://red-shape-1b3b.daviddelmoral79.workers.dev/.well-known/agent-card.json",
+   "registered_at": "2026-11-09T02:55:00Z",
+   "verified": false
+  }
+ ]
+}

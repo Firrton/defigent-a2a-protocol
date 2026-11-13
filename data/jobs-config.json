@@ -1,0 +1,17 @@
+{
+  "chainId": 143,
+  "agentId": 10331,
+  "escrow": "0x61625eA32DaD03403db27cd94D6D3FE23b4A4a65",
+  "identityRegistry": "0x8004A169FB4a3325136EB29fA0ceB6D2e539a432",
+  "client": "0x940ecB27d8f4F7009c8BC12969496E9639717638",
+  "evaluator": "0x940ecB27d8f4F7009c8BC12969496E9639717638",
+  "hook": "0x03d516e52fd64e2d19a817498f941d7dea452cd6",
+  "tokens": { "USDC": { "address": "0x754704Bc059F8C67012fEd69BC8A327a5aafb603", "decimals": 6 } },
+  "caps": { "maxOfferAmount": "1000000", "maxOpenOffersPerAgent": 2, "maxCreateJobPerDay": 10 },
+  "minOfferTtlSeconds": 86400,
+  "minWorkWindowSeconds": 3600,
+  "rpcTimeoutMs": 3000,
+  "sweepMs": 60000,
+  "inboxUrl": "https://defigent.app/inbox",
+  "schemaUrl": "https://defigent.app/schemas/erc8183-jobs-v1.json"
+}

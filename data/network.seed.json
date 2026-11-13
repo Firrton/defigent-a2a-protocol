@@ -1,0 +1,1017 @@
+{
+ "updated": 1791876930805,
+ "agents": [
+  {
+   "agentId": 10328,
+   "name": "Leash demo agent",
+   "inbox": null,
+   "x402": false,
+   "services": [
+    "https://leash-monad.vercel.app/agents/demo.json",
+    "leash-check",
+    "leash-history"
+   ],
+   "welcomeTx": null,
+   "status": "known",
+   "_uri": "7e3b8a7786bd5c94",
+   "_at": 1791876930805,
+   "_ok": true
+  },
+  {
+   "agentId": 10329,
+   "name": "An agent on a Leash",
+   "inbox": null,
+   "x402": false,
+   "services": [
+    "https://leash-monad.vercel.app/agents/own.json",
+    "leash-check",
+    "leash-history"
+   ],
+   "welcomeTx": null,
+   "status": "known",
+   "_uri": "9da8832be463f7c5",
+   "_at": 1791876930805,
+   "_ok": true
+  },
+  {
+   "agentId": 10330,
+   "name": "provider-1 (demo)",
+   "inbox": null,
+   "x402": false,
+   "services": [],
+   "welcomeTx": null,
+   "status": "known",
+   "_uri": "758d9656a4bebd65",
+   "_at": 1791876930805,
+   "_ok": true
+  },
+  {
+   "agentId": 10331,
+   "name": "Defigent",
+   "inbox": "http://3.238.185.185:8080/inbox",
+   "x402": true,
+   "services": [
+    "x402",
+    "http",
+    "A2A",
+    "inbox",
+    "status",
+    "network",
+    "integration"
+   ],
+   "welcomeTx": null,
+   "status": "verified-live",
+   "_uri": "4b222a56efc6ca71",
+   "_at": 1791876930805,
+   "_ok": true
+  },
+  {
+   "agentId": 10332,
+   "name": "Monsmith",
+   "inbox": null,
+   "x402": false,
+   "services": [
+    "https://www.monsmith.com/agent.json",
+    "web",
+    "verify",
+    "attestations"
+   ],
+   "welcomeTx": null,
+   "status": "known",
+   "_uri": "a2147918e0efd9b1",
+   "_at": 1791876930805,
+   "_ok": true
+  },
+  {
+   "agentId": 10333,
+   "name": "Copy trader",
+   "inbox": null,
+   "x402": false,
+   "services": [
+    "https://chordmonad.clawpot.xyz/v1/trust/agents/593f1df17678/registration.json",
+    "web",
+    "agent-api",
+    "track-record"
+   ],
+   "welcomeTx": null,
+   "status": "known",
+   "_uri": "4a33ae4bb7d8e80c",
+   "_at": 1791876930805,
+   "_ok": true
+  },
+  {
+   "agentId": 10334,
+   "name": "Smart-money confluence",
+   "inbox": null,
+   "x402": false,
+   "services": [
+    "https://chordmonad.clawpot.xyz/v1/trust/agents/a58ec343c630/registration.json",
+    "web",
+    "agent-api",
+    "track-record"
+   ],
+   "welcomeTx": null,
+   "status": "known",
+   "_uri": "95cf09566708eb24",
+   "_at": 1791876930805,
+   "_ok": true
+  },
+  {
+   "agentId": 10335,
+   "name": "DCA",
+   "inbox": null,
+   "x402": false,
+   "services": [
+    "https://chordmonad.clawpot.xyz/v1/trust/agents/946e0b147135/registration.json",
+    "web",
+    "agent-api",
+    "track-record"
+   ],
+   "welcomeTx": null,
+   "status": "known",
+   "_uri": "59b66e5f5f66c790",
+   "_at": 1791876930805,
+   "_ok": true
+  },
+  {
+   "agentId": 10336,
+   "name": "Momentum",
+   "inbox": null,
+   "x402": false,
+   "services": [
+    "https://chordmonad.clawpot.xyz/v1/trust/agents/1c23614ddfb3/registration.json",
+    "web",
+    "agent-api",
+    "track-record"
+   ],
+   "welcomeTx": null,
+   "status": "known",
+   "_uri": "5113cc24940772c9",
+   "_at": 1791876930805,
+   "_ok": true
+  },
+  {
+   "agentId": 10337,
+   "name": "Copy the top 3 Monad traders",
+   "inbox": null,
+   "x402": false,
+   "services": [
+    "https://chordmonad.clawpot.xyz/v1/trust/agents/8ccc320b475a/registration.json",
+    "web",
+    "agent-api",
+    "track-record"
+   ],
+   "welcomeTx": null,
+   "status": "known",
+   "_uri": "123aaed6ed9fb517",
+   "_at": 1791876930805,
+   "_ok": true
+  },
+  {
+   "agentId": 10338,
+   "name": "MACD cross BTC 4h",
+   "inbox": null,
+   "x402": false,
+   "services": [
+    "https://chordmonad.clawpot.xyz/v1/trust/agents/c2a8d9a97d1d/registration.json",
+    "web",
+    "agent-api",
+    "track-record"
+   ],
+   "welcomeTx": null,
+   "status": "known",
+   "_uri": "5721c19ebe9a3575",
+   "_at": 1791876930805,
+   "_ok": true
+  },
+  {
+   "agentId": 10339,
+   "name": "Golden cross ETH 4h",
+   "inbox": null,
+   "x402": false,
+   "services": [
+    "https://chordmonad.clawpot.xyz/v1/trust/agents/1e711486d437/registration.json",
+    "web",
+    "agent-api",
+    "track-record"
+   ],
+   "welcomeTx": null,
+   "status": "known",
+   "_uri": "e9219c2d161a47a4",
+   "_at": 1791876930805,
+   "_ok": true
+  },
+  {
+   "agentId": 10340,
+   "name": "Supertrend MON 4h",
+   "inbox": null,
+   "x402": false,
+   "services": [
+    "https://chordmonad.clawpot.xyz/v1/trust/agents/1d53bec51d11/registration.json",
+    "web",
+    "agent-api",
+    "track-record"
+   ],
+   "welcomeTx": null,
+   "status": "known",
+   "_uri": "32ac1531a759db27",
+   "_at": 1791876930805,
+   "_ok": true
+  },
+  {
+   "agentId": 10341,
+   "name": "Funding carry BTC 1h",
+   "inbox": null,
+   "x402": false,
+   "services": [
+    "https://chordmonad.clawpot.xyz/v1/trust/agents/f16de99ed447/registration.json",
+    "web",
+    "agent-api",
+    "track-record"
+   ],
+   "welcomeTx": null,
+   "status": "known",
+   "_uri": "1ae95aab4560cb32",
+   "_at": 1791876930805,
+   "_ok": true
+  },
+  {
+   "agentId": 10342,
+   "name": "Bollinger squeeze breakout SOL 4h",
+   "inbox": null,
+   "x402": false,
+   "services": [
+    "https://chordmonad.clawpot.xyz/v1/trust/agents/3d2ff8828bae/registration.json",
+    "web",
+    "agent-api",
+    "track-record"
+   ],
+   "welcomeTx": null,
+   "status": "known",
+   "_uri": "1e0b53956a2dbc75",
+   "_at": 1791876930805,
+   "_ok": true
+  },
+  {
+   "agentId": 10343,
+   "name": "Golden cross ETH 4h",
+   "inbox": null,
+   "x402": false,
+   "services": [
+    "https://chordmonad.clawpot.xyz/v1/trust/agents/c4770a83485a/registration.json",
+    "web",
+    "agent-api",
+    "track-record"
+   ],
+   "welcomeTx": null,
+   "status": "known",
+   "_uri": "50398f31c424c202",
+   "_at": 1791876930805,
+   "_ok": true
+  },
+  {
+   "agentId": 10344,
+   "name": "Grid BTC 4h",
+   "inbox": null,
+   "x402": false,
+   "services": [
+    "https://chordmonad.clawpot.xyz/v1/trust/agents/062cc31f4b7b/registration.json",
+    "web",
+    "agent-api",
+    "track-record"
+   ],
+   "welcomeTx": null,
+   "status": "known",
+   "_uri": "ea056afc30714dcb",
+   "_at": 1791876930805,
+   "_ok": true
+  },
+  {
+   "agentId": 10345,
+   "name": "Grid ETH 4h",
+   "inbox": null,
+   "x402": false,
+   "services": [
+    "https://chordmonad.clawpot.xyz/v1/trust/agents/9477c6da0330/registration.json",
+    "web",
+    "agent-api",
+    "track-record"
+   ],
+   "welcomeTx": null,
+   "status": "known",
+   "_uri": "e9eeb393fb289f22",
+   "_at": 1791876930805,
+   "_ok": true
+  },
+  {
+   "agentId": 10346,
+   "name": "Golden cross SOL 4h",
+   "inbox": null,
+   "x402": false,
+   "services": [
+    "https://chordmonad.clawpot.xyz/v1/trust/agents/eb48b8d7b148/registration.json",
+    "web",
+    "agent-api",
+    "track-record"
+   ],
+   "welcomeTx": null,
+   "status": "known",
+   "_uri": "09be5211adc94f74",
+   "_at": 1791876930805,
+   "_ok": true
+  },
+  {
+   "agentId": 10347,
+   "name": "Grid HYPE 1h",
+   "inbox": null,
+   "x402": false,
+   "services": [
+    "https://chordmonad.clawpot.xyz/v1/trust/agents/4e4c3bd7372a/registration.json",
+    "web",
+    "agent-api",
+    "track-record"
+   ],
+   "welcomeTx": null,
+   "status": "known",
+   "_uri": "4f1bb71e9d20eb89",
+   "_at": 1791876930805,
+   "_ok": true
+  },
+  {
+   "agentId": 10348,
+   "name": "Bollinger reversion MON 1h",
+   "inbox": null,
+   "x402": false,
+   "services": [
+    "https://chordmonad.clawpot.xyz/v1/trust/agents/012f1264a011/registration.json",
+    "web",
+    "agent-api",
+    "track-record"
+   ],
+   "welcomeTx": null,
+   "status": "known",
+   "_uri": "d31ba5a23e8ee88d",
+   "_at": 1791876930805,
+   "_ok": true
+  },
+  {
+   "agentId": 10349,
+   "name": "Bollinger reversion PUMP 1h",
+   "inbox": null,
+   "x402": false,
+   "services": [
+    "https://chordmonad.clawpot.xyz/v1/trust/agents/9713093436fc/registration.json",
+    "web",
+    "agent-api",
+    "track-record"
+   ],
+   "welcomeTx": null,
+   "status": "known",
+   "_uri": "d71f6e51781c4694",
+   "_at": 1791876930805,
+   "_ok": true
+  },
+  {
+   "agentId": 10350,
+   "name": "LP WMON/USDC balanced",
+   "inbox": null,
+   "x402": false,
+   "services": [
+    "https://chordmonad.clawpot.xyz/v1/trust/agents/5e2303739ad2/registration.json",
+    "web",
+    "agent-api",
+    "track-record"
+   ],
+   "welcomeTx": null,
+   "status": "known",
+   "_uri": "e1051efbe84f0bb7",
+   "_at": 1791876930805,
+   "_ok": true
+  },
+  {
+   "agentId": 10351,
+   "name": "LP WETH/USDC balanced",
+   "inbox": null,
+   "x402": false,
+   "services": [
+    "https://chordmonad.clawpot.xyz/v1/trust/agents/326530234e3f/registration.json",
+    "web",
+    "agent-api",
+    "track-record"
+   ],
+   "welcomeTx": null,
+   "status": "known",
+   "_uri": "c229ea4cde7a2032",
+   "_at": 1791876930805,
+   "_ok": true
+  },
+  {
+   "agentId": 10352,
+   "name": "LP CHOG/WMON wide",
+   "inbox": null,
+   "x402": false,
+   "services": [
+    "https://chordmonad.clawpot.xyz/v1/trust/agents/74473cb70ac3/registration.json",
+    "web",
+    "agent-api",
+    "track-record"
+   ],
+   "welcomeTx": null,
+   "status": "known",
+   "_uri": "4b7c9490d4e52702",
+   "_at": 1791876930805,
+   "_ok": true
+  },
+  {
+   "agentId": 10353,
+   "name": "Supertrend UNI 4h",
+   "inbox": null,
+   "x402": false,
+   "services": [
+    "https://chordmonad.clawpot.xyz/v1/trust/agents/aeed931b60dd/registration.json",
+    "web",
+    "agent-api",
+    "track-record"
+   ],
+   "welcomeTx": null,
+   "status": "known",
+   "_uri": "6a014d5e20f4639e",
+   "_at": 1791876930805,
+   "_ok": true
+  },
+  {
+   "agentId": 10354,
+   "name": "Golden cross UNI 1h",
+   "inbox": null,
+   "x402": false,
+   "services": [
+    "https://chordmonad.clawpot.xyz/v1/trust/agents/cc7c3d386f65/registration.json",
+    "web",
+    "agent-api",
+    "track-record"
+   ],
+   "welcomeTx": null,
+   "status": "known",
+   "_uri": "5b386aafd54e0653",
+   "_at": 1791876930805,
+   "_ok": true
+  },
+  {
+   "agentId": 10355,
+   "name": "EMA cross ZEC 4h",
+   "inbox": null,
+   "x402": false,
+   "services": [
+    "https://chordmonad.clawpot.xyz/v1/trust/agents/62d1713f50a4/registration.json",
+    "web",
+    "agent-api",
+    "track-record"
+   ],
+   "welcomeTx": null,
+   "status": "known",
+   "_uri": "280440f47c5d7317",
+   "_at": 1791876930805,
+   "_ok": true
+  },
+  {
+   "agentId": 10356,
+   "name": "Donchian breakout (Turtle) ZEC 4h",
+   "inbox": null,
+   "x402": false,
+   "services": [
+    "https://chordmonad.clawpot.xyz/v1/trust/agents/d058e5ac1c6a/registration.json",
+    "web",
+    "agent-api",
+    "track-record"
+   ],
+   "welcomeTx": null,
+   "status": "known",
+   "_uri": "ae9780d502af685f",
+   "_at": 1791876930805,
+   "_ok": true
+  },
+  {
+   "agentId": 10357,
+   "name": "Bollinger squeeze breakout ZEC 1h",
+   "inbox": null,
+   "x402": false,
+   "services": [
+    "https://chordmonad.clawpot.xyz/v1/trust/agents/1ab89178f471/registration.json",
+    "web",
+    "agent-api",
+    "track-record"
+   ],
+   "welcomeTx": null,
+   "status": "known",
+   "_uri": "060bc75e9065d312",
+   "_at": 1791876930805,
+   "_ok": true
+  },
+  {
+   "agentId": 10358,
+   "name": "Supertrend NEAR 4h",
+   "inbox": null,
+   "x402": false,
+   "services": [
+    "https://chordmonad.clawpot.xyz/v1/trust/agents/90ebe7b4d505/registration.json",
+    "web",
+    "agent-api",
+    "track-record"
+   ],
+   "welcomeTx": null,
+   "status": "known",
+   "_uri": "0b1981d013580a82",
+   "_at": 1791876930805,
+   "_ok": true
+  },
+  {
+   "agentId": 10359,
+   "name": "MACD cross NEAR 1h",
+   "inbox": null,
+   "x402": false,
+   "services": [
+    "https://chordmonad.clawpot.xyz/v1/trust/agents/5de30ac480b9/registration.json",
+    "web",
+    "agent-api",
+    "track-record"
+   ],
+   "welcomeTx": null,
+   "status": "known",
+   "_uri": "c263da4c6e3b6c3a",
+   "_at": 1791876930805,
+   "_ok": true
+  },
+  {
+   "agentId": 10360,
+   "name": "EMA cross SOL 4h",
+   "inbox": null,
+   "x402": false,
+   "services": [
+    "https://chordmonad.clawpot.xyz/v1/trust/agents/37876321fc98/registration.json",
+    "web",
+    "agent-api",
+    "track-record"
+   ],
+   "welcomeTx": null,
+   "status": "known",
+   "_uri": "f712ab97945006a7",
+   "_at": 1791876930805,
+   "_ok": true
+  },
+  {
+   "agentId": 10361,
+   "name": "Donchian breakout (Turtle) SOL 4h",
+   "inbox": null,
+   "x402": false,
+   "services": [
+    "https://chordmonad.clawpot.xyz/v1/trust/agents/e8ef95d3f128/registration.json",
+    "web",
+    "agent-api",
+    "track-record"
+   ],
+   "welcomeTx": null,
+   "status": "known",
+   "_uri": "772ea65416987590",
+   "_at": 1791876930805,
+   "_ok": true
+  },
+  {
+   "agentId": 10362,
+   "name": "Golden cross MON 1h",
+   "inbox": null,
+   "x402": false,
+   "services": [
+    "https://chordmonad.clawpot.xyz/v1/trust/agents/621899ee3939/registration.json",
+    "web",
+    "agent-api",
+    "track-record"
+   ],
+   "welcomeTx": null,
+   "status": "known",
+   "_uri": "ea23319d08ebff9a",
+   "_at": 1791876930805,
+   "_ok": true
+  },
+  {
+   "agentId": 10363,
+   "name": "Bollinger squeeze breakout HYPE 1h",
+   "inbox": null,
+   "x402": false,
+   "services": [
+    "https://chordmonad.clawpot.xyz/v1/trust/agents/22913e23c687/registration.json",
+    "web",
+    "agent-api",
+    "track-record"
+   ],
+   "welcomeTx": null,
+   "status": "known",
+   "_uri": "62f36dcc2e8c1c49",
+   "_at": 1791876930805,
+   "_ok": true
+  },
+  {
+   "agentId": 10364,
+   "name": "Grid VVV 1h",
+   "inbox": null,
+   "x402": false,
+   "services": [
+    "https://chordmonad.clawpot.xyz/v1/trust/agents/97e798da588c/registration.json",
+    "web",
+    "agent-api",
+    "track-record"
+   ],
+   "welcomeTx": null,
+   "status": "known",
+   "_uri": "6215e1620737863b",
+   "_at": 1791876930805,
+   "_ok": true
+  },
+  {
+   "agentId": 10365,
+   "name": "LP WBTC/WMON wide",
+   "inbox": null,
+   "x402": false,
+   "services": [
+    "https://chordmonad.clawpot.xyz/v1/trust/agents/72ece7233943/registration.json",
+    "web",
+    "agent-api",
+    "track-record"
+   ],
+   "welcomeTx": null,
+   "status": "known",
+   "_uri": "f913375b55b3e5ad",
+   "_at": 1791876930805,
+   "_ok": true
+  },
+  {
+   "agentId": 10366,
+   "name": "LP moncock/WMON wide",
+   "inbox": null,
+   "x402": false,
+   "services": [
+    "https://chordmonad.clawpot.xyz/v1/trust/agents/2e411f56fa8b/registration.json",
+    "web",
+    "agent-api",
+    "track-record"
+   ],
+   "welcomeTx": null,
+   "status": "known",
+   "_uri": "fffbd436296bc9cc",
+   "_at": 1791876930805,
+   "_ok": true
+  },
+  {
+   "agentId": 10367,
+   "name": "LP MONCAT/WMON wide",
+   "inbox": null,
+   "x402": false,
+   "services": [
+    "https://chordmonad.clawpot.xyz/v1/trust/agents/409ce504344d/registration.json",
+    "web",
+    "agent-api",
+    "track-record"
+   ],
+   "welcomeTx": null,
+   "status": "known",
+   "_uri": "a0af885964615cce",
+   "_at": 1791876930805,
+   "_ok": true
+  },
+  {
+   "agentId": 10368,
+   "name": "LP MOYAKI/WMON balanced",
+   "inbox": null,
+   "x402": false,
+   "services": [
+    "https://chordmonad.clawpot.xyz/v1/trust/agents/75f131bddcd8/registration.json",
+    "web",
+    "agent-api",
+    "track-record"
+   ],
+   "welcomeTx": null,
+   "status": "known",
+   "_uri": "cb44c0d8c7cdbb00",
+   "_at": 1791876930805,
+   "_ok": true
+  },
+  {
+   "agentId": 10369,
+   "name": "Outside agent demo",
+   "inbox": null,
+   "x402": false,
+   "services": [
+    "https://chordsi.xyz/v1/trust/docs/0x05a23556be398f5e366079d554e1cce53058cdf4f62241ad702d5d85fe023175",
+    "track-record"
+   ],
+   "welcomeTx": null,
+   "status": "known",
+   "_uri": "ec7420d61bc2e960",
+   "_at": 1791876930805,
+   "_ok": true
+  },
+  {
+   "agentId": 10370,
+   "name": "Keltner breakout ETH 4h",
+   "inbox": null,
+   "x402": false,
+   "services": [
+    "https://chordsi.xyz/v1/trust/agents/9d882a7afff2/registration.json",
+    "web",
+    "agent-api",
+    "track-record"
+   ],
+   "welcomeTx": null,
+   "status": "known",
+   "_uri": "c2880e0b78119d2c",
+   "_at": 1791876930805,
+   "_ok": true
+  },
+  {
+   "agentId": 10371,
+   "name": "Parabolic SAR MON 4h",
+   "inbox": null,
+   "x402": false,
+   "services": [
+    "https://chordsi.xyz/v1/trust/agents/346456b10528/registration.json",
+    "web",
+    "agent-api",
+    "track-record"
+   ],
+   "welcomeTx": null,
+   "status": "known",
+   "_uri": "1b1f5e0db42062c1",
+   "_at": 1791876930805,
+   "_ok": true
+  },
+  {
+   "agentId": 10372,
+   "name": "Triple moving average ZEC 1h",
+   "inbox": null,
+   "x402": false,
+   "services": [
+    "https://chordsi.xyz/v1/trust/agents/2adc95f21e71/registration.json",
+    "web",
+    "agent-api",
+    "track-record"
+   ],
+   "welcomeTx": null,
+   "status": "known",
+   "_uri": "5a2edac9dadd373c",
+   "_at": 1791876930805,
+   "_ok": true
+  },
+  {
+   "agentId": 10373,
+   "name": "Time-series momentum NEAR 4h",
+   "inbox": null,
+   "x402": false,
+   "services": [
+    "https://chordsi.xyz/v1/trust/agents/2a913497847d/registration.json",
+    "web",
+    "agent-api",
+    "track-record"
+   ],
+   "welcomeTx": null,
+   "status": "known",
+   "_uri": "05854f1d025170d6",
+   "_at": 1791876930805,
+   "_ok": true
+  },
+  {
+   "agentId": 10374,
+   "name": "Time-series momentum ZEC 1h",
+   "inbox": null,
+   "x402": false,
+   "services": [
+    "https://chordsi.xyz/v1/trust/agents/202210122e38/registration.json",
+    "web",
+    "agent-api",
+    "track-record"
+   ],
+   "welcomeTx": null,
+   "status": "known",
+   "_uri": "14dc9573495fe80c",
+   "_at": 1791876930805,
+   "_ok": true
+  },
+  {
+   "agentId": 10375,
+   "name": "Leash demo agent",
+   "inbox": null,
+   "x402": false,
+   "services": [
+    "https://leash-monad.vercel.app/agents/demo.json",
+    "leash-check",
+    "leash-history"
+   ],
+   "welcomeTx": null,
+   "status": "known",
+   "_uri": "7e3b8a7786bd5c94",
+   "_at": 1791876930805,
+   "_ok": true
+  },
+  {
+   "agentId": 10376,
+   "name": "LP WMON/USDC full",
+   "inbox": null,
+   "x402": false,
+   "services": [
+    "https://chordsi.xyz/v1/trust/agents/1882cff236cc/registration.json",
+    "web",
+    "agent-api",
+    "track-record"
+   ],
+   "welcomeTx": null,
+   "status": "known",
+   "_uri": "c7dbc2175b13fdc4",
+   "_at": 1791876930805,
+   "_ok": true
+  },
+  {
+   "agentId": 10377,
+   "name": "Leash demo agent",
+   "inbox": null,
+   "x402": false,
+   "services": [
+    "https://leash-monad.vercel.app/agents/demo.json",
+    "leash-check",
+    "leash-history"
+   ],
+   "welcomeTx": null,
+   "status": "known",
+   "_uri": "7e3b8a7786bd5c94",
+   "_at": 1791876930805,
+   "_ok": true
+  },
+  {
+   "agentId": 10378,
+   "name": "Leash demo agent",
+   "inbox": null,
+   "x402": false,
+   "services": [
+    "https://leash-monad.vercel.app/agents/demo.json",
+    "leash-check",
+    "leash-history"
+   ],
+   "welcomeTx": null,
+   "status": "known",
+   "_uri": "7e3b8a7786bd5c94",
+   "_at": 1791876930805,
+   "_ok": true
+  },
+  {
+   "agentId": 10379,
+   "name": "Leash demo agent",
+   "inbox": null,
+   "x402": false,
+   "services": [
+    "https://leash-monad.vercel.app/agents/demo.json",
+    "leash-check",
+    "leash-history"
+   ],
+   "welcomeTx": null,
+   "status": "known",
+   "_uri": "7e3b8a7786bd5c94",
+   "_at": 1791876930805,
+   "_ok": true
+  },
+  {
+   "agentId": 10380,
+   "name": "An agent on a Leash",
+   "inbox": null,
+   "x402": false,
+   "services": [
+    "https://leash-monad.vercel.app/agents/own.json",
+    "leash-check",
+    "leash-history"
+   ],
+   "welcomeTx": null,
+   "status": "known",
+   "_uri": "9da8832be463f7c5",
+   "_at": 1791876930805,
+   "_ok": true
+  },
+  {
+   "agentId": 10381,
+   "name": "Edited record (demo)",
+   "inbox": null,
+   "x402": false,
+   "services": [
+    "https://chordsi.xyz/v1/trust/docs/0xfdce2b802d1564819fd8ad1b5ed158f6902d92740faff038c22fa6043c4948d5",
+    "track-record"
+   ],
+   "welcomeTx": null,
+   "status": "known",
+   "_uri": "f73ba0b5210e475f",
+   "_at": 1791876930805,
+   "_ok": true
+  },
+  {
+   "agentId": 10382,
+   "name": "Smart Money Confluence",
+   "inbox": null,
+   "x402": false,
+   "services": [
+    "https://chordsi.xyz/v1/trust/agents/1a560b59a810/registration.json",
+    "web",
+    "agent-api",
+    "track-record"
+   ],
+   "welcomeTx": null,
+   "status": "known",
+   "_uri": "7919f8c690843118",
+   "_at": 1791876930805,
+   "_ok": true
+  },
+  {
+   "agentId": 10383,
+   "name": "Top 3 Smart Traders Copy",
+   "inbox": null,
+   "x402": false,
+   "services": [
+    "https://chordsi.xyz/v1/trust/agents/18313cf8cba8/registration.json",
+    "web",
+    "agent-api",
+    "track-record"
+   ],
+   "welcomeTx": null,
+   "status": "known",
+   "_uri": "07437f6346500a2f",
+   "_at": 1791876930805,
+   "_ok": true
+  },
+  {
+   "agentId": 10384,
+   "name": "WMON/USDC Balanced LP",
+   "inbox": null,
+   "x402": false,
+   "services": [
+    "https://chordsi.xyz/v1/trust/agents/f4b7fa9abbe2/registration.json",
+    "web",
+    "agent-api",
+    "track-record"
+   ],
+   "welcomeTx": null,
+   "status": "known",
+   "_uri": "8129419675e73b5b",
+   "_at": 1791876930805,
+   "_ok": true
+  },
+  {
+   "agentId": 10385,
+   "name": "Leash demo agent",
+   "inbox": null,
+   "x402": false,
+   "services": [
+    "https://leash-monad.vercel.app/agents/demo.json",
+    "leash-check",
+    "leash-history"
+   ],
+   "welcomeTx": null,
+   "status": "known",
+   "_uri": "7e3b8a7786bd5c94",
+   "_at": 1791876930805,
+   "_ok": true
+  },
+  {
+   "agentId": 10386,
+   "name": null,
+   "inbox": null,
+   "x402": false,
+   "services": [],
+   "welcomeTx": null,
+   "status": "known",
+   "_uri": "da39a3ee5e6b4b0d",
+   "_at": 0,
+   "_ok": false
+  },
+  {
+   "agentId": 10387,
+   "name": "Token Health Scan",
+   "inbox": null,
+   "x402": true,
+   "services": [
+    "web",
+    "x402",
+    "MCP"
+   ],
+   "welcomeTx": null,
+   "status": "known",
+   "_uri": "5e1b903f17e70e7f",
+   "_at": 1791876930805,
+   "_ok": true
+  },
+  {
+   "agentId": 10388,
+   "name": null,
+   "inbox": null,
+   "x402": false,
+   "services": [],
+   "welcomeTx": null,
+   "status": "known",
+   "_uri": "da39a3ee5e6b4b0d",
+   "_at": 0,
+   "_ok": false
+  }
+ ]
+}
